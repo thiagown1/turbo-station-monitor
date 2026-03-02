@@ -1,0 +1,30 @@
+{
+  "name": "turbo-station-monitor",
+  "version": "1.0.0",
+  "description": "Observability stack for Turbo Station — OCPP collector, mobile telemetry, Vercel drain, GitHub CI webhook, alert engine, and Pagarme status webhook",
+  "private": true,
+  "scripts": {
+    "start": "pm2 start ecosystem.config.js",
+    "stop": "pm2 stop ecosystem.config.js",
+    "restart": "pm2 restart ecosystem.config.js",
+    "status": "pm2 list",
+    "logs": "pm2 logs",
+    "test": "node test-telemetry-endpoint.js && node test-alert-engine.js",
+    "test:telemetry": "node test-telemetry-endpoint.js",
+    "test:telemetry:live": "node test-telemetry-endpoint.js --live",
+    "test:alerts": "node test-alert-engine.js",
+    "db:create": "node create-db.js",
+    "db:backup": "node db-backup.js",
+    "maintenance": "node daily-maintenance.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.6.2",
+    "node-fetch": "^2.7.0",
+    "ws": "^8.19.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "author": "TurboStation Team",
+  "license": "UNLICENSED"
+}

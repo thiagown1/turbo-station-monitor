@@ -1,0 +1,12 @@
+{
+    "groupId": "120363423472541295@g.us",
+    "mode": "alert-only",
+    "filters": {
+        "minLevel": "ERROR",
+        "ignoreKeywords": ["TriggerMessage", "Timeout", "Heartbeat"]
+    },
+    "behavior": {
+        "replyToUser": false,
+        "allowCommands": false
+    }
+}

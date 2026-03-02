@@ -1,0 +1,50 @@
+# ─── Dependencies ───
+node_modules/
+
+# ─── Databases (runtime data, ~10GB+) ───
+db/*.db
+db/*.db-shm
+db/*.db-wal
+db/backups/
+# Stale .db files that ended up in root
+*.db
+
+# ─── Logs (PM2 output) ───
+logs/
+
+# ─── Runtime state files ───
+history/*.json
+github-webhook-queue.jsonl
+github-webhook-queue.jsonl.bak
+github-ack-debounce.json
+ci-fix-attempts.json
+last-report.json
+
+# ─── Backup files ───
+*.backup
+*.backup2
+*.bak
+*.bak.*
+*.patch
+
+# ─── Old phase completion reports (not needed in repo) ───
+COMPLETION_REPORT.txt
+PHASE3_COMPLETION_REPORT.txt
+PHASE3_SUMMARY.md
+PHASE4_COMPLETE.md
+PHASE4_HANDOFF.md
+PHASE4_QUICKREF.txt
+
+# ─── Environment ───
+.env
+.env.local
+.env.production
+
+# ─── OS / Editor ───
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
