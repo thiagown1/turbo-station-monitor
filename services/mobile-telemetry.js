@@ -100,13 +100,11 @@ function handleMobileTelemetry(req, res) {
     return true;
   }
 
-  // Validate API key
-  const apiKey = req.headers['x-telemetry-key'];
-  if (apiKey !== TELEMETRY_API_KEY) {
-    res.writeHead(401, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: 'Unauthorized' }));
-    return true;
-  }
+  // TODO: Re-enable auth in next mobile release. The current production app was
+  // deployed without TELEMETRY_API_KEY baked in (--dart-define), so it sends an
+  // empty key and gets 401. Once the next build ships with the key, restore:
+  //   const apiKey = req.headers['x-telemetry-key'];
+  //   if (apiKey !== TELEMETRY_API_KEY) { res.writeHead(401); ... }
 
   // Determine if the body is compressed
   const contentEncoding = (req.headers['content-encoding'] || '').toLowerCase();
