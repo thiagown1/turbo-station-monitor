@@ -82,6 +82,13 @@ try {
   process.exit(1);
 }
 
+const MONITOR_API_SECRET =
+  process.env.MONITOR_API_SECRET || '';
+
+// How long since last heartbeat before considering a user offline.
+// 3x the mobile heartbeat interval (30s) to account for flush delays.
+const PRESENCE_WINDOW_MS = 90_000;
+
 function handleHealth(req, res) {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/ping')) {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -89,6 +96,77 @@ function handleHealth(req, res) {
     return true;
   }
   return false;
+}
+
+function handleOnlineUsers(req, res) {
+  const parsedUrl = new URL(req.url, `http://localhost:${PORT}`);
+  if (parsedUrl.pathname !== '/api/telemetry/online-users') return false;
+
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Method not allowed' }));
+    return true;
+  }
+
+  // Validate shared secret
+  const secret = req.headers['x-monitor-secret'];
+  if (!MONITOR_API_SECRET || secret !== MONITOR_API_SECRET) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return true;
+  }
+
+  try {
+    const cutoff = Date.now() - PRESENCE_WINDOW_MS;
+
+    // TODO: Filter by brandId once mobile app sends it in telemetry payload.
+    // const brandId = parsedUrl.searchParams.get('brandId');
+
+    const stmt = db.prepare(`
+      SELECT
+        device_id,
+        user_id,
+        data_json,
+        MAX(event_timestamp) as last_seen
+      FROM mobile_events
+      WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
+        AND event_timestamp > ?
+      GROUP BY device_id
+      ORDER BY last_seen DESC
+    `);
+
+    const rows = stmt.all(cutoff);
+
+    const users = rows.map((row) => {
+      let lat = null;
+      let lng = null;
+      try {
+        const data = JSON.parse(row.data_json || '{}');
+        lat = data.lat ?? null;
+        lng = data.lng ?? null;
+      } catch (_) { /* ignore parse errors */ }
+
+      return {
+        device_id: row.device_id,
+        user_id: row.user_id,
+        last_seen: row.last_seen,
+        lat,
+        lng,
+      };
+    });
+
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-store',
+    });
+    res.end(JSON.stringify({ count: users.length, users }));
+  } catch (err) {
+    console.error('[mobile-telemetry] Error fetching online users:', err.message);
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Internal server error' }));
+  }
+
+  return true;
 }
 
 function handleMobileTelemetry(req, res) {
@@ -283,6 +361,7 @@ function handleMobileTelemetry(req, res) {
 
 function requestHandler(req, res) {
   if (handleHealth(req, res)) return;
+  if (handleOnlineUsers(req, res)) return;
   if (handleMobileTelemetry(req, res)) return;
 
   res.writeHead(404, { 'Content-Type': 'application/json' });
