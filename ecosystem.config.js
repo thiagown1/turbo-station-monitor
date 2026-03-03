@@ -71,7 +71,7 @@ module.exports = {
     },
     {
       name: 'mobile-telemetry',
-      script: './services/mobile-telemetry.js',
+      script: './services/mobile-telemetry/index.js',
       cwd: '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor',
       instances: 1,
       autorestart: true,
