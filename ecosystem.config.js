@@ -84,6 +84,7 @@ module.exports = {
       script: './services/mobile-telemetry/index.js',
       cwd: CWD,
       instances: 1,
+      exec_mode: 'fork',
       autorestart: true,
       watch: false,
       max_memory_restart: '150M',
