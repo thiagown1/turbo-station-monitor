@@ -19,6 +19,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^12.6.2",
+    "express": "^5.2.1",
     "node-fetch": "^2.7.0",
     "ws": "^8.19.0"
   },
@@ -26,5 +27,8 @@
     "node": ">=18.0.0"
   },
   "author": "TurboStation Team",
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "supertest": "^7.2.2"
+  }
 }

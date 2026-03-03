@@ -81,7 +81,7 @@ module.exports = {
     },
     {
       name: 'mobile-telemetry',
-      script: './services/mobile-telemetry.js',
+      script: './services/mobile-telemetry/index.js',
       cwd: CWD,
       instances: 1,
       autorestart: true,
