@@ -17,18 +17,18 @@ const { DB_PATH, LOG_TAG } = require('./constants');
 
 let db;
 try {
-    db = new Database(DB_PATH);
-    db.pragma('journal_mode = WAL');
-    console.log(`${LOG_TAG} Database connected: ${DB_PATH}`);
+  db = new Database(DB_PATH);
+  db.pragma('journal_mode = WAL');
+  console.log(`${LOG_TAG} Database connected: ${DB_PATH}`);
 } catch (err) {
-    console.error(`${LOG_TAG} Failed to connect to database:`, err.message);
-    process.exit(1);
+  console.error(`${LOG_TAG} Failed to connect to database:`, err.message);
+  process.exit(1);
 }
 
 // ─── Schema ─────────────────────────────────────────────────────────────────────
 
 try {
-    db.exec(`
+  db.exec(`
     -- Raw ingest: full payload kept for debugging and replay.
     CREATE TABLE IF NOT EXISTS mobile_raw (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -68,25 +68,39 @@ try {
     CREATE INDEX IF NOT EXISTS idx_mobile_events_session_id      ON mobile_events(session_id);
     CREATE INDEX IF NOT EXISTS idx_mobile_events_station_id      ON mobile_events(station_id);
     CREATE INDEX IF NOT EXISTS idx_mobile_events_event_type      ON mobile_events(event_type);
+
+    -- User-submitted diagnostic log dumps (auto-purged after 3 days).
+    CREATE TABLE IF NOT EXISTS user_log_dumps (
+      id           INTEGER PRIMARY KEY AUTOINCREMENT,
+      received_at  INTEGER NOT NULL,
+      user_id      TEXT,
+      device_id    TEXT,
+      app_version  TEXT,
+      platform     TEXT,
+      logs_json    TEXT NOT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_user_log_dumps_user_id     ON user_log_dumps(user_id);
+    CREATE INDEX IF NOT EXISTS idx_user_log_dumps_received_at ON user_log_dumps(received_at);
   `);
-    console.log(`${LOG_TAG} Schema ready (mobile_raw, mobile_events)`);
+  console.log(`${LOG_TAG} Schema ready (mobile_raw, mobile_events, user_log_dumps)`);
 } catch (err) {
-    console.error(`${LOG_TAG} Failed to initialise schema:`, err.message);
-    process.exit(1);
+  console.error(`${LOG_TAG} Failed to initialise schema:`, err.message);
+  process.exit(1);
 }
 
 // ─── Prepared Statements ────────────────────────────────────────────────────────
 // Created once at startup, reused per request for performance.
 
 const stmts = {
-    /** Insert a raw payload into mobile_raw. */
-    insertRaw: db.prepare(`
+  /** Insert a raw payload into mobile_raw. */
+  insertRaw: db.prepare(`
     INSERT INTO mobile_raw (received_at, session_id, device_id, app_version, platform, user_id, payload_json)
     VALUES (@received_at, @session_id, @device_id, @app_version, @platform, @user_id, @payload_json)
   `),
 
-    /** Insert a single normalised event into mobile_events. */
-    insertEvent: db.prepare(`
+  /** Insert a single normalised event into mobile_events. */
+  insertEvent: db.prepare(`
     INSERT INTO mobile_events (
       raw_id, received_at, event_timestamp, session_id, device_id,
       app_version, platform, user_id, event_type, station_id,
@@ -98,8 +112,8 @@ const stmts = {
     )
   `),
 
-    /** Get currently online users (presence heartbeats within the window). */
-    onlineUsers: db.prepare(`
+  /** Get currently online users (presence heartbeats within the window). */
+  onlineUsers: db.prepare(`
     SELECT device_id, user_id, data_json, MAX(event_timestamp) AS last_seen
     FROM mobile_events
     WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
@@ -108,12 +122,12 @@ const stmts = {
     ORDER BY last_seen DESC
   `),
 
-    /**
-     * Heatmap queries with and without time filter.
-     * Grouped by (device_id, 5-minute bucket) to avoid inflation from
-     * continuous heartbeats at the same location.
-     */
-    heatmapWithTime: db.prepare(`
+  /**
+   * Heatmap queries with and without time filter.
+   * Grouped by (device_id, 5-minute bucket) to avoid inflation from
+   * continuous heartbeats at the same location.
+   */
+  heatmapWithTime: db.prepare(`
     SELECT data_json
     FROM mobile_events
     WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
@@ -123,7 +137,7 @@ const stmts = {
     ORDER BY (event_timestamp / 300000) DESC
   `),
 
-    heatmapAll: db.prepare(`
+  heatmapAll: db.prepare(`
     SELECT data_json
     FROM mobile_events
     WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')

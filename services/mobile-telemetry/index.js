@@ -40,6 +40,9 @@ app.use('/api/telemetry/heatmap-data', requireSecret, require('./routes/heatmap-
 // Mobile app ingestion (auth temporarily disabled — see routes/ingest.js)
 app.use('/api/telemetry/mobile', require('./routes/ingest'));
 
+// User log dumps: POST is public (mobile submits), GET requires secret (admin queries)
+app.use('/api/telemetry/user-logs', require('./routes/user-logs'));
+
 // ─── 404 Fallback ───────────────────────────────────────────────────────────────
 
 app.use((_req, res) => {

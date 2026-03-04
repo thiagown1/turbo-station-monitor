@@ -287,6 +287,149 @@ test('POST /api/telemetry/mobile — presence events get lat/lng stored', async 
     assert.strictEqual(data.lng, -56.079);
 });
 
+// ── User Log Dumps ──────────────────────────────────────────────────────────────
+
+function makeLogDump(overrides = {}) {
+    return {
+        user_id: 'test-uid-logs',
+        device_id: 'test-device-001',
+        app_version: '2.0.0-test',
+        platform: 'android',
+        logs: {
+            app_logs: [
+                { timestamp: Date.now(), level: 'info', message: 'Test log entry 1' },
+                { timestamp: Date.now(), level: 'error', message: 'Test error entry' },
+            ],
+            network_logs: [
+                {
+                    timestamp: Date.now(),
+                    method: 'GET',
+                    url: 'https://api.example.com/test',
+                    status_code: 200,
+                    duration_ms: 150,
+                },
+            ],
+        },
+        ...overrides,
+    };
+}
+
+test('POST /api/telemetry/user-logs — valid payload → 202', async () => {
+    const payload = makeLogDump();
+    const res = await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(payload);
+    assert.strictEqual(res.status, 202);
+    assert.strictEqual(res.body.success, true);
+    assert.strictEqual(res.body.app_logs, 2);
+    assert.strictEqual(res.body.network_logs, 1);
+    assert.ok(typeof res.body.id === 'number');
+});
+
+test('POST /api/telemetry/user-logs — missing logs → 400', async () => {
+    const res = await request(app)
+        .post('/api/telemetry/user-logs')
+        .send({ user_id: 'x', device_id: 'y' });
+    assert.strictEqual(res.status, 400);
+    assert.ok(res.body.error.includes('logs'));
+});
+
+test('POST /api/telemetry/user-logs — empty logs object → 202', async () => {
+    const res = await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(makeLogDump({ logs: { app_logs: [], network_logs: [] } }));
+    assert.strictEqual(res.status, 202);
+    assert.strictEqual(res.body.app_logs, 0);
+    assert.strictEqual(res.body.network_logs, 0);
+});
+
+test('POST /api/telemetry/user-logs — data persists in DB', async () => {
+    const userId = 'persist-test-' + Date.now();
+    await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(makeLogDump({ user_id: userId }));
+
+    const row = db.prepare(
+        'SELECT * FROM user_log_dumps WHERE user_id = ?'
+    ).get(userId);
+
+    assert.ok(row, 'Row should exist in DB');
+    assert.strictEqual(row.user_id, userId);
+    assert.strictEqual(row.device_id, 'test-device-001');
+    assert.strictEqual(row.platform, 'android');
+
+    const logs = JSON.parse(row.logs_json);
+    assert.strictEqual(logs.app_logs.length, 2);
+    assert.strictEqual(logs.network_logs.length, 1);
+});
+
+test('GET /api/telemetry/user-logs without secret → 401', async () => {
+    const res = await request(app).get('/api/telemetry/user-logs');
+    assert.strictEqual(res.status, 401);
+});
+
+test('GET /api/telemetry/user-logs?user_id=X with secret → returns dumps', async () => {
+    const userId = 'query-test-' + Date.now();
+
+    // Insert two dumps for the same user
+    await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(makeLogDump({ user_id: userId }));
+    await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(makeLogDump({ user_id: userId }));
+
+    const res = await request(app)
+        .get(`/api/telemetry/user-logs?user_id=${userId}`)
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.user_id, userId);
+    assert.strictEqual(res.body.count, 2);
+    assert.ok(Array.isArray(res.body.dumps));
+    assert.ok(res.body.dumps[0].logs, 'Dump should include parsed logs');
+    assert.ok(res.body.dumps[0].logs.app_logs, 'Dump should include app_logs');
+});
+
+test('GET /api/telemetry/user-logs without user_id → returns summary list', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/user-logs')
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    assert.ok(typeof res.body.count === 'number');
+    assert.ok(Array.isArray(res.body.dumps));
+    // Summary should not include full logs_json, just logs_size
+    if (res.body.dumps.length > 0) {
+        assert.ok(typeof res.body.dumps[0].logs_size === 'number');
+        assert.strictEqual(res.body.dumps[0].logs, undefined);
+    }
+});
+
+test('POST /api/telemetry/user-logs — auto-purges entries older than 3 days', async () => {
+    const oldUserId = 'purge-test-old-' + Date.now();
+    const fourDaysMs = 4 * 24 * 60 * 60 * 1000;
+
+    // Manually insert an old entry
+    db.prepare(
+        `INSERT INTO user_log_dumps (received_at, user_id, device_id, app_version, platform, logs_json)
+         VALUES (?, ?, ?, ?, ?, ?)`
+    ).run(Date.now() - fourDaysMs, oldUserId, 'device', '1.0', 'android', '{"app_logs":[]}');
+
+    // Verify it exists
+    const before = db.prepare('SELECT * FROM user_log_dumps WHERE user_id = ?').get(oldUserId);
+    assert.ok(before, 'Old entry should exist before purge');
+
+    // POST triggers purge
+    await request(app)
+        .post('/api/telemetry/user-logs')
+        .send(makeLogDump());
+
+    // Old entry should be gone
+    const after = db.prepare('SELECT * FROM user_log_dumps WHERE user_id = ?').get(oldUserId);
+    assert.ok(!after, 'Old entry should be purged after POST');
+});
+
 // ─── Cleanup + Run ──────────────────────────────────────────────────────────────
 
 // Clean up test data after all tests
@@ -294,6 +437,7 @@ test._cleanup = () => {
     try {
         db.prepare("DELETE FROM mobile_events WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%'").run();
         db.prepare("DELETE FROM mobile_raw WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%'").run();
+        db.prepare("DELETE FROM user_log_dumps WHERE user_id LIKE 'test-%' OR user_id LIKE 'persist-test-%' OR user_id LIKE 'query-test-%' OR user_id LIKE 'purge-test-%'").run();
         console.log('\n🧹 Test data cleaned up');
     } catch (err) {
         console.error('Cleanup error:', err.message);

@@ -11,6 +11,8 @@ read-only query endpoints for the dashboard.
 | `GET` | `/api/telemetry/online-users` | `X-Monitor-Secret` | Currently active app users |
 | `GET` | `/api/telemetry/heatmap-data` | `X-Monitor-Secret` | Aggregated user demand density |
 | `POST` | `/api/telemetry/mobile` | *(disabled)* | Event ingestion from mobile app |
+| `POST` | `/api/telemetry/user-logs` | — | User-submitted diagnostic log dump |
+| `GET` | `/api/telemetry/user-logs` | `X-Monitor-Secret` | Query stored log dumps |
 
 ## Architecture
 
@@ -28,6 +30,7 @@ mobile-telemetry/
     online-users.js     ← GET /api/telemetry/online-users
     heatmap-data.js     ← GET /api/telemetry/heatmap-data
     ingest.js           ← POST /api/telemetry/mobile
+    user-logs.js        ← POST/GET /api/telemetry/user-logs
 ```
 
 ## Adding a New Route
