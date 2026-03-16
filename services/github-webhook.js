@@ -15,6 +15,7 @@
 const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const PORT = parseInt(process.env.PORT || '3002', 10);
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b367b04b35758df55a42b72d3c9ba65';
@@ -25,8 +26,28 @@ const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '1700081a5b367b
 const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
 const ACK_DEBOUNCE_PATH = path.join(__dirname, '..', 'github-ack-debounce.json');
+const AGENT_TASK_TRACKER_PATH = path.join(__dirname, '..', 'agent-task-followup.jsonl');
 
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads are small)
+
+function writeAgentTaskTracker(entry) {
+  try {
+    fs.appendFileSync(AGENT_TASK_TRACKER_PATH, `${JSON.stringify(entry)}\n`);
+  } catch (err) {
+    console.error('[github-webhook] Failed to write follow-up tracker:', err.message);
+  }
+}
+
+function formatFollowUpDirective({ reason, needHumanDecision = true, windowHours = 2 }) {
+  return (
+    `[FOLLOWUP_RULE]\n` +
+    `- need_human_decision: ${needHumanDecision}\n` +
+    `- active_window_hours: ${windowHours}\n` +
+    `- timeout_minutes: 10\n` +
+    `- se sem evidência: reenfileirar para o MESMO agente (sem escalar main)\n` +
+    `- tarefa: ${reason}`
+  );
+}
 
 function sendTelegramNotification(text, target = 'telegram:-5103508388') {
   const { exec } = require('child_process');
@@ -94,7 +115,7 @@ function sendOpenClawWake(text) {
   req.end();
 }
 
-function sendOpenClawAgent({ message, agentId, name, channel, to, wakeMode = 'now', deliver = true }) {
+function sendOpenClawAgent({ message, agentId, name, channel, to, wakeMode = 'now', deliver = true, sessionId }) {
   const postData = JSON.stringify({
     message,
     agentId,
@@ -103,6 +124,7 @@ function sendOpenClawAgent({ message, agentId, name, channel, to, wakeMode = 'no
     to,
     wakeMode,
     deliver,
+    sessionId,
   });
 
   const url = new URL('/hooks/agent', OPENCLAW_GATEWAY_URL);
@@ -266,6 +288,15 @@ function handleWebhook(req, res) {
         webhookEvent.pr_author = payload.pull_request?.user?.login;
         webhookEvent.pr_state = payload.pull_request?.state;
         webhookEvent.pr_merged = payload.pull_request?.merged;
+        webhookEvent.pr_action = payload.action;
+        webhookEvent.pr_label = payload.label?.name;
+      } else if (event === 'issues') {
+        webhookEvent.issue_number = payload.issue?.number;
+        webhookEvent.issue_title = payload.issue?.title;
+        webhookEvent.issue_body = payload.issue?.body;
+        webhookEvent.issue_url = payload.issue?.html_url;
+        webhookEvent.issue_author = payload.issue?.user?.login;
+        webhookEvent.issue_labels = (payload.issue?.labels || []).map((l) => (typeof l === 'string' ? l : l?.name)).filter(Boolean);
       } else if (event === 'push') {
         webhookEvent.ref = payload.ref;
         webhookEvent.pusher = payload.pusher?.name;
@@ -285,10 +316,19 @@ function handleWebhook(req, res) {
         webhookEvent.sender = payload.sender?.login;
       }
 
-      const author = webhookEvent.comment_author || webhookEvent.review_author || webhookEvent.pr_author || '';
+      const author = webhookEvent.comment_author || webhookEvent.review_author || webhookEvent.pr_author || webhookEvent.issue_author || '';
       const isBot = author === 'TurboStation-ai' || author.endsWith('[bot]') || author === 'github-actions';
 
-      const needsAttention = ['issue_comment', 'pull_request_review_comment', 'pull_request_review'].includes(event) && !isBot;
+      const bodyTextForFlags = webhookEvent.comment_body || webhookEvent.review_body || '';
+      // Old marker-based request (kept as fallback)
+      const isE2ERequest = isBot && bodyTextForFlags.includes('[REQ:E2E]') && ['issue_comment', 'pull_request_review_comment', 'pull_request_review'].includes(event);
+      // Preferred: label-based E2E request on PR
+      const isE2ELabelEvent = event === 'pull_request' && ['labeled', 'unlabeled'].includes(webhookEvent.pr_action) && webhookEvent.pr_label === 'needs:e2e';
+      const isIssueCreation = event === 'issues' && webhookEvent.action === 'opened';
+      const hasAgentLabel = Array.isArray(webhookEvent.issue_labels) && webhookEvent.issue_labels.some((l) => String(l).startsWith('agent:'));
+      const isIssueForScout = isIssueCreation && !hasAgentLabel;
+
+      const needsAttention = (['issue_comment', 'pull_request_review_comment', 'pull_request_review'].includes(event) && !isBot) || isE2ERequest || isE2ELabelEvent || isIssueForScout;
 
       // Spam guard:
       // - ignore edited comments for ACK (still enqueue + wake)
@@ -380,56 +420,134 @@ function handleWebhook(req, res) {
 
       // Instant ACK + Wake
       if (needsAttention) {
-        const bodyText = webhookEvent.comment_body || webhookEvent.review_body || '';
+        const bodyText = webhookEvent.comment_body || webhookEvent.review_body || webhookEvent.issue_body || '';
         const preview = bodyText.length > 100 ? bodyText.substring(0, 100) + '...' : bodyText;
 
-        const ackKey = `pr:${webhookEvent.pr_number}:author:${author}`;
-        const canAck = shouldAckThisEvent && shouldSendAck({ key: ackKey, windowMs: ackDebounceWindowMs });
+        // Issue-created routing (no agent: label): wake scout for triage.
+        if (isIssueForScout) {
+          const issueSessionId = `issue-${webhookEvent.issue_number}`;
+          writeAgentTaskTracker({
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            agentId: 'scout',
+            sessionId: issueSessionId,
+            reason: 'Issue triage',
+            source: 'issues.opened',
+            repository: webhookEvent.repository,
+            issueNumber: webhookEvent.issue_number,
+            sender: webhookEvent.issue_author,
+            needHumanDecision: false,
+            activeWindowHours: 2,
+            status: 'assigned',
+          });
+          sendOpenClawAgent({
+            agentId: 'scout',
+            wakeMode: 'now',
+            deliver: false,
+            sessionId: issueSessionId,
+            message:
+              `[AUTO][NEEDS_SCOUT]\n` +
+              `Nova issue sem label agent:*\n` +
+              `Issue #${webhookEvent.issue_number}: ${webhookEvent.issue_title || ''}\n` +
+              `Repo: ${webhookEvent.repository}\n` +
+              `Autor: ${webhookEvent.issue_author || ''}\n` +
+              `Link: ${webhookEvent.issue_url || ''}\n` +
+              `Ação: fazer triagem inicial e priorização.\n` +
+              `\n` +
+              formatFollowUpDirective({ reason: 'Issue triage', needHumanDecision: false, windowHours: 2 }),
+          });
+          console.log(`[github-webhook] Issue #${webhookEvent.issue_number} dispatched to scout for triage`);
+        }
 
-        if (canAck) {
-          const prUrl = getPullRequestUrl({ repository: webhookEvent.repository, prNumber: webhookEvent.pr_number, fallbackUrl: webhookEvent.pr_url });
-          const link = webhookEvent.comment_url || webhookEvent.review_url || prUrl;
-          const title = webhookEvent.pr_title ? ` — ${webhookEvent.pr_title}` : '';
-
-          // Keep ACK short but actionable: PR number + link.
-          const ackTarget = isShortTrader ? shortTraderGroup : 'telegram:-5103508388';
-          sendTelegramNotification(
-            `🔔 ${author} comentou (${webhookEvent.action}) na PR #${webhookEvent.pr_number}${title}\n${link || ''}\n"${preview}"\n⚡ Processando...`,
-            ackTarget
-          );
-
-          if (isShortTrader) {
-            // Trigger MoneyMan automatically for short_trader events.
+        if (!isIssueForScout) {
+          // Special case: tester requesting E2E on a PR.
+          // Preferred trigger: label `needs:e2e` (pull_request labeled event).
+          // Fallback: comment marker `[REQ:E2E]` by TurboStation-ai.
+          // We don't ACK in Telegram (to avoid spam), but we DO wake coder internally.
+          if (isE2ELabelEvent || isE2ERequest) {
+            const e2eSessionId = `pr-${webhookEvent.pr_number}-e2e`;
+            writeAgentTaskTracker({
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              agentId: 'coder',
+              sessionId: e2eSessionId,
+              reason: 'Tester request E2E',
+              source: event,
+              repository: webhookEvent.repository,
+              prNumber: webhookEvent.pr_number,
+              sender: author,
+              needHumanDecision: true,
+              activeWindowHours: 2,
+              status: 'assigned',
+            });
             sendOpenClawAgent({
-              agentId: 'moneyman',
-              name: 'GitHub short_trader',
-              channel: 'telegram',
-              to: '-5128168391',
+              agentId: 'coder',
+              name: 'Tester → Coder (E2E request)',
               wakeMode: 'now',
-              deliver: true,
+              deliver: false,
+              sessionId: e2eSessionId,
               message:
-                `Você é o MoneyMan. Chegou um evento do GitHub do repo ${webhookEvent.repository}.\n\n` +
-                `Tipo: ${webhookEvent.event} (${webhookEvent.action})\n` +
-                `Autor: ${author}\n` +
-                `PR: #${webhookEvent.pr_number || ''} ${webhookEvent.pr_title || ''}\n` +
-                `Link: ${link || ''}\n\n` +
-                `Preview: "${preview}"\n\n` +
-                `Tarefa: avalie se precisa agir (responder comentário, abrir PR, corrigir CI, etc). Se precisar mexer em código, clone/atualize o repo short_trader e faça a ação. Responda com um status curto + próximo passo.`,
+                `[AUTO][MUST_SPAWN_SUBAGENT][REQ:E2E]\n` +
+                `O tester solicitou E2E nesta PR.\n\n` +
+                `PR #${webhookEvent.pr_number}: ${webhookEvent.pr_title || ''}\n` +
+                `Link: ${(webhookEvent.comment_url || webhookEvent.review_url || webhookEvent.pr_url) || ''}\n\n` +
+                `Trigger: ${isE2ELabelEvent ? 'label needs:e2e' : 'comment [REQ:E2E]'}\n\n` +
+                `Pedido do tester (copiado):\n${bodyText || '(sem texto; ver label needs:e2e na PR)'}\n\n` +
+                `Ação OBRIGATÓRIA: spawnar subagent executor (runtime=subagent, agentId=coder) para executar o E2E solicitado e responder na PR com:\n` +
+                `- [DONE:E2E] + evidência (logs/prints/vídeo) + resultado (pass/fail)\n` +
+                `Se não for possível executar (ambiente/credenciais), responder [BLOCKED:E2E] com motivo específico.\n\n` +
+                formatFollowUpDirective({ reason: 'Tester request E2E', needHumanDecision: true, windowHours: 2 }),
             });
           }
-        } else {
-          console.log(`[github-webhook] ACK suppressed (debounce or edited) for ${ackKey}`);
-        }
 
-        // Keep current pipeline for the main system (Turbo Station).
-        // For short_trader we rely on sendOpenClawAgent above to route to MoneyMan.
-        if (!isShortTrader) {
-          sendOpenClawWake(
-            `🔔 GitHub: ${author} (${webhookEvent.action}) on PR #${webhookEvent.pr_number} (${webhookEvent.pr_title}): "${preview}"\n\n` +
-              `Process the github-webhook-queue.jsonl file. Read the comment, analyze if it needs a code fix or reply, and act accordingly.`
-          );
+          const ackKey = `pr:${webhookEvent.pr_number}:author:${author}`;
+          const canAck = shouldAckThisEvent && shouldSendAck({ key: ackKey, windowMs: ackDebounceWindowMs });
+
+          if (canAck) {
+            const prUrl = getPullRequestUrl({ repository: webhookEvent.repository, prNumber: webhookEvent.pr_number, fallbackUrl: webhookEvent.pr_url });
+            const link = webhookEvent.comment_url || webhookEvent.review_url || prUrl;
+            const title = webhookEvent.pr_title ? ` — ${webhookEvent.pr_title}` : '';
+
+            // Keep ACK short but actionable: PR number + link.
+            const ackTarget = isShortTrader ? shortTraderGroup : 'telegram:-5103508388';
+            sendTelegramNotification(
+              `🔔 ${author} comentou (${webhookEvent.action}) na PR #${webhookEvent.pr_number}${title}\n${link || ''}\n"${preview}"\n⚡ Processando...`,
+              ackTarget
+            );
+
+            if (isShortTrader) {
+              // Trigger MoneyMan automatically for short_trader events.
+              sendOpenClawAgent({
+                agentId: 'moneyman',
+                name: 'GitHub short_trader',
+                channel: 'telegram',
+                to: '-5128168391',
+                wakeMode: 'now',
+                deliver: true,
+                message:
+                  `Você é o MoneyMan. Chegou um evento do GitHub do repo ${webhookEvent.repository}.\n\n` +
+                  `Tipo: ${webhookEvent.event} (${webhookEvent.action})\n` +
+                  `Autor: ${author}\n` +
+                  `PR: #${webhookEvent.pr_number || ''} ${webhookEvent.pr_title || ''}\n` +
+                  `Link: ${link || ''}\n\n` +
+                  `Preview: "${preview}"\n\n` +
+                  `Tarefa: avalie se precisa agir (responder comentário, abrir PR, corrigir CI, etc). Se precisar mexer em código, clone/atualize o repo short_trader e faça a ação. Responda com um status curto + próximo passo.`,
+              });
+            }
+          } else {
+            console.log(`[github-webhook] ACK suppressed (debounce or edited) for ${ackKey}`);
+          }
+
+          // Keep current pipeline for the main system (Turbo Station).
+          // For short_trader we rely on sendOpenClawAgent above to route to MoneyMan.
+          if (!isShortTrader) {
+            sendOpenClawWake(
+              `🔔 GitHub: ${author} (${webhookEvent.action}) on PR #${webhookEvent.pr_number} (${webhookEvent.pr_title}): "${preview}"\n\n` +
+                `Process the github-webhook-queue.jsonl file. Read the comment, analyze if it needs a code fix or reply, and act accordingly.`
+            );
+          }
         }
-      } else if (ciNeedsAttention) { 
+      } else if (ciNeedsAttention) {
         const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '10', 10);
         const attempts = readJsonFileOrDefault(CI_ATTEMPTS_PATH, {});
         const runKey = `${webhookEvent.workflow_name}:${webhookEvent.head_branch}`;
@@ -460,12 +578,45 @@ function handleWebhook(req, res) {
         }
 
         if (!isShortTrader) {
-          sendOpenClawWake(
-            `🔴 CI Failed: "${webhookEvent.workflow_name}" on branch ${webhookEvent.head_branch} (attempt ${count}/${maxFixAttempts})\n\n` +
-              `Auto-fix: Read the CI failure logs with 'gh run view --log-failed', diagnose the issue, fix it if possible, commit and push. ` +
-              `If you cannot fix it or it's a pre-existing issue unrelated to our PR branch changes, notify in GitHub Hub with the diagnosis. ` +
-              `DO NOT attempt to fix pre-existing issues in the codebase that are unrelated to our PR branch changes.`
-          );
+          // Instead of waking a generic turn, dispatch the main agent to spawn a subagent executor.
+          // This avoids blocking any chat thread and prevents session-lock contention.
+          // Keep raw Telegram notification behavior unchanged.
+          // Additionally: wake the executor flow by dispatching an internal agent turn (no extra Telegram spam).
+                    const ciSessionId = `ci-pr-${webhookEvent.pr_number || webhookEvent.head_branch || 'unknown'}`;
+          writeAgentTaskTracker({
+            createdAt: Date.now(),
+            updatedAt: Date.now(),
+            agentId: 'coder',
+            sessionId: ciSessionId,
+            reason: `CI failure ${webhookEvent.workflow_name}`,
+            source: event,
+            repository: webhookEvent.repository,
+            prNumber: webhookEvent.pr_number || null,
+            sender: author,
+            needHumanDecision: true,
+            activeWindowHours: 2,
+            status: 'assigned',
+          });
+          sendOpenClawAgent({
+            agentId: 'coder',
+            name: 'GitHub CI → Coder',
+            // Internal wake (no extra Telegram message)
+            wakeMode: 'now',
+            deliver: false,
+            sessionId: ciSessionId,
+            message:
+              `[AUTO][MUST_SPAWN_SUBAGENT][CI]\n` +
+              `Você DEVE spawnar um subagent executor (runtime=subagent, agentId=coder) para executar a correção.\n` +
+              `NÃO faça o fix no seu próprio turno (evita lock/bloqueio de sessão).\n\n` +
+              `Repo: ${webhookEvent.repository}\n` +
+              `Branch: ${webhookEvent.head_branch}\n` +
+              `Workflow: ${webhookEvent.workflow_name}\n` +
+              `Run: ${runUrl || ''}\n` +
+              `Tentativa: ${count}/${maxFixAttempts}\n\n` +
+              `Tarefa do subagent: (1) abrir logs do run (gh run view --log-failed), (2) aplicar fix mínimo relacionado à branch/PR, (3) commit+push, (4) confirmar CI verde.\n` +
+              `Se for falha preexistente fora da branch, apenas reportar diagnóstico curto no grupo GitHub e parar.\n\n` +
+              formatFollowUpDirective({ reason: `CI failure ${webhookEvent.workflow_name}`, needHumanDecision: true, windowHours: 2 }),
+          });
         }
 
         // Dispatch to Night workers when the CI issue is persisting
