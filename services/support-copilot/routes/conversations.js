@@ -35,13 +35,33 @@ const BRAND_TO_INSTANCE = Object.entries(EVOLUTION_INSTANCE_BRAND_MAP).reduce((m
 router.get('/', (req, res) => {
   const brandId = req.query.brand_id || req.query.brandId;
   if (!brandId) return res.status(400).json({ error: 'brand_id required' });
-  // Include __test__ conversations alongside the brand's real conversations
-  const rows = db.prepare(
-    `SELECT c.*,
-       (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
-     FROM conversations c WHERE c.brand_id IN (?, '__test__') ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
-  ).all(brandId);
-  res.json({ conversations: rows });
+
+  // Channel filter: 'whatsapp' (default, 1:1), 'whatsapp-group' (groups), 'all'
+  const channel = req.query.channel || 'whatsapp';
+
+  let rows;
+  if (channel === 'all') {
+    rows = db.prepare(
+      `SELECT c.*,
+         (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
+       FROM conversations c WHERE c.brand_id IN (?, '__test__') ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
+    ).all(brandId);
+  } else if (channel === 'whatsapp-group') {
+    rows = db.prepare(
+      `SELECT c.*,
+         (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
+       FROM conversations c WHERE c.brand_id = ? AND c.channel = 'whatsapp-group' ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
+    ).all(brandId);
+  } else {
+    // Default: 1:1 whatsapp + test conversations (exclude groups)
+    rows = db.prepare(
+      `SELECT c.*,
+         (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
+       FROM conversations c WHERE c.brand_id IN (?, '__test__') AND c.channel != 'whatsapp-group' ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
+    ).all(brandId);
+  }
+
+  res.json({ conversations: rows, channel });
 });
 
 // ─── Bulk reset sessions (on MD changes) ──────────────────────────────────────
@@ -141,9 +161,9 @@ router.post('/:id/messages', async (req, res) => {
 
   console.log(`${LOG_TAG} Message sent in conv ${conv.id}`);
 
-  // Send to WhatsApp via Evolution API
+  // Send to WhatsApp via Evolution API (1:1 or group)
   let deliveryStatus = 'sent';
-  if (conv.customer_phone && conv.channel === 'whatsapp') {
+  if (conv.customer_phone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
     const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
     sendText(instance, conv.customer_phone, msgBody)
       .then(() => {
@@ -249,8 +269,8 @@ router.post('/:id/media', async (req, res) => {
 
   console.log(`${LOG_TAG} Media message (${type}) sent in conv ${conv.id}`);
 
-  // Send to WhatsApp via Evolution API
-  if (conv.customer_phone && conv.channel === 'whatsapp') {
+  // Send to WhatsApp via Evolution API (1:1 or group)
+  if (conv.customer_phone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
     const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
     // Send base64 directly to Evolution API
     const base64WithPrefix = `data:${mimetype};base64,${base64}`;

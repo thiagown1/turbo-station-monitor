@@ -29,13 +29,33 @@ const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone } = require('../lib/db');
-const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP } = require('../lib/constants');
+const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { emitEvent } = require('../lib/sse');
 
 const router = Router();
 const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
 // Ensure media directory exists
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
+
+/**
+ * Async helper: fetch group subject (name) from WhatsApp gateway and update the conversation.
+ * Runs in the background — does NOT block the webhook response.
+ */
+function fetchGroupName(instance, groupJid, conversationId) {
+  const url = `${EVOLUTION_API_URL}/group/${encodeURIComponent(instance)}/${encodeURIComponent(groupJid)}/metadata`;
+  fetch(url)
+    .then(r => r.ok ? r.json() : null)
+    .then(data => {
+      if (data?.subject) {
+        db.prepare('UPDATE conversations SET customer_name = ?, updated_at = ? WHERE id = ?')
+          .run(data.subject, nowIso(), conversationId);
+        console.log(`${LOG_TAG} Updated group name for ${conversationId}: "${data.subject}"`);
+      }
+    })
+    .catch(err => {
+      console.warn(`${LOG_TAG} Could not fetch group metadata for ${groupJid}:`, err.message);
+    });
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -189,12 +209,11 @@ router.post('/', (req, res) => {
     return res.json({ ok: true, skipped: true, reason: 'protocolMessage detected' });
   }
 
-  // Skip group messages (only handle 1:1 support chats)
-  if (isGroupMessage(key.remoteJid)) {
-    return res.json({ ok: true, skipped: true, reason: 'group message' });
-  }
+  // Detect group messages — store with separate channel
+  const isGroup = isGroupMessage(key.remoteJid);
+  const channel = isGroup ? 'whatsapp-group' : 'whatsapp';
 
-  // Extract phone from JID
+  // Extract phone from JID (for 1:1) or group JID (for groups)
   const phone = phoneFromJid(key.remoteJid);
   if (!phone) {
     return res.status(400).json({ error: 'Could not extract phone from remoteJid' });
@@ -231,6 +250,119 @@ router.post('/', (req, res) => {
 
   const normalizedPhone = normalizePhone(phone);
   const externalMessageId = key.id;
+
+  // ─── Group conversations ──────────────────────────────────────────────
+  if (isGroup) {
+    // For groups: use the group JID as the conversation key
+    // The sender is tracked via pushName in the message body prefix
+    const groupJid = key.remoteJid;
+    const senderName = pushName || (key.participant ? phoneFromJid(key.participant) : null) || 'Unknown';
+
+    // Find or create group conversation by group JID
+    let existing = db.prepare(
+      `SELECT * FROM conversations WHERE brand_id = ? AND channel = 'whatsapp-group' AND customer_phone = ?`
+    ).get(brandId, groupJid);
+
+    const now = nowIso();
+    let conversationId;
+    let created = false;
+
+    if (existing) {
+      conversationId = existing.id;
+      db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?')
+        .run(now, existing.id);
+
+      // Backfill group name if still using fallback JID-based name
+      if (existing.customer_name && existing.customer_name.startsWith('Grupo 1')) {
+        fetchGroupName(instance, groupJid, existing.id);
+      }
+    } else {
+      conversationId = randomId('conv');
+      created = true;
+      // Use the group JID as customer_phone (stable group identifier)
+      db.prepare(`
+        INSERT INTO conversations (id, brand_id, channel, external_user_id, external_conversation_id,
+          customer_phone, customer_name, status, assigned_agent_id, priority,
+          last_message_at, last_inbound_at, last_outbound_at, unread_count, created_at, updated_at)
+        VALUES (?, ?, 'whatsapp-group', NULL, ?, ?, ?, 'open', NULL, 'normal', NULL, NULL, NULL, 0, ?, ?)
+      `).run(conversationId, brandId, groupJid, groupJid, `Grupo ${groupJid.split('@')[0]}`, now, now);
+      console.log(`${LOG_TAG} Created group conv ${conversationId} for ${groupJid}`);
+      // Async: fetch real group name from gateway
+      fetchGroupName(instance, groupJid, conversationId);
+    }
+
+    // Dedup by external_message_id
+    if (externalMessageId) {
+      const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
+      if (dup) return res.json({ id: dup.id, conversationId, duplicate: true });
+    }
+
+    // Insert message — prefix body with sender name for group context
+    const msgId = randomId('msg');
+    const mediaJson = media ? JSON.stringify(media) : null;
+    const groupBody = direction === 'inbound' ? `[${senderName}]: ${body}` : body;
+
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
+        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?)
+      `).run(msgId, conversationId, brandId, direction, groupBody, null, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, now);
+
+      if (direction === 'inbound') {
+        db.prepare('UPDATE conversations SET last_message_at = ?, last_inbound_at = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?')
+          .run(now, now, now, conversationId);
+      } else {
+        db.prepare('UPDATE conversations SET last_message_at = ?, last_outbound_at = ?, updated_at = ? WHERE id = ?')
+          .run(now, now, now, conversationId);
+      }
+    })();
+
+    console.log(`${LOG_TAG} Group ingest: ${created ? 'new' : 'existing'} conv ${conversationId}, msg ${msgId}, group ${groupJid}, sender ${senderName}`);
+
+    // Push SSE event
+    const updatedConv = stmts.getConversation.get(conversationId);
+    emitEvent({
+      type: created ? 'conversation_created' : 'message',
+      conversationId,
+      direction,
+      brandId,
+      channel: 'whatsapp-group',
+      message: {
+        id: msgId,
+        conversation_id: conversationId,
+        brand_id: brandId,
+        direction,
+        source: 'evolution',
+        body: groupBody,
+        author_id: null,
+        media_json: mediaJson,
+        delivery_status: direction === 'outbound' ? 'sent' : null,
+        created_at: now,
+      },
+      conversation: updatedConv ? {
+        id: updatedConv.id,
+        status: updatedConv.status,
+        customerName: updatedConv.customer_name,
+        customerPhone: updatedConv.customer_phone,
+        lastMessageAt: updatedConv.last_message_at,
+        unreadCount: updatedConv.unread_count,
+        lastMessagePreview: groupBody,
+        profilePicUrl: updatedConv.profile_pic_url,
+        tags: updatedConv.tags_json ? JSON.parse(updatedConv.tags_json) : [],
+      } : null,
+    });
+
+    return res.status(201).json({
+      id: msgId,
+      conversationId,
+      created,
+      duplicate: false,
+      source: 'evolution',
+      channel: 'whatsapp-group',
+    });
+  }
+
+  // ─── 1:1 conversations (existing logic below) ─────────────────────────
 
   // Detect LID format (WhatsApp internal ID, not a real phone number — typically > 13 digits)
   const isLid = normalizedPhone.length > 13;
