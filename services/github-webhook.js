@@ -714,8 +714,8 @@ function handleWebhook(req, res) {
               'telegram:-5103508388'
             );
 
-            // Delay restart slightly so the notification has time to send
-            const restartDelay = servicesToRestart.has('github-webhook') ? 2000 : 500;
+            // Delay restart so the notification CLI has time to complete
+            const restartDelay = servicesToRestart.has('github-webhook') ? 5000 : 500;
             setTimeout(() => {
               const restartCmd = [...servicesToRestart].map(s => `pm2 restart ${s} --update-env`).join(' && ');
               exec(restartCmd, { timeout: 30000 }, (restartErr) => {
