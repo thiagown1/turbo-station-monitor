@@ -700,34 +700,33 @@ function handleWebhook(req, res) {
             if (servicesToRestart.size === 0) {
               console.log('[auto-deploy] No service files changed, skipping restart');
               sendTelegramNotification(
-                `📦 Monitor atualizado (sem restart):\n"${commitMsg}" by ${pusher}`,
+                `📦 Monitor atualizado (sem restart): "${commitMsg}" by ${pusher}`,
                 'telegram:-5103508388'
               );
               return;
             }
 
-            // Step 3: Restart affected services
-            const services = [...servicesToRestart].join(' ');
-            const restartCmd = [...servicesToRestart].map(s => `pm2 restart ${s} --update-env`).join(' && ');
+            // Step 3: Send notification FIRST, then restart
+            // (If github-webhook itself is restarted, we'd lose the notification)
+            const services = [...servicesToRestart].join(', ');
+            sendTelegramNotification(
+              `🚀 Auto-deploy turbo-station-monitor: "${commitMsg}" by ${pusher} | Reiniciando: ${services}`,
+              'telegram:-5103508388'
+            );
 
-            exec(restartCmd, { timeout: 30000 }, (restartErr) => {
-              if (restartErr) {
-                console.error(`[auto-deploy] pm2 restart failed: ${restartErr.message}`);
-                sendTelegramNotification(
-                  `⚠️ Auto-deploy: pull OK mas restart falhou (${services}):\n${restartErr.message.substring(0, 200)}`,
-                  'telegram:-5103508388'
-                );
-              } else {
-                // Save PM2 state after restart
-                exec('pm2 save', { timeout: 10000 }, () => {});
-
-                console.log(`[auto-deploy] ✅ Restarted: ${services}`);
-                sendTelegramNotification(
-                  `🚀 Auto-deploy turbo-station-monitor:\n"${commitMsg}" by ${pusher}\n♻️ Reiniciado: ${services}`,
-                  'telegram:-5103508388'
-                );
-              }
-            });
+            // Delay restart slightly so the notification has time to send
+            const restartDelay = servicesToRestart.has('github-webhook') ? 2000 : 500;
+            setTimeout(() => {
+              const restartCmd = [...servicesToRestart].map(s => `pm2 restart ${s} --update-env`).join(' && ');
+              exec(restartCmd, { timeout: 30000 }, (restartErr) => {
+                if (restartErr) {
+                  console.error(`[auto-deploy] pm2 restart failed: ${restartErr.message}`);
+                } else {
+                  exec('pm2 save', { timeout: 10000 }, () => {});
+                  console.log(`[auto-deploy] ✅ Restarted: ${services}`);
+                }
+              });
+            }, restartDelay);
           });
         }
       }
