@@ -273,6 +273,14 @@ const stmts = {
      ORDER BY datetime(created_at) DESC
      LIMIT 5`
   ),
+  // Find a duplicate conversation with the same phone or alias (for auto-merge)
+  // Excludes the given conversation ID to avoid self-match
+  findDuplicateConv: db.prepare(
+    `SELECT * FROM conversations
+     WHERE brand_id = ? AND channel = 'whatsapp' AND id != ?
+     AND (customer_phone = ? OR (',' || phone_aliases || ',') LIKE ('%,' || ? || ',%'))
+     LIMIT 1`
+  ),
   // Session context tracking
   getSessionContext: db.prepare(
     `SELECT * FROM session_context WHERE conversation_id = ?`
@@ -288,4 +296,66 @@ const stmts = {
   ),
 };
 
-module.exports = { db, stmts, nowIso, randomId, normalizePhone };
+/**
+ * Merge source conversation into target conversation.
+ * Moves all messages, suggestions, and audit logs from source to target.
+ * Combines phone numbers and aliases. Deletes the source conversation.
+ *
+ * @param {string} targetId - The conversation ID to keep
+ * @param {string} sourceId - The conversation ID to merge and delete
+ * @returns {{ merged: boolean, targetId: string, sourceId: string }} result
+ */
+function mergeConversations(targetId, sourceId) {
+  const target = stmts.getConversation.get(targetId);
+  const source = stmts.getConversation.get(sourceId);
+  if (!target || !source) return { merged: false, targetId, sourceId, reason: 'not_found' };
+  if (target.id === source.id) return { merged: false, targetId, sourceId, reason: 'same_conversation' };
+
+  const now = nowIso();
+  db.transaction(() => {
+    // Move messages
+    db.prepare('UPDATE messages SET conversation_id = ? WHERE conversation_id = ?')
+      .run(target.id, source.id);
+    // Move suggestions
+    db.prepare('UPDATE suggestions SET conversation_id = ? WHERE conversation_id = ?')
+      .run(target.id, source.id);
+    // Move audit log
+    db.prepare('UPDATE audit_log SET conversation_id = ? WHERE conversation_id = ?')
+      .run(target.id, source.id);
+    // Merge phone info: prefer the real phone number
+    if (source.customer_phone && !target.customer_phone) {
+      db.prepare('UPDATE conversations SET customer_phone = ? WHERE id = ?')
+        .run(source.customer_phone, target.id);
+    }
+    if (source.customer_name && !target.customer_name) {
+      db.prepare('UPDATE conversations SET customer_name = ? WHERE id = ?')
+        .run(source.customer_name, target.id);
+    }
+    // Profile pic: keep whichever exists
+    if (source.profile_pic_url && !target.profile_pic_url) {
+      db.prepare('UPDATE conversations SET profile_pic_url = ? WHERE id = ?')
+        .run(source.profile_pic_url, target.id);
+    }
+    // Merge aliases — combine all known identifiers
+    const allAliases = new Set();
+    if (target.phone_aliases) target.phone_aliases.split(',').forEach(a => allAliases.add(a));
+    if (source.phone_aliases) source.phone_aliases.split(',').forEach(a => allAliases.add(a));
+    if (source.customer_phone) allAliases.add(source.customer_phone);
+    if (target.customer_phone) allAliases.add(target.customer_phone);
+    // Remove the primary phone from aliases (it's already in customer_phone)
+    const primaryPhone = target.customer_phone || source.customer_phone;
+    if (primaryPhone) allAliases.delete(primaryPhone);
+    const mergedAliases = [...allAliases].filter(Boolean).join(',') || null;
+    db.prepare('UPDATE conversations SET phone_aliases = ?, updated_at = ? WHERE id = ?')
+      .run(mergedAliases, now, target.id);
+    // Delete source conversation
+    db.prepare('DELETE FROM conversations WHERE id = ?').run(source.id);
+    // Audit
+    db.prepare(`INSERT INTO audit_log (id, brand_id, conversation_id, action, actor_user_id, metadata_json, created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(randomId('audit'), target.brand_id, target.id, 'support.auto_merge', null, JSON.stringify({ merged_from: source.id, source_phone: source.customer_phone, source_aliases: source.phone_aliases }), now);
+  })();
+
+  return { merged: true, targetId: target.id, sourceId: source.id };
+}
+
+module.exports = { db, stmts, nowIso, randomId, normalizePhone, mergeConversations };

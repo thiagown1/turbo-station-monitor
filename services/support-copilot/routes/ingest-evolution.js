@@ -28,7 +28,7 @@
 const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
-const { db, stmts, nowIso, randomId, normalizePhone } = require('../lib/db');
+const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
 const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { emitEvent } = require('../lib/sse');
 
@@ -409,6 +409,24 @@ router.post('/', (req, res) => {
         UPDATE conversations SET customer_phone = ?, updated_at = ? WHERE id = ?
       `).run(normalizedPhone, now, existing.id);
       console.log(`${LOG_TAG} Backfilled customer_phone=${normalizedPhone} on conv ${existing.id}`);
+
+      // Auto-merge: check if ANOTHER conversation already has this real phone number.
+      // This happens when: Conv A (real phone) exists, then customer messages via LID (Conv B created).
+      // When we backfill Conv B's phone, we detect Conv A as duplicate and merge them.
+      const duplicate = stmts.findDuplicateConv.get(brandId, existing.id, normalizedPhone, normalizedPhone);
+      if (duplicate) {
+        // Keep the conversation with more messages (or the older one if equal)
+        const existingMsgCount = stmts.countMessages.get(existing.id)?.total || 0;
+        const dupMsgCount = stmts.countMessages.get(duplicate.id)?.total || 0;
+        const keepId = dupMsgCount > existingMsgCount ? duplicate.id : existing.id;
+        const mergeId = keepId === existing.id ? duplicate.id : existing.id;
+        const result = mergeConversations(keepId, mergeId);
+        if (result.merged) {
+          console.log(`${LOG_TAG} Auto-merged conv ${mergeId} into ${keepId} (phone=${normalizedPhone})`);
+          conversationId = keepId;
+          emitEvent({ type: 'conversation_merged', targetId: keepId, sourceId: mergeId, brandId });
+        }
+      }
     }
 
     // Cross-link: if conv has a real phone but this message came via LID,
@@ -421,6 +439,18 @@ router.post('/', (req, res) => {
           UPDATE conversations SET phone_aliases = ?, updated_at = ? WHERE id = ?
         `).run(newAliases, now, existing.id);
         console.log(`${LOG_TAG} Added LID ${normalizedPhone} as alias on conv ${existing.id}`);
+      }
+
+      // Auto-merge: check if there's an orphaned LID-only conv that should be merged.
+      // This happens when: Conv B (LID only, no phone) exists, then customer contacts via real phone (Conv A).
+      // When a new LID message arrives for Conv A, check if Conv B still exists separately.
+      const lidDuplicate = stmts.findDuplicateConv.get(brandId, existing.id, normalizedPhone, normalizedPhone);
+      if (lidDuplicate) {
+        const result = mergeConversations(existing.id, lidDuplicate.id);
+        if (result.merged) {
+          console.log(`${LOG_TAG} Auto-merged LID-only conv ${lidDuplicate.id} into ${existing.id}`);
+          emitEvent({ type: 'conversation_merged', targetId: existing.id, sourceId: lidDuplicate.id, brandId });
+        }
       }
     }
 

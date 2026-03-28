@@ -16,7 +16,7 @@
  */
 
 const { Router } = require('express');
-const { db, stmts, nowIso, randomId } = require('../lib/db');
+const { db, stmts, nowIso, randomId, mergeConversations } = require('../lib/db');
 const { LOG_TAG, EVOLUTION_API_KEY } = require('../lib/constants');
 const { sendText, sendMedia } = require('../lib/evolution-client');
 const { emitEvent } = require('../lib/sse');
@@ -421,40 +421,10 @@ router.post('/:id/merge', (req, res) => {
   if (!target) return res.status(404).json({ error: 'Target conversation not found' });
   if (!source) return res.status(404).json({ error: 'Source conversation not found' });
 
-  const now = nowIso();
-  db.transaction(() => {
-    // Move messages
-    db.prepare('UPDATE messages SET conversation_id = ? WHERE conversation_id = ?')
-      .run(target.id, source.id);
-    // Move suggestions
-    db.prepare('UPDATE suggestions SET conversation_id = ? WHERE conversation_id = ?')
-      .run(target.id, source.id);
-    // Move audit log
-    db.prepare('UPDATE audit_log SET conversation_id = ? WHERE conversation_id = ?')
-      .run(target.id, source.id);
-    // Merge phone info
-    if (source.customer_phone && !target.customer_phone) {
-      db.prepare('UPDATE conversations SET customer_phone = ? WHERE id = ?')
-        .run(source.customer_phone, target.id);
-    }
-    if (source.customer_name && !target.customer_name) {
-      db.prepare('UPDATE conversations SET customer_name = ? WHERE id = ?')
-        .run(source.customer_name, target.id);
-    }
-    // Merge aliases
-    const allAliases = new Set();
-    if (target.phone_aliases) target.phone_aliases.split(',').forEach(a => allAliases.add(a));
-    if (source.phone_aliases) source.phone_aliases.split(',').forEach(a => allAliases.add(a));
-    if (source.customer_phone) allAliases.add(source.customer_phone);
-    const mergedAliases = [...allAliases].filter(Boolean).join(',') || null;
-    db.prepare('UPDATE conversations SET phone_aliases = ?, updated_at = ? WHERE id = ?')
-      .run(mergedAliases, now, target.id);
-    // Delete source conversation
-    db.prepare('DELETE FROM conversations WHERE id = ?').run(source.id);
-    // Audit
-    db.prepare(`INSERT INTO audit_log (id, brand_id, conversation_id, action, actor_user_id, metadata_json, created_at) VALUES (?,?,?,?,?,?,?)`)
-      .run(randomId('audit'), target.brand_id, target.id, 'support.merge', null, JSON.stringify({ merged_from: source.id }), now);
-  })();
+  const result = mergeConversations(target.id, source.id);
+  if (!result.merged) {
+    return res.status(400).json({ error: 'Merge failed', reason: result.reason });
+  }
 
   console.log(`${LOG_TAG} Merged conv ${source.id} into ${target.id}`);
   emitEvent({ type: 'conversation_update', conversationId: target.id, brandId: target.brand_id });
