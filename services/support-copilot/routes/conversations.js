@@ -44,7 +44,9 @@ router.get('/', (req, res) => {
     rows = db.prepare(
       `SELECT c.*,
          (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
-       FROM conversations c WHERE c.brand_id IN (?, '__test__') ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
+       FROM conversations c WHERE c.brand_id IN (?, '__test__')
+         AND NOT (c.customer_name IS NULL AND c.customer_phone IS NULL)
+       ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
     ).all(brandId);
   } else if (channel === 'whatsapp-group') {
     rows = db.prepare(
@@ -53,11 +55,13 @@ router.get('/', (req, res) => {
        FROM conversations c WHERE c.brand_id = ? AND c.channel = 'whatsapp-group' ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
     ).all(brandId);
   } else {
-    // Default: 1:1 whatsapp + test conversations (exclude groups)
+    // Default: 1:1 whatsapp + test conversations (exclude groups and ghost convs with no name/phone)
     rows = db.prepare(
       `SELECT c.*,
          (SELECT m.body FROM messages m WHERE m.conversation_id = c.id ORDER BY datetime(m.created_at) DESC LIMIT 1) AS last_message_preview
-       FROM conversations c WHERE c.brand_id IN (?, '__test__') AND c.channel != 'whatsapp-group' ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
+       FROM conversations c WHERE c.brand_id IN (?, '__test__') AND c.channel != 'whatsapp-group'
+         AND NOT (c.customer_name IS NULL AND c.customer_phone IS NULL)
+       ORDER BY datetime(COALESCE(c.last_message_at, c.updated_at)) DESC`
     ).all(brandId);
   }
 
