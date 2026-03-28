@@ -239,15 +239,16 @@ const stmts = {
     `SELECT * FROM audit_log WHERE conversation_id = ? ORDER BY datetime(created_at) ASC`
   ),
   findConvByPhone: db.prepare(
-    `SELECT * FROM conversations WHERE brand_id = ? AND channel = 'whatsapp' AND customer_phone = ? LIMIT 1`
+    `SELECT * FROM conversations WHERE channel = 'whatsapp' AND customer_phone = ? LIMIT 1`
   ),
   findConvByAlias: db.prepare(
-    `SELECT * FROM conversations WHERE brand_id = ? AND channel = 'whatsapp' AND (',' || phone_aliases || ',') LIKE ('%,' || ? || ',%') LIMIT 1`
+    `SELECT * FROM conversations WHERE channel = 'whatsapp' AND (',' || phone_aliases || ',') LIKE ('%,' || ? || ',%') LIMIT 1`
   ),
   // Unified: find by phone OR alias (fixes LID ↔ phone dedup)
+  // NOTE: brand-agnostic — phone uniquely identifies a customer regardless of brand_id.
   findConvByPhoneOrAlias: db.prepare(
     `SELECT * FROM conversations
-     WHERE brand_id = ? AND channel = 'whatsapp'
+     WHERE channel = 'whatsapp'
      AND (customer_phone = ? OR (',' || phone_aliases || ',') LIKE ('%,' || ? || ',%'))
      LIMIT 1`
   ),
@@ -275,9 +276,10 @@ const stmts = {
   ),
   // Find a duplicate conversation with the same phone or alias (for auto-merge)
   // Excludes the given conversation ID to avoid self-match
+  // NOTE: brand-agnostic — phone uniquely identifies a customer regardless of brand_id.
   findDuplicateConv: db.prepare(
     `SELECT * FROM conversations
-     WHERE brand_id = ? AND channel = 'whatsapp' AND id != ?
+     WHERE channel = 'whatsapp' AND id != ?
      AND (customer_phone = ? OR (',' || phone_aliases || ',') LIKE ('%,' || ? || ',%'))
      LIMIT 1`
   ),

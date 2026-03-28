@@ -371,7 +371,15 @@ router.post('/', (req, res) => {
   // Unified lookup: check both customer_phone AND phone_aliases in one query.
   // This fixes the LID ↔ phone dedup gap where a LID-created conv (phone=null)
   // would not be found when outbound messages arrive with the real phone number.
-  let existing = stmts.findConvByPhoneOrAlias.get(brandId, normalizedPhone, normalizedPhone);
+  let existing = stmts.findConvByPhoneOrAlias.get(normalizedPhone, normalizedPhone);
+
+  // Self-heal brand_id: if instance mapping changed, update conv to correct brand
+  if (existing && existing.brand_id !== brandId) {
+    db.prepare('UPDATE conversations SET brand_id = ?, updated_at = ? WHERE id = ?')
+      .run(brandId, nowIso(), existing.id);
+    console.log(`${LOG_TAG} Self-healed brand_id on conv ${existing.id}: ${existing.brand_id} → ${brandId}`);
+    existing.brand_id = brandId;
+  }
 
   const now = nowIso();
   let conversationId;
@@ -413,7 +421,7 @@ router.post('/', (req, res) => {
       // Auto-merge: check if ANOTHER conversation already has this real phone number.
       // This happens when: Conv A (real phone) exists, then customer messages via LID (Conv B created).
       // When we backfill Conv B's phone, we detect Conv A as duplicate and merge them.
-      const duplicate = stmts.findDuplicateConv.get(brandId, existing.id, normalizedPhone, normalizedPhone);
+      const duplicate = stmts.findDuplicateConv.get(existing.id, normalizedPhone, normalizedPhone);
       if (duplicate) {
         // Keep the conversation with more messages (or the older one if equal)
         const existingMsgCount = stmts.countMessages.get(existing.id)?.total || 0;
@@ -444,7 +452,7 @@ router.post('/', (req, res) => {
       // Auto-merge: check if there's an orphaned LID-only conv that should be merged.
       // This happens when: Conv B (LID only, no phone) exists, then customer contacts via real phone (Conv A).
       // When a new LID message arrives for Conv A, check if Conv B still exists separately.
-      const lidDuplicate = stmts.findDuplicateConv.get(brandId, existing.id, normalizedPhone, normalizedPhone);
+      const lidDuplicate = stmts.findDuplicateConv.get(existing.id, normalizedPhone, normalizedPhone);
       if (lidDuplicate) {
         const result = mergeConversations(existing.id, lidDuplicate.id);
         if (result.merged) {
