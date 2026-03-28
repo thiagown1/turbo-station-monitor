@@ -494,6 +494,48 @@ router.post('/', (req, res) => {
           last_message_at, last_inbound_at, last_outbound_at, unread_count, created_at, updated_at)
         VALUES (?, ?, 'whatsapp', NULL, NULL, ?, ?, 'open', NULL, 'normal', NULL, NULL, NULL, 0, ?, ?)
       `).run(conversationId, brandId, normalizedPhone, customerName || null, now, now);
+
+      // ─── Outbound phone → LID merge ───────────────────────────
+      // If we just created a new conv from an outbound to a real phone,
+      // check for existing LID-only conversations (customer_phone IS NULL)
+      // that have the same WhatsApp contact. We can detect this because
+      // Evolution sends the contact name as pushName even for outbound.
+      // Merge them so we don't get duplicates (Charlles scenario).
+      if (direction === 'outbound') {
+        const contactName = pushName || data.pushName;
+        if (contactName) {
+          const lidConv = db.prepare(`
+            SELECT * FROM conversations
+            WHERE customer_phone IS NULL
+              AND customer_name = ?
+              AND channel = 'whatsapp'
+            ORDER BY last_message_at DESC
+            LIMIT 1
+          `).get(contactName);
+
+          if (lidConv) {
+            // Merge: keep the LID conv (has all the history) and absorb the new phone conv
+            const newConvMsgCount = 0; // just created, 0 messages inserted yet
+            const lidMsgCount = stmts.countMessages.get(lidConv.id)?.total || 0;
+            const keepId = lidMsgCount > 0 ? lidConv.id : conversationId;
+            const mergeId = keepId === lidConv.id ? conversationId : lidConv.id;
+
+            // Backfill the phone on the LID conv before merging
+            db.prepare(`
+              UPDATE conversations SET customer_phone = ?,
+                phone_aliases = CASE WHEN phone_aliases IS NULL OR phone_aliases = '' THEN ? ELSE phone_aliases || ',' || ? END,
+                updated_at = ? WHERE id = ?
+            `).run(normalizedPhone, normalizedPhone, normalizedPhone, now, lidConv.id);
+
+            const result = mergeConversations(keepId, mergeId);
+            if (result.merged) {
+              console.log(`${LOG_TAG} Outbound phone→LID merge: ${mergeId} into ${keepId} (name=${contactName}, phone=${normalizedPhone})`);
+              conversationId = keepId;
+              emitEvent({ type: 'conversation_merged', targetId: keepId, sourceId: mergeId, brandId });
+            }
+          }
+        }
+      }
     }
   }
 
