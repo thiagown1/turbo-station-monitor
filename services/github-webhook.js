@@ -639,6 +639,99 @@ function handleWebhook(req, res) {
         }
       }
 
+      // ── Auto-deploy turbo-station-monitor on push to main ──────────
+      if (event === 'push' && payload.ref === 'refs/heads/main' && payload.repository?.full_name === 'thiagown1/turbo-station-monitor') {
+        const deployKey = `deploy:turbo-station-monitor:${payload.after}`;
+        const shouldDeploy = shouldSendAck({ key: deployKey, windowMs: 30 * 1000 }); // 30s dedup
+
+        if (shouldDeploy) {
+          const { exec } = require('child_process');
+          const monitorDir = '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor';
+          const commitMsg = (payload.head_commit?.message || '').substring(0, 80);
+          const pusher = payload.pusher?.name || 'unknown';
+
+          console.log(`[auto-deploy] turbo-station-monitor push by ${pusher}: "${commitMsg}"`);
+
+          // Step 1: git pull
+          exec(`cd ${monitorDir} && git pull origin main`, { timeout: 30000 }, (pullErr, pullStdout) => {
+            if (pullErr) {
+              console.error(`[auto-deploy] git pull failed: ${pullErr.message}`);
+              sendTelegramNotification(
+                `❌ Auto-deploy falhou (git pull):\n${pullErr.message.substring(0, 200)}`,
+                'telegram:-5103508388'
+              );
+              return;
+            }
+
+            console.log(`[auto-deploy] git pull: ${pullStdout.trim()}`);
+
+            // Step 2: Detect which services changed based on committed files
+            const changedFiles = (payload.commits || []).flatMap(c =>
+              [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
+            );
+
+            const serviceMap = {
+              'services/support-copilot/': 'support-copilot',
+              'services/whatsapp-gateway/': 'whatsapp-gateway',
+              'services/smart-collector.js': 'ocpp-collector',
+              'services/alert-processor.js': 'ocpp-alerts',
+              'services/vercel-drain.js': 'vercel-drain',
+              'services/github-webhook.js': 'github-webhook',
+              'services/mobile-telemetry/': 'mobile-telemetry',
+              'services/pagarme-status-webhook.js': 'pagarme-status-webhook',
+              'services/alert-engine.js': 'alert-engine',
+            };
+
+            const servicesToRestart = new Set();
+
+            // If ecosystem.config.js changed, restart everything
+            if (changedFiles.some(f => f === 'ecosystem.config.js' || f === '.env')) {
+              Object.values(serviceMap).forEach(s => servicesToRestart.add(s));
+            } else {
+              for (const file of changedFiles) {
+                for (const [prefix, service] of Object.entries(serviceMap)) {
+                  if (file.startsWith(prefix)) {
+                    servicesToRestart.add(service);
+                  }
+                }
+              }
+            }
+
+            if (servicesToRestart.size === 0) {
+              console.log('[auto-deploy] No service files changed, skipping restart');
+              sendTelegramNotification(
+                `📦 Monitor atualizado (sem restart):\n"${commitMsg}" by ${pusher}`,
+                'telegram:-5103508388'
+              );
+              return;
+            }
+
+            // Step 3: Restart affected services
+            const services = [...servicesToRestart].join(' ');
+            const restartCmd = [...servicesToRestart].map(s => `pm2 restart ${s} --update-env`).join(' && ');
+
+            exec(restartCmd, { timeout: 30000 }, (restartErr) => {
+              if (restartErr) {
+                console.error(`[auto-deploy] pm2 restart failed: ${restartErr.message}`);
+                sendTelegramNotification(
+                  `⚠️ Auto-deploy: pull OK mas restart falhou (${services}):\n${restartErr.message.substring(0, 200)}`,
+                  'telegram:-5103508388'
+                );
+              } else {
+                // Save PM2 state after restart
+                exec('pm2 save', { timeout: 10000 }, () => {});
+
+                console.log(`[auto-deploy] ✅ Restarted: ${services}`);
+                sendTelegramNotification(
+                  `🚀 Auto-deploy turbo-station-monitor:\n"${commitMsg}" by ${pusher}\n♻️ Reiniciado: ${services}`,
+                  'telegram:-5103508388'
+                );
+              }
+            });
+          });
+        }
+      }
+
       // Auto-update release notes for TestFlight tags
       if (releaseAutoNotesEnabled && event === 'release') {
         const tag = payload.release?.tag_name;
