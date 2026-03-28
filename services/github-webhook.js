@@ -33,10 +33,10 @@ const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads 
 
 function sendTelegramNotification(text, target = 'telegram:-5103508388') {
   const { exec } = require('child_process');
-  // Escape for a double-quoted shell string.
-  const escaped = text.replace(/"/g, '\\"').replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  // Use single-quote escaping (same pattern as alert-engine.js which works reliably)
+  const escaped = text.replace(/'/g, "'\\''");
   exec(
-    `openclaw message send --channel telegram --target ${target} -m "${escaped}"`,
+    `openclaw message send --channel telegram --target '${target}' --message '${escaped}'`,
     { timeout: 10000 },
     (err) => {
       if (err) console.error(`[telegram-notify] CLI failed: ${err.message}`);
