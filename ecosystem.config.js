@@ -122,6 +122,50 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
       env: { ...dotenv }
+    },
+    {
+      name: 'support-copilot',
+      script: './services/support-copilot/index.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '150M',
+      error_file: './logs/support-copilot-error.log',
+      out_file: './logs/support-copilot-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: {
+        ...dotenv,
+        PORT: dotenv.SUPPORT_COPILOT_PORT || 3005,
+        EVOLUTION_API_URL: `http://localhost:${dotenv.GATEWAY_PORT || 3006}`,
+        EVOLUTION_API_KEY: dotenv.EVOLUTION_API_KEY || '',
+        EVOLUTION_WEBHOOK_SECRET: dotenv.EVOLUTION_WEBHOOK_SECRET || '',
+        EVOLUTION_INSTANCE_MAP: dotenv.EVOLUTION_INSTANCE_MAP || 'turbo:turbo_station',
+      }
+    },
+    {
+      name: 'whatsapp-gateway',
+      script: './services/whatsapp-gateway/index.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '200M',
+      error_file: './logs/whatsapp-gateway-error.log',
+      out_file: './logs/whatsapp-gateway-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: {
+        ...dotenv,
+        GATEWAY_PORT: dotenv.GATEWAY_PORT || 3006,
+        GATEWAY_AUTH_DIR: path.join(CWD, 'services', 'whatsapp-gateway', 'auth'),
+        GATEWAY_WEBHOOK_URL: `http://localhost:${dotenv.SUPPORT_COPILOT_PORT || 3005}/api/support/ingest/evolution`,
+        GATEWAY_INSTANCE_NAME: dotenv.GATEWAY_INSTANCE_NAME || 'turbostation',
+        EVOLUTION_WEBHOOK_SECRET: dotenv.EVOLUTION_WEBHOOK_SECRET || '',
+      }
     }
   ]
 };
