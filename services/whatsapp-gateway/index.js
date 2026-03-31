@@ -218,9 +218,24 @@ async function startInstance(name) {
         console.log(`${LOG_TAG} [${name}] Reconnecting in 5s...`);
         inst.reconnectTimer = setTimeout(() => startInstance(name), 5000);
       } else {
-        console.log(`${LOG_TAG} [${name}] Logged out — needs re-pairing`);
+        console.log(`${LOG_TAG} [${name}] Logged out — clearing auth and restarting for new QR`);
         inst.connectedAt = null;
         inst.phoneNumber = null;
+
+        // Clear stale auth so a fresh QR is generated on restart
+        const dir = authDir(name);
+        if (fs.existsSync(dir)) {
+          fs.rmSync(dir, { recursive: true, force: true });
+          console.log(`${LOG_TAG} [${name}] Auth state cleared after logout`);
+        }
+
+        // Restart after a short delay to generate a new QR for re-pairing
+        inst.reconnectTimer = setTimeout(() => {
+          console.log(`${LOG_TAG} [${name}] Restarting for new QR code...`);
+          startInstance(name).catch(err => {
+            console.error(`${LOG_TAG} [${name}] Restart after logout failed:`, err.message);
+          });
+        }, 3000);
       }
     }
   });
@@ -584,6 +599,32 @@ app.get('/group/:instance/:jid/metadata', async (req, res) => {
     });
   } catch (err) {
     console.error(`${LOG_TAG} [${req.params.instance}] Group metadata failed for ${jid}:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/debug/resolve/:instance/:phone', async (req, res) => {
+  const inst = instances.get(req.params.instance);
+  if (!inst || inst.state !== 'open') return res.status(503).json({ error: 'Instance not connected' });
+  try {
+    const jid = req.params.phone.includes('@') ? req.params.phone : `${req.params.phone.replace(/\D/g, '')}@s.whatsapp.net`;
+    const result = await inst.sock.onWhatsApp(jid);
+    
+    // Attempt to fetch profile picture, status, or any contact metadata that might include LID
+    let metadata = {};
+    try {
+      const [contact] = await inst.sock.onWhatsApp(jid);
+      metadata.onWhatsApp = contact;
+    } catch(e) {}
+    
+    // Try USync if available
+    try {
+      const { requestPhoneNumber } = require('baileys');
+      // not easily accessible here
+    } catch(e) {}
+
+    res.json({ jid, result, metadata });
+  } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });

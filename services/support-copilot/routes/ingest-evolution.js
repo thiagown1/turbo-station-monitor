@@ -373,6 +373,13 @@ router.post('/', (req, res) => {
   // would not be found when outbound messages arrive with the real phone number.
   let existing = stmts.findConvByPhoneOrAlias.get(normalizedPhone, normalizedPhone);
 
+  // If not found normally, check if this is the real phone replying to a validation challenge
+  if (!existing && !isLid) {
+    try {
+      existing = db.prepare(`SELECT * FROM conversations WHERE pending_validation_phone = ? AND status != 'closed' LIMIT 1`).get(normalizedPhone);
+    } catch (e) { /* ignore if column missing */ }
+  }
+
   // Self-heal brand_id: if instance mapping changed, update conv to correct brand
   if (existing && existing.brand_id !== brandId) {
     db.prepare('UPDATE conversations SET brand_id = ?, updated_at = ? WHERE id = ?')
@@ -437,8 +444,6 @@ router.post('/', (req, res) => {
       }
     }
 
-    // Cross-link: if conv has a real phone but this message came via LID,
-    // add the LID to aliases if not already there.
     if (isLid && existing.customer_phone) {
       const aliases = existing.phone_aliases || '';
       if (!aliases.split(',').includes(normalizedPhone)) {
@@ -540,10 +545,28 @@ router.post('/', (req, res) => {
   }
 
   // ─── Dedup by external_message_id ─────────────────────────────────────
+  let isDashboardDedup = false;
   if (externalMessageId) {
     const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
     if (dup) {
       return res.json({ id: dup.id, conversationId, duplicate: true });
+    }
+
+    // Fallback dedup for outbound messages (dashboard operator sends via Evolution → WhatsApp echo returns)
+    if (direction === 'outbound') {
+      const recentOutbound = db.prepare(`
+        SELECT id, body FROM messages 
+        WHERE conversation_id = ? AND direction = 'outbound' AND external_message_id IS NULL AND datetime(created_at) > datetime('now', '-120 seconds')
+        ORDER BY datetime(created_at) DESC LIMIT 5
+      `).all(conversationId);
+      
+      const trimmedBody = body.trim();
+      const match = recentOutbound.find(m => m.body.trim() === trimmedBody);
+      if (match) {
+        db.prepare('UPDATE messages SET external_message_id = ? WHERE id = ?').run(externalMessageId, match.id);
+        console.log(`${LOG_TAG} Dedup matched outbound echo to local msg ${match.id}`);
+        return res.json({ id: match.id, conversationId, duplicate: true });
+      }
     }
   }
 
@@ -701,6 +724,8 @@ router.post('/', (req, res) => {
             const lastMsg = allMsgs[allMsgs.length - 1];
             if (lastMsg?.direction === 'outbound') return;
 
+            emitEvent({ type: 'copilot_started', conversationId, brandId });
+
             const result = await generateSuggestion(conv, allMsgs);
             // generateSuggestion returns { text, model, waiting?, noReply?, tags? }
             if (!result?.text || result.waiting || result.noReply) return;
@@ -728,8 +753,8 @@ router.post('/', (req, res) => {
             // Auto-respond if enabled
             if (settings.auto_respond && result.model !== 'template-fallback') {
               const { sendText } = require('../lib/evolution-client');
-              const customerPhone = conv.customer_phone;
-              if (customerPhone) {
+              const customerPhone = conv.customer_phone || (conv.channel === 'whatsapp' && conv.phone_aliases ? `${conv.phone_aliases.split(',')[0]}@lid` : null);
+              if (customerPhone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
                 // Resolve the Evolution API instance name for this brand
                 const instanceName = Object.entries(EVOLUTION_INSTANCE_BRAND_MAP)
                   .find(([, brand]) => brand === brandId)?.[0] || brandId;
@@ -785,6 +810,7 @@ router.post('/', (req, res) => {
             }
           } catch (err) {
             console.warn(`${LOG_TAG} [auto-suggest] Failed for ${conversationId}:`, err.message);
+            emitEvent({ type: 'copilot_failed', conversationId, brandId, error: err.message });
           }
         }, DEBOUNCE_MS);
       }

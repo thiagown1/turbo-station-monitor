@@ -167,9 +167,10 @@ router.post('/:id/messages', async (req, res) => {
 
   // Send to WhatsApp via Evolution API (1:1 or group)
   let deliveryStatus = 'sent';
-  if (conv.customer_phone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
+  const targetPhone = conv.customer_phone || (conv.channel === 'whatsapp' && conv.phone_aliases ? `${conv.phone_aliases.split(',')[0]}@lid` : null);
+  if (targetPhone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
     const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
-    sendText(instance, conv.customer_phone, msgBody)
+    sendText(instance, targetPhone, msgBody)
       .then(() => {
         db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('sent', id);
         emitEvent({ type: 'delivery_update', conversationId: conv.id, brandId: conv.brand_id, messageId: id, deliveryStatus: 'sent' });
@@ -274,11 +275,12 @@ router.post('/:id/media', async (req, res) => {
   console.log(`${LOG_TAG} Media message (${type}) sent in conv ${conv.id}`);
 
   // Send to WhatsApp via Evolution API (1:1 or group)
-  if (conv.customer_phone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
+  const targetPhone = conv.customer_phone || (conv.channel === 'whatsapp' && conv.phone_aliases ? `${conv.phone_aliases.split(',')[0]}@lid` : null);
+  if (targetPhone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
     const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
     // Send base64 directly to Evolution API
     const base64WithPrefix = `data:${mimetype};base64,${base64}`;
-    sendMedia(instance, conv.customer_phone, type, base64WithPrefix, caption || '', fileName || localFileName, mimetype)
+    sendMedia(instance, targetPhone, type, base64WithPrefix, caption || '', fileName || localFileName, mimetype)
       .then(() => {
         db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('sent', id);
       })
@@ -413,6 +415,123 @@ router.post('/:id/escalate', (req, res) => {
   console.log(`${LOG_TAG} Conv ${conv.id} escalated to ${escalated_to || 'team'}`);
   emitEvent({ type: 'conversation_update', conversationId: conv.id, brandId: conv.brand_id });
   res.json({ ok: true });
+});
+
+// ─── Bind Phone Number ────────────────────────────────────────────────────
+router.patch('/:id/phone', async (req, res) => {
+  const { id } = req.params;
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Phone number required' });
+
+  const conv = stmts.getConversation.get(id);
+  if (!conv) return res.status(404).json({ error: 'Not found' });
+
+  let normalizedPhone = phone.replace(/\D/g, '');
+  // Add Brazil country code if missing
+  if (normalizedPhone.length <= 11) normalizedPhone = '55' + normalizedPhone;
+
+  // Resolve via WhatsApp to get canonical JID (handles BR 9th digit stripping)
+  try {
+    const http = require('http');
+    const gwPort = process.env.GATEWAY_PORT || '3006';
+    const gwUrl = `http://localhost:${gwPort}/debug/resolve/turbo/${normalizedPhone}`;
+    const resolved = await new Promise((resolve, reject) => {
+      http.get(gwUrl, (resp) => {
+        let data = '';
+        resp.on('data', c => data += c);
+        resp.on('end', () => {
+          try { resolve(JSON.parse(data)); } catch { resolve(null); }
+        });
+      }).on('error', reject);
+    });
+    if (resolved?.result?.[0]?.jid) {
+      const resolvedPhone = resolved.result[0].jid.split('@')[0];
+      if (resolvedPhone !== normalizedPhone) {
+        console.log(`${LOG_TAG} WhatsApp resolved ${normalizedPhone} → ${resolvedPhone}`);
+      }
+      normalizedPhone = resolvedPhone;
+    }
+  } catch (err) {
+    console.warn(`${LOG_TAG} WhatsApp resolve failed, using raw number:`, err.message);
+  }
+
+  const now = nowIso();
+
+  try {
+    db.prepare('UPDATE conversations SET customer_phone = ?, updated_at = ? WHERE id = ?')
+      .run(normalizedPhone, now, id);
+
+    // Send validation message through normal message flow (shows on dashboard + WhatsApp)
+    const validationMsg = 'Só um momento, vou verificar o que pode ter acontecido.';
+    const msgId = randomId('msg');
+
+    db.transaction(() => {
+      db.prepare(`
+        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, delivery_status, created_at)
+        VALUES (?, ?, ?, 'outbound', 'system', ?, NULL, NULL, 'pending', ?)
+      `).run(msgId, conv.id, conv.brand_id, validationMsg, now);
+
+      db.prepare('UPDATE conversations SET last_message_at = ?, last_outbound_at = ?, unread_count = 0, updated_at = ? WHERE id = ?')
+        .run(now, now, now, conv.id);
+    })();
+
+    // Send to WhatsApp via the real phone number
+    const targetJid = `${normalizedPhone}@s.whatsapp.net`;
+    const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
+    sendText(instance, targetJid, validationMsg)
+      .then(() => {
+        db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('sent', msgId);
+        emitEvent({ type: 'delivery_update', conversationId: conv.id, brandId: conv.brand_id, messageId: msgId, deliveryStatus: 'sent' });
+        console.log(`${LOG_TAG} Validation message sent to ${targetJid}`);
+      })
+      .catch(err => {
+        db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('failed', msgId);
+        emitEvent({ type: 'delivery_update', conversationId: conv.id, brandId: conv.brand_id, messageId: msgId, deliveryStatus: 'failed' });
+        console.error(`${LOG_TAG} Validation message failed:`, err.message);
+      });
+
+    // SSE: push the new message + conversation update to the dashboard
+    const updatedConv = stmts.getConversation.get(id);
+    emitEvent({
+      type: 'message',
+      conversationId: conv.id,
+      direction: 'outbound',
+      brandId: conv.brand_id,
+      message: {
+        id: msgId,
+        conversation_id: conv.id,
+        brand_id: conv.brand_id,
+        direction: 'outbound',
+        source: 'system',
+        body: validationMsg,
+        author_id: null,
+        media_json: null,
+        delivery_status: 'pending',
+        created_at: now,
+      },
+      conversation: updatedConv ? {
+        id: updatedConv.id,
+        status: updatedConv.status,
+        customerName: updatedConv.customer_name,
+        customerPhone: updatedConv.customer_phone,
+        lastMessageAt: updatedConv.last_message_at,
+        unreadCount: updatedConv.unread_count,
+        lastMessagePreview: validationMsg,
+        profilePicUrl: updatedConv.profile_pic_url,
+        tags: updatedConv.tags_json ? JSON.parse(updatedConv.tags_json) : [],
+      } : null,
+    });
+    emitEvent({ type: 'conversation_update', conversationId: updatedConv.id, brandId: updatedConv.brand_id });
+
+    // Audit log
+    db.prepare(`INSERT INTO audit_log (id, brand_id, conversation_id, action, actor_user_id, metadata_json, created_at) VALUES (?,?,?,?,?,?,?)`)
+      .run(randomId('audit'), conv.brand_id, conv.id, 'support.phone_bound', null, JSON.stringify({ phone: normalizedPhone }), now);
+
+    res.json({ ok: true, phone: normalizedPhone, validationMessageId: msgId });
+  } catch (err) {
+    console.error(`${LOG_TAG} Bind phone failed:`, err.message);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Merge conversations ──────────────────────────────────────────────────
@@ -555,6 +674,8 @@ router.post('/:id/suggest', async (req, res) => {
   const tags = conv.tags ? conv.tags.split(',').filter(Boolean) : [];
 
   try {
+    emitEvent({ type: 'copilot_started', conversationId: conv.id, brandId: conv.brand_id });
+    
     const result = await generateSuggestion(conv, messages, { userData, tags });
 
     // If copilot says no suggestion is needed (operator sent last msg, waiting for client)
@@ -590,6 +711,7 @@ router.post('/:id/suggest', async (req, res) => {
     });
   } catch (err) {
     console.error(`${LOG_TAG} Copilot suggestion failed:`, err.message);
+    emitEvent({ type: 'copilot_failed', conversationId: conv.id, brandId: conv.brand_id, error: err.message });
     res.status(500).json({ error: 'Failed to generate suggestion' });
   }
 });
@@ -720,6 +842,8 @@ router.post('/nuke', async (req, res) => {
 
   console.log(`${LOG_TAG} ⚠️ NUKE initiated for brand ${brandId}`);
 
+  const fs = require('fs');
+  const path = require('path');
   const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
   const counts = {};
 
