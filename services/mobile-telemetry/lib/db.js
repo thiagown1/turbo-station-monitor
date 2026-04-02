@@ -125,43 +125,29 @@ const stmts = {
   /**
    * Heatmap queries with and without time filter.
    *
-   * Two-level aggregation:
-   *   1. Deduplicate per (device_id, 5-min bucket) to remove heartbeat spam.
-   *   2. Group the deduplicated points into a ~111 m geo-grid and count
-   *      occurrences per cell. The resulting `weight` tells the frontend
-   *      how "hot" each area is.
+   * Deduplicated per (device_id, 5-minute bucket) to avoid inflation from
+   * continuous heartbeats at the same location. Each row represents one
+   * unique user presence observation; the frontend controls visual intensity
+   * via maxIntensity so that only areas with many distinct observations
+   * appear "hot".
    */
   heatmapWithTime: db.prepare(`
-    SELECT data_json, COUNT(*) AS weight
-    FROM (
-      SELECT data_json
-      FROM mobile_events
-      WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
-        AND data_json IS NOT NULL
-        AND event_timestamp > ?
-      GROUP BY device_id, (event_timestamp / 300000)
-    )
-    WHERE data_json IS NOT NULL
-    GROUP BY
-      CAST(json_extract(data_json, '$.lat') * 1000 AS INTEGER),
-      CAST(json_extract(data_json, '$.lng') * 1000 AS INTEGER)
-    ORDER BY weight DESC
+    SELECT data_json, 1 AS weight
+    FROM mobile_events
+    WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
+      AND data_json IS NOT NULL
+      AND event_timestamp > ?
+    GROUP BY device_id, (event_timestamp / 300000)
+    ORDER BY (event_timestamp / 300000) DESC
   `),
 
   heatmapAll: db.prepare(`
-    SELECT data_json, COUNT(*) AS weight
-    FROM (
-      SELECT data_json
-      FROM mobile_events
-      WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
-        AND data_json IS NOT NULL
-      GROUP BY device_id, (event_timestamp / 300000)
-    )
-    WHERE data_json IS NOT NULL
-    GROUP BY
-      CAST(json_extract(data_json, '$.lat') * 1000 AS INTEGER),
-      CAST(json_extract(data_json, '$.lng') * 1000 AS INTEGER)
-    ORDER BY weight DESC
+    SELECT data_json, 1 AS weight
+    FROM mobile_events
+    WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
+      AND data_json IS NOT NULL
+    GROUP BY device_id, (event_timestamp / 300000)
+    ORDER BY (event_timestamp / 300000) DESC
   `),
 };
 
