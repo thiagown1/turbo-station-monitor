@@ -30,12 +30,17 @@ router.get('/', (req, res) => {
             : stmts.heatmapAll.all();
 
         const points = [];
+        let totalEvents = 0;
         for (const row of rows) {
             const { lat, lng } = parseLocation(row.data_json);
-            if (lat != null && lng != null) points.push({ lat, lng });
+            if (lat != null && lng != null) {
+                const w = row.weight || 1;
+                points.push({ lat, lng, weight: w });
+                totalEvents += w;
+            }
         }
 
-        res.set('Cache-Control', 'max-age=60').json({ count: points.length, period, points });
+        res.set('Cache-Control', 'max-age=60').json({ count: points.length, totalEvents, period, points });
     } catch (err) {
         console.error(`${LOG_TAG} Error fetching heatmap data:`, err.message);
         res.status(500).json({ error: 'Internal server error' });
