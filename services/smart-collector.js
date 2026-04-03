@@ -118,8 +118,45 @@ const HEARTBEAT_DB_INTERVAL = 5 * 60 * 1000; // Save 1 heartbeat per charger eve
 const METER_VALUE_DB_INTERVAL = 5 * 60 * 1000; // Save 1 meter value per charger every 5 min
 
 let restPollStarted = false;
+let restPollInterval = null; // interval handle for REST polling
 let lastRestCursorIso = null; // ISO timestamp of last ingested REST entry
 
+// === WS HEALTH TRACKING ===
+let lastWsMessageAt = 0; // timestamp (ms) of last WS message received
+const WS_SILENCE_THRESHOLD_MS = 30_000; // activate REST fallback after 30s of WS silence
+let wsHealthCheckInterval = null;
+
+// === DEDUP ===
+// Sliding-window set to prevent double-processing entries from WS + REST
+// Key: `${timestamp}|${message_prefix}` — auto-expires after 60s
+const recentEntryKeys = new Map(); // key -> expiry timestamp (ms)
+const DEDUP_WINDOW_MS = 60_000; // 60s dedup window
+const DEDUP_CLEAN_INTERVAL_MS = 30_000; // purge expired keys every 30s
+
+// === DEDUP HELPERS ===
+function makeDedupeKey(timestamp, message) {
+    // Use first 80 chars of message to avoid memory bloat but still be unique enough
+    const ts = new Date(timestamp).getTime() || 0;
+    const msgPrefix = (message || '').substring(0, 80);
+    return `${ts}|${msgPrefix}`;
+}
+
+function isDuplicate(timestamp, message) {
+    const key = makeDedupeKey(timestamp, message);
+    if (recentEntryKeys.has(key)) return true;
+    // Register this entry
+    recentEntryKeys.set(key, Date.now() + DEDUP_WINDOW_MS);
+    return false;
+}
+
+function cleanExpiredDedupeKeys() {
+    const now = Date.now();
+    for (const [key, expiry] of recentEntryKeys) {
+        if (expiry < now) recentEntryKeys.delete(key);
+    }
+}
+
+// === REST FALLBACK (only when WS is silent) ===
 async function pollOcppLogsRestOnce() {
     try {
         const params = new URLSearchParams();
@@ -142,14 +179,22 @@ async function pollOcppLogsRestOnce() {
         // Ensure chronological order so cursor moves forward
         entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
 
+        let ingested = 0;
         for (const e of entries) {
-            // Normalize to the same shape the WS emits inside msg.data
+            // Dedup: skip if already processed via WS
+            if (isDuplicate(e.timestamp, e.message)) continue;
+
             processEntry({
                 timestamp: e.timestamp,
                 level: e.level,
                 logger: e.logger,
                 message: e.message
             });
+            ingested++;
+        }
+
+        if (ingested > 0) {
+            console.log(`🌐 [rest-poll] ingested ${ingested} entries (${entries.length - ingested} deduped)`);
         }
 
         // Advance cursor to last entry timestamp (plus 1ms to avoid duplicates)
@@ -167,10 +212,32 @@ function startRestPolling() {
     if (restPollStarted) return;
     restPollStarted = true;
 
-    // Kick once immediately, then interval
+    console.log(`🌐 REST fallback ACTIVATED (WS silent for ${WS_SILENCE_THRESHOLD_MS / 1000}s)`);
     pollOcppLogsRestOnce();
-    setInterval(pollOcppLogsRestOnce, REST_POLL_INTERVAL_MS);
-    console.log(`🌐 REST fallback enabled: ${REST_BASE_URL} (every ${REST_POLL_INTERVAL_MS}ms)`);
+    restPollInterval = setInterval(pollOcppLogsRestOnce, REST_POLL_INTERVAL_MS);
+}
+
+function stopRestPolling() {
+    if (!restPollStarted) return;
+    restPollStarted = false;
+
+    if (restPollInterval) {
+        clearInterval(restPollInterval);
+        restPollInterval = null;
+    }
+    console.log('🌐 REST fallback PAUSED (WS recovered)');
+}
+
+// Periodically check if WS went silent and toggle REST polling
+function startWsHealthCheck() {
+    if (wsHealthCheckInterval) return;
+    wsHealthCheckInterval = setInterval(() => {
+        const silenceMs = Date.now() - lastWsMessageAt;
+        if (silenceMs >= WS_SILENCE_THRESHOLD_MS && !restPollStarted) {
+            console.warn(`⚠️ WS silent for ${Math.round(silenceMs / 1000)}s — activating REST fallback`);
+            startRestPolling();
+        }
+    }, 10_000); // check every 10s
 }
 
 function connect() {
@@ -178,9 +245,13 @@ function connect() {
 
     ws.on('open', () => {
         console.log('✅ Smart Collector Connected (Enhanced)');
+        lastWsMessageAt = Date.now();
 
-        // Always enable REST fallback (WebSocket can be silent)
-        startRestPolling();
+        // Start health check — REST polling will activate only if WS goes silent
+        startWsHealthCheck();
+
+        // If REST was running (e.g. reconnect), pause it now that WS is back
+        stopRestPolling();
 
         ws.send(JSON.stringify({
             type: 'filter_update',
@@ -192,16 +263,26 @@ function connect() {
     });
 
     ws.on('message', (data) => {
+        lastWsMessageAt = Date.now();
+
+        // WS is alive — if REST fallback was active, pause it
+        if (restPollStarted) stopRestPolling();
+
         try {
             const msg = JSON.parse(data);
 
             if (msg.type === 'log_entry' && msg.data) {
+                // Register in dedup set so REST won't re-process
+                isDuplicate(msg.data.timestamp, msg.data.message);
                 processEntry(msg.data);
                 return;
             }
 
             if (msg.type === 'log_batch' && msg.data?.entries) {
-                for (const e of msg.data.entries) processEntry(e);
+                for (const e of msg.data.entries) {
+                    isDuplicate(e.timestamp, e.message);
+                    processEntry(e);
+                }
                 return;
             }
 
@@ -821,6 +902,9 @@ function startPeriodicTasks() {
     setInterval(flushBuffer, 10000);
     setInterval(flushDbBuffer, 10000); // Flush DB buffer every 10s
     setInterval(() => tracker.saveState(), 30000);
+
+    // Dedup key cleanup
+    setInterval(cleanExpiredDedupeKeys, DEDUP_CLEAN_INTERVAL_MS);
 
     // TTL cleanup for ocpp_raw
     // Keep it cheap: delete old rows and let SQLite reuse pages; VACUUM can be done manually/off-peak.
