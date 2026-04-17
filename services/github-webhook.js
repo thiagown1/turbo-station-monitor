@@ -281,7 +281,7 @@ function dispatchBatchedCIWake(branchKey) {
         `3. Read CI logs for EACH failed run above: gh run view RUN_ID --log-failed --repo ${repoFull}\n` +
         `4. If the branch has a worktree, use it. Otherwise create one.\n` +
         `5. Fix ALL issues from the batch, commit, push.\n` +
-        `6. If attempts >= 5: set phase=blocked, add label status:blocked\n` +
+        `6. If attempts >= 3: set phase=blocked, add label status:blocked\n` +
         `7. Update task-state.json before finishing`,
     });
   }
@@ -407,6 +407,12 @@ function handleWebhook(req, res) {
       const isBot = !isCodexReview && (author === 'TurboStation-ai' || author.endsWith('[bot]') || author === 'github-actions');
 
       const needsAttention = ['issue_comment', 'pull_request_review_comment', 'pull_request_review'].includes(event) && !isBot;
+      const isThiagoIntervention = !isBot && (
+        author === 'thiagown1' ||
+        webhookEvent.comment_author === 'thiagown1' ||
+        webhookEvent.review_author === 'thiagown1' ||
+        payload.sender?.login === 'thiagown1'
+      );
 
       // Spam guard:
       // - ignore edited comments for ACK (still enqueue + wake)
@@ -416,6 +422,25 @@ function handleWebhook(req, res) {
 
       // Release auto-notes (TestFlight)
       const releaseAutoNotesEnabled = (process.env.RELEASE_AUTONOTES_ENABLED || '1') !== '0';
+
+      // Human intervention resets CI auto-fix counter for the affected branch/PR.
+      if (isThiagoIntervention && webhookEvent.pr_head_ref) {
+        const attempts = readJsonFileOrDefault(CI_ATTEMPTS_PATH, {});
+        const branch = webhookEvent.pr_head_ref;
+        let resetCount = 0;
+
+        for (const key of Object.keys(attempts)) {
+          if (key.endsWith(`:${branch}`)) {
+            delete attempts[key];
+            resetCount++;
+          }
+        }
+
+        if (resetCount > 0) {
+          writeJsonFile(CI_ATTEMPTS_PATH, attempts);
+          console.log(`[github-webhook] Thiago intervention detected on ${branch} — reset ${resetCount} CI auto-fix counter(s)`);
+        }
+      }
 
       // CI failures that need auto-fix (loop protection)
       let ciNeedsAttention = false;
@@ -438,7 +463,7 @@ function handleWebhook(req, res) {
           entry.firstAttempt = now;
         }
 
-        const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '5', 10);
+        const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '3', 10);
 
         if (webhookEvent.sha_already_analyzed) {
           console.log(`[github-webhook] CI skip: SHA already analyzed for ${runKey}, not waking coder`);
@@ -453,6 +478,46 @@ function handleWebhook(req, res) {
         } else {
           console.log(`[github-webhook] CI fix limit reached (${maxFixAttempts}/${maxFixAttempts}) for ${runKey}, skipping auto-fix`);
           webhookEvent.fix_limit_reached = true;
+        }
+      }
+
+      // ── Defensive label cleanup on submitted reviews ───────────
+      // If SecGuard/Test Engineer actually submit a review, clean stale review-request labels.
+      if (event === 'pull_request_review' && webhookEvent.action === 'submitted' && !isShortTrader) {
+        const reviewAuthor = (webhookEvent.review_author || '').toLowerCase();
+        const reviewState = (webhookEvent.review_state || '').toLowerCase();
+        const prNumber = webhookEvent.pr_number;
+        const repo = webhookEvent.repository || 'thiagown1/turbo_station';
+
+        const cleanupEdits = [];
+
+        if (reviewAuthor === 'turbostation-ai' || reviewAuthor === 'secguard') {
+          if (reviewState === 'approved') {
+            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:sec-review" --add-label "reviewed:security"`);
+          } else if (reviewState === 'changes_requested') {
+            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:sec-review" --add-label "needs:coder-fix"`);
+          }
+        }
+
+        if (reviewAuthor === 'turbostation-ai' || reviewAuthor === 'test-engineer') {
+          if (reviewState === 'approved') {
+            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:test-review" --add-label "reviewed:tests"`);
+          } else if (reviewState === 'changes_requested') {
+            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:test-review" --add-label "needs:coder-fix"`);
+          }
+        }
+
+        if (cleanupEdits.length > 0) {
+          const { exec } = require('child_process');
+          const script = cleanupEdits.join(' && ');
+          exec(script, { env: process.env }, (error, stdout, stderr) => {
+            if (error) {
+              console.error('[github-webhook] Review label cleanup failed:', error.message);
+              if (stderr) console.error(stderr);
+              return;
+            }
+            if (stdout) console.log('[github-webhook] Review label cleanup ok:', stdout.trim());
+          });
         }
       }
 
@@ -657,13 +722,28 @@ function handleWebhook(req, res) {
             if (pullErr) {
               console.error(`[auto-deploy] git pull failed: ${pullErr.message}`);
               sendTelegramNotification(
-                `❌ Auto-deploy falhou (git pull):\n${pullErr.message.substring(0, 200)}`,
+                `❌ Auto-deploy falhou (git pull): ${pullErr.message.substring(0, 200)}`,
                 'telegram:-5103508388'
               );
               return;
             }
 
             console.log(`[auto-deploy] git pull: ${pullStdout.trim()}`);
+
+            // ── Auto-version: bump patch in package.json ──────────────
+            let version = '?.?.?';
+            try {
+              const pkgPath = `${monitorDir}/package.json`;
+              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+              const parts = (pkg.version || '1.0.0').split('.').map(Number);
+              parts[2] = (parts[2] || 0) + 1; // bump patch
+              pkg.version = parts.join('.');
+              version = pkg.version;
+              fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
+              console.log(`[auto-deploy] Version bumped to ${version}`);
+            } catch (vErr) {
+              console.error(`[auto-deploy] Version bump failed: ${vErr.message}`);
+            }
 
             // Step 2: Detect which services changed based on committed files
             const changedFiles = (payload.commits || []).flatMap(c =>
@@ -700,7 +780,7 @@ function handleWebhook(req, res) {
             if (servicesToRestart.size === 0) {
               console.log('[auto-deploy] No service files changed, skipping restart');
               sendTelegramNotification(
-                `📦 Monitor atualizado (sem restart): "${commitMsg}" by ${pusher}`,
+                `📦 Monitor v${version} atualizado (sem restart): "${commitMsg}" by ${pusher}`,
                 'telegram:-5103508388'
               );
               return;
@@ -710,7 +790,7 @@ function handleWebhook(req, res) {
             // (If github-webhook itself is restarted, we'd lose the notification)
             const services = [...servicesToRestart].join(', ');
             sendTelegramNotification(
-              `🚀 Auto-deploy turbo-station-monitor: "${commitMsg}" by ${pusher} | Reiniciando: ${services}`,
+              `🚀 Auto-deploy v${version}: "${commitMsg}" by ${pusher} | Reiniciando: ${services}`,
               'telegram:-5103508388'
             );
 
@@ -723,7 +803,7 @@ function handleWebhook(req, res) {
                   console.error(`[auto-deploy] pm2 restart failed: ${restartErr.message}`);
                 } else {
                   exec('pm2 save', { timeout: 10000 }, () => {});
-                  console.log(`[auto-deploy] ✅ Restarted: ${services}`);
+                  console.log(`[auto-deploy] ✅ v${version} — Restarted: ${services}`);
                 }
               });
             }, restartDelay);
@@ -868,7 +948,7 @@ function handleWebhook(req, res) {
           // NOTE: main agent no longer woken — coder handles PR feedback autonomously
         }
       } else if (ciNeedsAttention) { 
-        const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '5', 10);
+        const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '3', 10);
         const attempts = readJsonFileOrDefault(CI_ATTEMPTS_PATH, {});
         const runKey = `${webhookEvent.workflow_name}:${webhookEvent.head_branch}`;
         const count = attempts[runKey]?.count || 1;
@@ -950,7 +1030,7 @@ function handleWebhook(req, res) {
         }
       } else if (webhookEvent.fix_limit_reached) {
         sendOpenClawWake(
-          `⚠️ CI fix limit reached: "${webhookEvent.workflow_name}" on ${webhookEvent.head_branch} failed ${process.env.CI_FIX_MAX_ATTEMPTS || '5'} times. ` +
+          `⚠️ CI fix limit reached: "${webhookEvent.workflow_name}" on ${webhookEvent.head_branch} failed ${process.env.CI_FIX_MAX_ATTEMPTS || '3'} times. ` +
             `Stopping auto-fix to prevent infinite loop. Notify Thiago with the full diagnosis.`
         );
       }

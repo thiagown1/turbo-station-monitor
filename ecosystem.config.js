@@ -166,6 +166,21 @@ module.exports = {
         GATEWAY_INSTANCE_NAME: dotenv.GATEWAY_INSTANCE_NAME || 'turbostation',
         EVOLUTION_WEBHOOK_SECRET: dotenv.EVOLUTION_WEBHOOK_SECRET || '',
       }
+    },
+    {
+      name: 'sweep-orchestrator',
+      script: './services/sweep-orchestrator.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      watch: false,
+      max_memory_restart: '150M',
+      error_file: './logs/sweep-error.log',
+      out_file: './logs/sweep-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: { ...dotenv }
     }
   ]
 };

@@ -140,6 +140,10 @@ try {
 safeAddColumn('session_context', 'compacted_at', 'TEXT DEFAULT NULL');
 safeAddColumn('session_context', 'compaction_summary', 'TEXT DEFAULT NULL');
 
+// Security validation
+safeAddColumn('conversations', 'pending_validation_phone', 'TEXT DEFAULT NULL');
+safeAddColumn('conversations', 'pending_validation_code', 'TEXT DEFAULT NULL');
+
 // Copilot settings — per-brand configuration for the AI assistant
 try {
   db.exec(`
