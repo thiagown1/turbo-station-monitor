@@ -6,7 +6,8 @@ const StateTracker = require('./state-tracker');
 
 // Config
 const WS_URL = 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
-const TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXNoYm9hcmRfaWQiOiJvcGVuY2xhdy1tb25pdG9yIiwicm9sZSI6Im1vbml0b3IiLCJwZXJtaXNzaW9ucyI6WyJsb2dzLnJlYWQiLCJsb2dzLmZpbHRlciJdLCJpYXQiOjE3NzA4MTcxOTAsImlzcyI6Im9jcHAtc2VydmVyIiwic3ViIjoib3BlbmNsYXctbW9uaXRvciJ9.toiKVkIbGcmeVx-RRQh7Zt8lXLCbfFDGqyC9qbYoAPM';
+const DEFAULT_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXNoYm9hcmRfaWQiOiJvcGVuY2xhdy1tb25pdG9yIiwicm9sZSI6Im1vbml0b3IiLCJwZXJtaXNzaW9ucyI6WyJsb2dzLnJlYWQiLCJsb2dzLmZpbHRlciJdLCJpYXQiOjE3NzA4MTcxOTAsImlzcyI6Im9jcHAtc2VydmVyIiwic3ViIjoib3BlbmNsYXctbW9uaXRvciJ9.toiKVkIbGcmeVx-RRQh7Zt8lXLCbfFDGqyC9qbYoAPM';
+const TOKEN = process.env.OCPP_LOGS_TOKEN || process.env.OCPP_DASHBOARD_TOKEN || DEFAULT_TOKEN;
 
 // REST fallback polling (WS can be silent depending on server/file watcher)
 const REST_BASE_URL = 'https://logs.ocpp.turbostation.com.br';
@@ -170,7 +171,11 @@ async function pollOcppLogsRestOnce() {
         }
 
         const url = `${REST_BASE_URL}/api/logs/history?${params.toString()}`;
-        const res = await fetch(url);
+        const res = await fetch(url, {
+            headers: {
+                Authorization: `Bearer ${TOKEN}`
+            }
+        });
         if (!res.ok) throw new Error(`REST ${res.status}`);
         const body = await res.json();
         const entries = body?.data?.entries || [];
