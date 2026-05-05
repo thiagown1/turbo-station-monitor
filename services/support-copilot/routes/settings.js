@@ -171,18 +171,21 @@ router.post('/:brandId/save-rule', (req, res) => {
 
 // ─── Knowledge Documents ──────────────────────────────────────────────────────
 
-const { agentForBrand } = require('../lib/copilot');
+const { resolveSupportAgent, parseBrandAgentMap } = require('../lib/agent-resolution');
 const fs = require('fs');
 const path = require('path');
 
 /**
  * Resolve the knowledge/ directory path for a brand's agent workspace.
- * OpenClaw workspace naming: agent "support_turbo_station" → dir "workspace-support-turbo_station"
- * (first underscore between prefix and brand becomes hyphen, rest preserved)
- * We try multiple patterns to be resilient to naming variations.
+ * OpenClaw workspace naming typically maps agent ids to `workspace-<agent-id>`
+ * with minor underscore/hyphen variations, so we probe a few patterns.
+ * The agent must be resolved explicitly for the active tenant/fallback config.
  */
 function knowledgeDirForBrand(brandId) {
-  const agentId = agentForBrand(brandId);
+  const agentId = resolveSupportAgent(brandId, undefined, {
+    brandAgentMap: parseBrandAgentMap(),
+    defaultAgent: process.env.OPENCLAW_AGENT || '',
+  });
   const base = path.join(process.env.HOME || '/home/openclaw', '.openclaw');
 
   // Try multiple naming patterns (OpenClaw isn't 100% consistent)
@@ -310,7 +313,7 @@ ${fileList || '- _(nenhum documento cadastrado)_'}
 
   try {
     fs.writeFileSync(toolsPath, toolsContent, 'utf8');
-    console.log(`${LOG_TAG} TOOLS.md updated for agent ${agentId} (${activeDocs.length} docs)`);
+    console.log(`${LOG_TAG} TOOLS.md updated for workspace ${workspaceDir} (${activeDocs.length} docs)`);
   } catch (err) {
     console.warn(`${LOG_TAG} Failed to update TOOLS.md:`, err.message);
   }

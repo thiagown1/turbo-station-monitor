@@ -35,7 +35,7 @@ const MEDIA_DIR = path.join(path.dirname(DB_PATH), 'media');
  * Each brand gets an isolated agent workspace with its own knowledge
  * base, SOUL, and policies — preventing cross-brand data leakage.
  *
- * Override via env: BRAND_AGENT_MAP="turbo_station:support_turbo_station,zev:support_zev"
+ * Override via env: BRAND_AGENT_MAP="brand_a:support_brand_a,brand_b:support_brand_b"
  * Shared fallback is opt-in via OPENCLAW_AGENT.
  */
 const BRAND_AGENT_MAP = parseBrandAgentMap();
@@ -43,21 +43,24 @@ const BRAND_AGENT_MAP = parseBrandAgentMap();
 /**
  * Optional explicit fallback agent for environments that want a shared default.
  * Intentionally unset by default so multi-tenant runtimes fail closed instead of
- * silently falling back to the Turbo Station tenant.
+ * silently falling back to any specific tenant.
  */
 const DEFAULT_AGENT = process.env.OPENCLAW_AGENT || '';
 
 /**
  * Resolve the openclaw agent id for a given brand/channel.
- * Convention: support_<brand_id> (e.g. support_turbo_station)
+ * Convention: support_<brand_id>
  * Group chats use GROUP_AGENT from constants when explicitly configured.
  *
  * Fails closed when neither a tenant binding nor an explicit environment
  * fallback is available.
  */
 function agentForBrand(brandId, channel) {
+  const { GROUP_AGENT } = require('./constants');
   return resolveSupportAgent(brandId, channel, {
     brandAgentMap: BRAND_AGENT_MAP,
+    defaultAgent: DEFAULT_AGENT,
+    groupAgent: GROUP_AGENT,
   });
 }
 

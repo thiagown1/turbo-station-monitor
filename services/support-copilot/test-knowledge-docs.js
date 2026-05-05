@@ -11,22 +11,13 @@ const SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET 
 const BRAND = process.env.SUPPORT_TEST_BRAND || process.env.BRAND_ID || 'test_brand';
 const fs = require('fs');
 const path = require('path');
+const { parseBrandAgentMap, resolveSupportAgent } = require('./lib/agent-resolution');
 
 function resolveAgentId(brandId) {
-  const explicitAgent = process.env.SUPPORT_TEST_AGENT || process.env.OPENCLAW_AGENT;
-  if (explicitAgent) return explicitAgent;
-
-  const map = (process.env.BRAND_AGENT_MAP || '')
-    .split(',')
-    .map(pair => pair.trim())
-    .filter(Boolean)
-    .reduce((acc, pair) => {
-      const [brand, agent] = pair.split(':').map(part => part?.trim());
-      if (brand && agent) acc[brand] = agent;
-      return acc;
-    }, {});
-
-  return map[brandId] || `support_${brandId}`;
+  return resolveSupportAgent(brandId, undefined, {
+    brandAgentMap: parseBrandAgentMap(),
+    defaultAgent: process.env.SUPPORT_TEST_AGENT || process.env.OPENCLAW_AGENT || '',
+  });
 }
 
 function resolveWorkspaceDir(agentId) {
