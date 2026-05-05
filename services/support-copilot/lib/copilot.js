@@ -3,7 +3,7 @@
  *
  * Generates AI-powered reply suggestions by delegating to brand-specific
  * OpenClaw agents. Each brand_id maps to an isolated agent workspace
- * (e.g. turbo_station → support_turbo_station) for data isolation.
+ * (e.g. <brand_id> → support_<brand_id>) for data isolation.
  * Each WhatsApp conversation maps to a unique agent session, so the
  * agent sees the full chat history and learns from human corrections.
  *
@@ -17,6 +17,7 @@ const path = require('path');
 const { LOG_TAG, DB_PATH } = require('./constants');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
+const { parseBrandAgentMap, resolveSupportAgent } = require('./agent-resolution');
 
 // Cap message body length to avoid token waste on giant messages
 const MAX_MSG_BODY = 500;
@@ -35,35 +36,29 @@ const MEDIA_DIR = path.join(path.dirname(DB_PATH), 'media');
  * base, SOUL, and policies — preventing cross-brand data leakage.
  *
  * Override via env: BRAND_AGENT_MAP="turbo_station:support_turbo_station,zev:support_zev"
+ * Shared fallback is opt-in via OPENCLAW_AGENT.
  */
-const BRAND_AGENT_MAP = (process.env.BRAND_AGENT_MAP || '')
-  .split(',')
-  .filter(Boolean)
-  .reduce((map, pair) => {
-    const [brand, agent] = pair.split(':');
-    if (brand && agent) map[brand.trim()] = agent.trim();
-    return map;
-  }, {});
+const BRAND_AGENT_MAP = parseBrandAgentMap();
 
-// Default fallback agent (used when brand is unknown or not mapped)
-const DEFAULT_AGENT = process.env.OPENCLAW_AGENT || 'support_turbo_station';
+/**
+ * Optional explicit fallback agent for environments that want a shared default.
+ * Intentionally unset by default so multi-tenant runtimes fail closed instead of
+ * silently falling back to the Turbo Station tenant.
+ */
+const DEFAULT_AGENT = process.env.OPENCLAW_AGENT || '';
 
 /**
  * Resolve the openclaw agent id for a given brand/channel.
  * Convention: support_<brand_id> (e.g. support_turbo_station)
- * Group chats use GROUP_AGENT from constants.
+ * Group chats use GROUP_AGENT from constants when explicitly configured.
+ *
+ * Fails closed when neither a tenant binding nor an explicit environment
+ * fallback is available.
  */
 function agentForBrand(brandId, channel) {
-  // Group chats route to a separate agent
-  if (channel === 'whatsapp-group') {
-    const { GROUP_AGENT } = require('./constants');
-    return GROUP_AGENT;
-  }
-  if (!brandId) return DEFAULT_AGENT;
-  // 1. Explicit map override
-  if (BRAND_AGENT_MAP[brandId]) return BRAND_AGENT_MAP[brandId];
-  // 2. Convention: support_<brand_id>
-  return `support_${brandId}`;
+  return resolveSupportAgent(brandId, channel, {
+    brandAgentMap: BRAND_AGENT_MAP,
+  });
 }
 
 /**

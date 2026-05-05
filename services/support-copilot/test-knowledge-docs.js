@@ -8,9 +8,42 @@
 
 const API = process.env.SUPPORT_API_URL || 'http://localhost:3005';
 const SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
-const BRAND = 'turbo_station';
+const BRAND = process.env.SUPPORT_TEST_BRAND || process.env.BRAND_ID || 'test_brand';
 const fs = require('fs');
 const path = require('path');
+
+function resolveAgentId(brandId) {
+  const explicitAgent = process.env.SUPPORT_TEST_AGENT || process.env.OPENCLAW_AGENT;
+  if (explicitAgent) return explicitAgent;
+
+  const map = (process.env.BRAND_AGENT_MAP || '')
+    .split(',')
+    .map(pair => pair.trim())
+    .filter(Boolean)
+    .reduce((acc, pair) => {
+      const [brand, agent] = pair.split(':').map(part => part?.trim());
+      if (brand && agent) acc[brand] = agent;
+      return acc;
+    }, {});
+
+  return map[brandId] || `support_${brandId}`;
+}
+
+function resolveWorkspaceDir(agentId) {
+  const base = path.join(process.env.HOME, '.openclaw');
+  const candidates = [
+    `workspace-${agentId.replace(/_/, '-')}`,
+    `workspace-${agentId}`,
+    `workspace-${agentId.replace(/_/g, '-')}`,
+  ];
+
+  for (const dir of candidates) {
+    const full = path.join(base, dir);
+    if (fs.existsSync(full)) return full;
+  }
+
+  return path.join(base, candidates[0]);
+}
 
 const headers = {
   'Content-Type': 'application/json',
@@ -78,7 +111,8 @@ async function main() {
   const createdId = created.id;
 
   // Verify filesystem sync
-  const knowledgeDir = path.join(process.env.HOME, '.openclaw', 'workspace-support-turbo_station', 'knowledge');
+  const workspaceDir = resolveWorkspaceDir(resolveAgentId(BRAND));
+  const knowledgeDir = path.join(workspaceDir, 'knowledge');
   const createdFile = path.join(knowledgeDir, 'teste-e2e.md');
   assert(fs.existsSync(createdFile), 'File created on disk: teste-e2e.md');
   if (fs.existsSync(createdFile)) {
@@ -87,7 +121,7 @@ async function main() {
   }
 
   // Verify TOOLS.md updated
-  const toolsPath = path.join(process.env.HOME, '.openclaw', 'workspace-support-turbo_station', 'TOOLS.md');
+  const toolsPath = path.join(workspaceDir, 'TOOLS.md');
   if (fs.existsSync(toolsPath)) {
     const tools = fs.readFileSync(toolsPath, 'utf8');
     assert(tools.includes('teste-e2e.md'), 'TOOLS.md lists new doc');

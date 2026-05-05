@@ -29,8 +29,11 @@ const EVOLUTION_API_KEY = process.env.EVOLUTION_API_KEY || '';
 /** Optional: secret shared with Evolution API webhook config to verify inbound requests */
 const EVOLUTION_WEBHOOK_SECRET = process.env.EVOLUTION_WEBHOOK_SECRET || '';
 
-/** Agent to use for WhatsApp group conversations (partner reports, station reports, etc.) */
-const GROUP_AGENT = process.env.GROUP_AGENT || 'support_turbo_station';
+/**
+ * Agent to use for WhatsApp group conversations (partner reports, station reports, etc.).
+ * Must be explicitly configured per environment to avoid implicit Turbo Station fallback.
+ */
+const GROUP_AGENT = process.env.GROUP_AGENT || process.env.OPENCLAW_GROUP_AGENT || '';
 
 /**
  * Map Evolution API instance name → brand_id.
