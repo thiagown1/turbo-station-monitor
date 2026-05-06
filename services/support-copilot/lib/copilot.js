@@ -17,6 +17,7 @@ const path = require('path');
 const { LOG_TAG, DB_PATH } = require('./constants');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
+const { parseBrandAgentMap, resolveAgentForBrand } = require('./agent-routing');
 
 // Cap message body length to avoid token waste on giant messages
 const MAX_MSG_BODY = 500;
@@ -36,34 +37,26 @@ const MEDIA_DIR = path.join(path.dirname(DB_PATH), 'media');
  *
  * Override via env: BRAND_AGENT_MAP="turbo_station:support_turbo_station,zev:support_zev"
  */
-const BRAND_AGENT_MAP = (process.env.BRAND_AGENT_MAP || '')
-  .split(',')
-  .filter(Boolean)
-  .reduce((map, pair) => {
-    const [brand, agent] = pair.split(':');
-    if (brand && agent) map[brand.trim()] = agent.trim();
-    return map;
-  }, {});
+const BRAND_AGENT_MAP = parseBrandAgentMap(process.env.BRAND_AGENT_MAP || '');
 
-// Default fallback agent (used when brand is unknown or not mapped)
-const DEFAULT_AGENT = process.env.OPENCLAW_AGENT || 'support_turbo_station';
+// Optional environment-configured fallback agent. Shared runtime must not hardcode a tenant.
+const DEFAULT_AGENT = process.env.OPENCLAW_AGENT || '';
 
 /**
  * Resolve the openclaw agent id for a given brand/channel.
  * Convention: support_<brand_id> (e.g. support_turbo_station)
- * Group chats use GROUP_AGENT from constants.
+ * Group chats use GROUP_AGENT only when explicitly configured; otherwise they
+ * inherit the resolved tenant agent. If no safe binding exists, fail closed.
  */
 function agentForBrand(brandId, channel) {
-  // Group chats route to a separate agent
-  if (channel === 'whatsapp-group') {
-    const { GROUP_AGENT } = require('./constants');
-    return GROUP_AGENT;
-  }
-  if (!brandId) return DEFAULT_AGENT;
-  // 1. Explicit map override
-  if (BRAND_AGENT_MAP[brandId]) return BRAND_AGENT_MAP[brandId];
-  // 2. Convention: support_<brand_id>
-  return `support_${brandId}`;
+  const { GROUP_AGENT } = require('./constants');
+  return resolveAgentForBrand({
+    brandId,
+    channel,
+    groupAgent: GROUP_AGENT,
+    defaultAgent: DEFAULT_AGENT,
+    brandAgentMap: BRAND_AGENT_MAP,
+  });
 }
 
 /**
