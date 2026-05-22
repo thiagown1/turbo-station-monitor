@@ -149,6 +149,61 @@ const stmts = {
     GROUP BY device_id, (event_timestamp / 300000)
     ORDER BY (event_timestamp / 300000) DESC
   `),
+
+  /**
+   * Heatmap with dynamic user_id exclusion (e.g. to drop admin/internal
+   * users so their home/office activity does not pollute demand suggestions).
+   *
+   * Better-sqlite3 needs a fresh prepared statement per placeholder count,
+   * so we build (and cache) statements keyed by (hasTime, excludeCount).
+   */
+  heatmapFiltered({ periodMs, excludeUserIds }) {
+    const exclude = Array.isArray(excludeUserIds)
+      ? excludeUserIds.filter((u) => typeof u === 'string' && u.length > 0)
+      : [];
+    const hasTime = typeof periodMs === 'number' && periodMs > 0;
+
+    // Fast paths — preserve existing query plans.
+    if (exclude.length === 0) {
+      return hasTime
+        ? stmts.heatmapWithTime.all(Date.now() - periodMs)
+        : stmts.heatmapAll.all();
+    }
+
+    const cacheKey = `${hasTime ? 1 : 0}:${exclude.length}`;
+    if (!heatmapStmtCache.has(cacheKey)) {
+      const placeholders = exclude.map(() => '?').join(',');
+      const sql = `
+        SELECT data_json, 1 AS weight
+        FROM mobile_events
+        WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
+          AND data_json IS NOT NULL
+          ${hasTime ? 'AND event_timestamp > ?' : ''}
+          AND (user_id IS NULL OR user_id NOT IN (${placeholders}))
+        GROUP BY device_id, (event_timestamp / 300000)
+        ORDER BY (event_timestamp / 300000) DESC
+      `;
+      heatmapStmtCache.set(cacheKey, db.prepare(sql));
+    }
+
+    const stmt = heatmapStmtCache.get(cacheKey);
+    const params = hasTime ? [Date.now() - periodMs, ...exclude] : exclude;
+    return stmt.all(...params);
+  },
+};
+
+// Cache of prepared statements keyed by (hasTime, excludeCount) so we don't
+// re-parse identical SQL on every request. Capped to avoid unbounded growth
+// from pathological excludeUserIds counts.
+const HEATMAP_STMT_CACHE_LIMIT = 64;
+const heatmapStmtCache = new Map();
+const _origSet = heatmapStmtCache.set.bind(heatmapStmtCache);
+heatmapStmtCache.set = function (key, value) {
+  if (this.size >= HEATMAP_STMT_CACHE_LIMIT) {
+    const oldestKey = this.keys().next().value;
+    this.delete(oldestKey);
+  }
+  return _origSet(key, value);
 };
 
 module.exports = { db, stmts };

@@ -171,6 +171,64 @@ test('GET /api/telemetry/heatmap-data defaults to 7d', async () => {
     assert.strictEqual(res.body.period, '7d');
 });
 
+test('GET /api/telemetry/heatmap-data?excludeUserIds=X → drops events from X', async () => {
+    // Seed two presence events for two distinct users at distinct locations.
+    // Unique IDs per run so re-running the suite doesn't leak rows between runs.
+    const runTag = `excl-${Date.now()}`;
+    const excludeUid = `${runTag}-EXCLUDE`;
+    const keepUid = `${runTag}-KEEP`;
+    // Lat/lng unique per run too (avoids point collisions if the DB is reused).
+    const excludeLat = -15.85 - Date.now() % 1000 / 1e6;
+    const keepLat = -15.80 - Date.now() % 1000 / 1e6;
+
+    const now = Date.now();
+    const insert = stmts.insertEvent;
+    const baseRow = {
+        raw_id: null,
+        received_at: now,
+        event_timestamp: now,
+        app_version: '2.0.0-test',
+        platform: 'android',
+        event_type: 'app_presence_start',
+        station_id: null,
+        severity: null,
+        message: null,
+    };
+    insert.run({
+        ...baseRow,
+        session_id: `${runTag}-s1`,
+        device_id: `${runTag}-d1`,
+        user_id: excludeUid,
+        data_json: JSON.stringify({ lat: excludeLat, lng: -48.03 }),
+    });
+    insert.run({
+        ...baseRow,
+        session_id: `${runTag}-s2`,
+        device_id: `${runTag}-d2`,
+        user_id: keepUid,
+        data_json: JSON.stringify({ lat: keepLat, lng: -47.93 }),
+    });
+
+    const baseline = await request(app)
+        .get('/api/telemetry/heatmap-data?period=24h')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(baseline.status, 200);
+    const seededPts = baseline.body.points.filter(
+        (p) => (p.lat === excludeLat && p.lng === -48.03) || (p.lat === keepLat && p.lng === -47.93)
+    );
+    assert.strictEqual(seededPts.length, 2, `expected both seeded points, got ${seededPts.length}`);
+
+    const filtered = await request(app)
+        .get(`/api/telemetry/heatmap-data?period=24h&excludeUserIds=${excludeUid}`)
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(filtered.status, 200);
+    const filteredSeeded = filtered.body.points.filter(
+        (p) => (p.lat === excludeLat && p.lng === -48.03) || (p.lat === keepLat && p.lng === -47.93)
+    );
+    assert.strictEqual(filteredSeeded.length, 1, `expected only KEEP survives, got ${filteredSeeded.length}`);
+    assert.strictEqual(filteredSeeded[0].lat, keepLat);
+});
+
 // ── Ingestion ───────────────────────────────────────────────────────────────────
 
 function makePayload(overrides = {}) {
