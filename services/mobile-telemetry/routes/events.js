@@ -87,11 +87,17 @@ router.get('/', (req, res) => {
 
         // Build SQL with dynamic placeholders for IN clause.
         const placeholders = eventTypes.map(() => '?').join(',');
-        // Brand filter: match the column OR a JSON-embedded brand_id in data_json
-        // so legacy rows (where mobile envelope didn't carry brand_id) still
-        // resolve correctly once the mobile build ships with brand_id baked in.
+        // Brand filter — transition semantics:
+        //   - Row's brand_id column matches → included
+        //   - Row's data_json carries brand_id → included
+        //   - Row has NEITHER (brand_id IS NULL and data_json lacks the key) →
+        //     treated as legacy/unknown and ALSO included for any brand
+        //     filter. This is intentional during the mobile-rollout window:
+        //     until enough sessions ship with brand_id in the envelope
+        //     (turbo-station PR #B), strict matching would zero out the
+        //     dashboard. Once rollout completes, tighten to strict match.
         const brandClause = brandId
-            ? "AND (brand_id = ? OR json_extract(data_json, '$.brand_id') = ?)"
+            ? "AND (brand_id IS NULL OR brand_id = ? OR json_extract(data_json, '$.brand_id') = ?)"
             : '';
         const cacheKey = `${eventTypes.length}:${brandId ? 1 : 0}`;
         const stmt = cacheStmt(cacheKey, () => db.prepare(`
