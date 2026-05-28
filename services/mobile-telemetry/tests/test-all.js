@@ -441,6 +441,12 @@ test('GET /api/telemetry/events returns seeded events in window with parsed data
         'parsed data should expose start_flow_id');
     assert.ok(seeded.every((e) => e.app_version === '4.17.0'));
     assert.ok(seeded.every((e) => e.brand_id === 'turbo_station'));
+    // The Next.js RawMobileFunnelEvent reader looks INSIDE data — assert the
+    // envelope-derived fields are hoisted there too, not just at top level.
+    assert.ok(seeded.every((e) => e.data.app_version === '4.17.0'),
+        'data.app_version should be hoisted from the column');
+    assert.ok(seeded.every((e) => e.data.brand_id === 'turbo_station'),
+        'data.brand_id should be hoisted from the column');
 });
 
 test('GET /api/telemetry/events filters by brand_id', async () => {
