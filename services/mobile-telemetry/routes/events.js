@@ -121,16 +121,33 @@ router.get('/', (req, res) => {
         const truncated = rows.length > limit;
         const trimmed = truncated ? rows.slice(0, limit) : rows;
 
-        const events = trimmed.map((row) => ({
-            timestamp: row.timestamp,
-            event_type: row.event_type,
-            user_id: row.user_id,
-            device_id: row.device_id,
-            app_version: row.app_version,
-            station_id: row.station_id,
-            brand_id: row.brand_id,
-            data: parseDataJson(row.data_json),
-        }));
+        // The Next.js consumer (RawMobileFunnelEvent in hourly-funnel.ts) reads
+        // app_version / station_id / brand_id / start_flow_id from inside `data`.
+        // Our schema stores app_version / station_id / brand_id as top-level
+        // columns (extracted at ingest from the envelope), so hoist them into
+        // `data` here — column wins over data_json's copy since the column came
+        // from the session envelope (one source of truth per session).
+        const events = trimmed.map((row) => {
+            const data = parseDataJson(row.data_json);
+            if (row.app_version != null) data.app_version = row.app_version;
+            if (row.station_id != null && data.station_id == null && data.stationId == null) {
+                data.station_id = row.station_id;
+            }
+            if (row.brand_id != null && data.brand_id == null && data.brandId == null) {
+                data.brand_id = row.brand_id;
+            }
+            return {
+                timestamp: row.timestamp,
+                event_type: row.event_type,
+                user_id: row.user_id,
+                device_id: row.device_id,
+                // Keep top-level copies for callers that don't dig into data.
+                app_version: row.app_version,
+                station_id: row.station_id,
+                brand_id: row.brand_id,
+                data,
+            };
+        });
 
         res
             .set('Cache-Control', 'no-store')
