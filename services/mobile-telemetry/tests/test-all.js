@@ -191,6 +191,7 @@ test('GET /api/telemetry/heatmap-data?excludeUserIds=X → drops events from X',
         platform: 'android',
         event_type: 'app_presence_start',
         station_id: null,
+        brand_id: null,
         severity: null,
         message: null,
     };
@@ -321,6 +322,230 @@ test('POST /api/telemetry/mobile — data persists in DB', async () => {
     assert.strictEqual(rows[0].user_id, 'test-uid');
     assert.ok(['screen_open', 'start_charge_tap'].includes(rows[0].event_type));
 });
+
+// ── Brand ID ingestion ─────────────────────────────────────────────────────────
+
+test('POST /api/telemetry/mobile — envelope brand_id persists to mobile_events.brand_id', async () => {
+    const sessionId = 'brand-env-' + Date.now();
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send(makePayload({ session_id: sessionId, brand_id: 'turbo_station' }));
+
+    const rows = db.prepare(
+        'SELECT brand_id FROM mobile_events WHERE session_id = ?'
+    ).all(sessionId);
+
+    assert.strictEqual(rows.length, 2);
+    assert.ok(rows.every((r) => r.brand_id === 'turbo_station'),
+        `expected all rows brand_id=turbo_station, got ${JSON.stringify(rows)}`);
+});
+
+test('POST /api/telemetry/mobile — per-event data.brand_id falls back when envelope omitted', async () => {
+    const sessionId = 'brand-evt-' + Date.now();
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: sessionId,
+            device_id: 'd1',
+            app_version: '2.0.0-test',
+            platform: 'android',
+            user_id: 'u1',
+            events: [
+                { event_type: 'screen_open', timestamp: Date.now(), data: { brand_id: 'zev' } },
+                { event_type: 'start_charge_tap', timestamp: Date.now(), data: { station_id: 'X' } },
+            ],
+        });
+
+    const rows = db.prepare(
+        'SELECT event_type, brand_id FROM mobile_events WHERE session_id = ? ORDER BY id'
+    ).all(sessionId);
+
+    assert.strictEqual(rows.length, 2);
+    const byType = Object.fromEntries(rows.map((r) => [r.event_type, r.brand_id]));
+    assert.strictEqual(byType.screen_open, 'zev', 'event with brand_id should record it');
+    assert.strictEqual(byType.start_charge_tap, null, 'event without brand_id should be null');
+});
+
+test('POST /api/telemetry/mobile — no brand_id anywhere → null column', async () => {
+    const sessionId = 'brand-none-' + Date.now();
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send(makePayload({ session_id: sessionId }));
+
+    const rows = db.prepare(
+        'SELECT brand_id FROM mobile_events WHERE session_id = ?'
+    ).all(sessionId);
+
+    assert.ok(rows.every((r) => r.brand_id === null), 'all brand_id should be null');
+});
+
+// ── Events Query (deploy-monitor / hourly-funnel upstream) ─────────────────────
+
+test('GET /api/telemetry/events without secret → 401', async () => {
+    const res = await request(app).get('/api/telemetry/events');
+    assert.strictEqual(res.status, 401);
+});
+
+test('GET /api/telemetry/events missing required params → 400', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/events')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 400);
+});
+
+test('GET /api/telemetry/events empty event_types → 400', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/events?start_ms=1&end_ms=2&event_types=')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 400);
+    assert.ok(/event_types/.test(res.body.error));
+});
+
+test('GET /api/telemetry/events end_ms <= start_ms → 400', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/events?start_ms=2000&end_ms=1000&event_types=foo')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 400);
+});
+
+test('GET /api/telemetry/events returns seeded events in window with parsed data', async () => {
+    const tag = 'evtq-' + Date.now();
+    const t0 = Date.now();
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag,
+            device_id: 'd-' + tag,
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag,
+            brand_id: 'turbo_station',
+            events: [
+                { event_type: 'start_charge_tap', timestamp: t0, data: { station_id: 'S1', start_flow_id: 'f1' } },
+                { event_type: 'charging_confirmed', timestamp: t0 + 100, data: { station_id: 'S1', start_flow_id: 'f1' } },
+                { event_type: 'screen_open', timestamp: t0 + 200, data: { screen: 'home' } }, // not requested
+            ],
+        });
+
+    const res = await request(app)
+        .get(`/api/telemetry/events?start_ms=${t0 - 1000}&end_ms=${t0 + 5000}&event_types=start_charge_tap,charging_confirmed`)
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    assert.ok(Array.isArray(res.body.events));
+    const seeded = res.body.events.filter((e) => e.user_id === 'u-' + tag);
+    assert.strictEqual(seeded.length, 2, 'should return tap + confirm but not screen_open');
+    assert.ok(seeded.every((e) => typeof e.data === 'object' && e.data !== null),
+        'data should be parsed object, not JSON string');
+    assert.ok(seeded.some((e) => e.data.start_flow_id === 'f1'),
+        'parsed data should expose start_flow_id');
+    assert.ok(seeded.every((e) => e.app_version === '4.17.0'));
+    assert.ok(seeded.every((e) => e.brand_id === 'turbo_station'));
+});
+
+test('GET /api/telemetry/events filters by brand_id', async () => {
+    const tag = 'evtbr-' + Date.now();
+    const t0 = Date.now();
+    // Seed two events under different brands
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag + '-turbo',
+            device_id: 'd-' + tag + '-t',
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag + '-t',
+            brand_id: 'turbo_station',
+            events: [{ event_type: 'start_charge_tap', timestamp: t0, data: {} }],
+        });
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag + '-zev',
+            device_id: 'd-' + tag + '-z',
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag + '-z',
+            brand_id: 'zev',
+            events: [{ event_type: 'start_charge_tap', timestamp: t0, data: {} }],
+        });
+
+    const res = await request(app)
+        .get(`/api/telemetry/events?start_ms=${t0 - 1000}&end_ms=${t0 + 5000}&event_types=start_charge_tap&brand_id=zev`)
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    const seeded = res.body.events.filter((e) => e.user_id && e.user_id.startsWith('u-' + tag));
+    assert.strictEqual(seeded.length, 1, `expected only zev row, got ${seeded.length}`);
+    assert.strictEqual(seeded[0].brand_id, 'zev');
+});
+
+test('GET /api/telemetry/events without brand filter returns all brands', async () => {
+    const tag = 'evtany-' + Date.now();
+    const t0 = Date.now();
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag + '-a',
+            device_id: 'd-' + tag + '-a',
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag + '-a',
+            brand_id: 'turbo_station',
+            events: [{ event_type: 'start_charge_tap', timestamp: t0, data: {} }],
+        });
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag + '-b',
+            device_id: 'd-' + tag + '-b',
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag + '-b',
+            brand_id: 'zev',
+            events: [{ event_type: 'start_charge_tap', timestamp: t0, data: {} }],
+        });
+
+    const res = await request(app)
+        .get(`/api/telemetry/events?start_ms=${t0 - 1000}&end_ms=${t0 + 5000}&event_types=start_charge_tap`)
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    const seeded = res.body.events.filter((e) => e.user_id && e.user_id.startsWith('u-' + tag));
+    assert.strictEqual(seeded.length, 2, 'should return both brands when filter absent');
+    const brands = new Set(seeded.map((e) => e.brand_id));
+    assert.ok(brands.has('turbo_station') && brands.has('zev'));
+});
+
+test('GET /api/telemetry/events honors limit param', async () => {
+    const tag = 'evtlim-' + Date.now();
+    const t0 = Date.now();
+    const events = Array.from({ length: 5 }, (_, i) => ({
+        event_type: 'screen_open',
+        timestamp: t0 + i,
+        data: { i },
+    }));
+    await request(app)
+        .post('/api/telemetry/mobile')
+        .send({
+            session_id: tag,
+            device_id: 'd-' + tag,
+            app_version: '4.17.0',
+            platform: 'android',
+            user_id: 'u-' + tag,
+            events,
+        });
+
+    const res = await request(app)
+        .get(`/api/telemetry/events?start_ms=${t0 - 1000}&end_ms=${t0 + 5000}&event_types=screen_open&limit=3`)
+        .set('X-Monitor-Secret', SECRET);
+
+    assert.strictEqual(res.status, 200);
+    const seeded = res.body.events.filter((e) => e.user_id === 'u-' + tag);
+    assert.ok(seeded.length <= 3, `expected <=3 events, got ${seeded.length}`);
+});
+
+// ── Original presence test continues ───────────────────────────────────────────
 
 test('POST /api/telemetry/mobile — presence events get lat/lng stored', async () => {
     const sessionId = 'presence-test-' + Date.now();
@@ -493,8 +718,8 @@ test('POST /api/telemetry/user-logs — auto-purges entries older than 3 days', 
 // Clean up test data after all tests
 test._cleanup = () => {
     try {
-        db.prepare("DELETE FROM mobile_events WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%'").run();
-        db.prepare("DELETE FROM mobile_raw WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%'").run();
+        db.prepare("DELETE FROM mobile_events WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%' OR session_id LIKE 'brand-env-%' OR session_id LIKE 'brand-evt-%' OR session_id LIKE 'brand-none-%' OR session_id LIKE 'evtq-%' OR session_id LIKE 'evtbr-%' OR session_id LIKE 'evtany-%' OR session_id LIKE 'evtlim-%'").run();
+        db.prepare("DELETE FROM mobile_raw WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%' OR session_id LIKE 'brand-env-%' OR session_id LIKE 'brand-evt-%' OR session_id LIKE 'brand-none-%' OR session_id LIKE 'evtq-%' OR session_id LIKE 'evtbr-%' OR session_id LIKE 'evtany-%' OR session_id LIKE 'evtlim-%'").run();
         db.prepare("DELETE FROM user_log_dumps WHERE user_id LIKE 'test-%' OR user_id LIKE 'persist-test-%' OR user_id LIKE 'query-test-%' OR user_id LIKE 'purge-test-%'").run();
         console.log('\n🧹 Test data cleaned up');
     } catch (err) {

@@ -54,6 +54,7 @@ try {
       user_id         TEXT,
       event_type      TEXT,
       station_id      TEXT,
+      brand_id        TEXT,
       severity        TEXT,
       message         TEXT,
       data_json       TEXT,
@@ -68,6 +69,7 @@ try {
     CREATE INDEX IF NOT EXISTS idx_mobile_events_session_id      ON mobile_events(session_id);
     CREATE INDEX IF NOT EXISTS idx_mobile_events_station_id      ON mobile_events(station_id);
     CREATE INDEX IF NOT EXISTS idx_mobile_events_event_type      ON mobile_events(event_type);
+
 
     -- User-submitted diagnostic log dumps (auto-purged after 3 days).
     CREATE TABLE IF NOT EXISTS user_log_dumps (
@@ -89,6 +91,26 @@ try {
   process.exit(1);
 }
 
+// ─── Migrations (idempotent) ────────────────────────────────────────────────────
+// CREATE TABLE IF NOT EXISTS above is a no-op when the table exists from a prior
+// boot — so columns added later need explicit ALTER TABLE. Each step here must
+// be safe to re-run on every startup.
+
+try {
+  const cols = db.prepare("PRAGMA table_info('mobile_events')").all();
+  const hasBrandId = cols.some((c) => c.name === 'brand_id');
+  if (!hasBrandId) {
+    db.exec('ALTER TABLE mobile_events ADD COLUMN brand_id TEXT');
+    console.log(`${LOG_TAG} Migration: added mobile_events.brand_id column`);
+  }
+  // Index creation is idempotent and safe whether the column was just
+  // added (above) or already existed (fresh DB with brand_id in schema).
+  db.exec('CREATE INDEX IF NOT EXISTS idx_mobile_events_brand_id ON mobile_events(brand_id)');
+} catch (err) {
+  console.error(`${LOG_TAG} Migration failed:`, err.message);
+  process.exit(1);
+}
+
 // ─── Prepared Statements ────────────────────────────────────────────────────────
 // Created once at startup, reused per request for performance.
 
@@ -104,11 +126,11 @@ const stmts = {
     INSERT INTO mobile_events (
       raw_id, received_at, event_timestamp, session_id, device_id,
       app_version, platform, user_id, event_type, station_id,
-      severity, message, data_json
+      brand_id, severity, message, data_json
     ) VALUES (
       @raw_id, @received_at, @event_timestamp, @session_id, @device_id,
       @app_version, @platform, @user_id, @event_type, @station_id,
-      @severity, @message, @data_json
+      @brand_id, @severity, @message, @data_json
     )
   `),
 

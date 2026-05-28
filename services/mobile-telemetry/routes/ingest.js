@@ -9,7 +9,7 @@
  * @route   POST /api/telemetry/mobile
  * @access  Public (auth temporarily disabled — see TODO below)
  *
- * @body    {{ session_id, device_id, app_version, platform, user_id?, events: Event[] }}
+ * @body    {{ session_id, device_id, app_version, platform, user_id?, brand_id?, events: Event[] }}
  * @returns {{ success: boolean, received: number, session_id: string }}
  */
 
@@ -32,6 +32,7 @@ const ingestBatch = db.transaction((payload, receivedAt) => {
         app_version: appVersion,
         platform,
         user_id: userId,
+        brand_id: envelopeBrandId,
         events,
     } = payload;
 
@@ -49,6 +50,11 @@ const ingestBatch = db.transaction((payload, receivedAt) => {
         const eventType = event.event_type || 'unknown';
         const data = event.data || {};
 
+        // Brand resolution: envelope brand_id wins (one per session/payload),
+        // fall back to a per-event data.brand_id so legacy/edge writers can
+        // still tag rows. Null is fine — cross-brand queries omit the filter.
+        const brandId = envelopeBrandId || data.brand_id || data.brandId || null;
+
         stmts.insertEvent.run({
             raw_id: rawId,
             received_at: receivedAt,
@@ -60,6 +66,7 @@ const ingestBatch = db.transaction((payload, receivedAt) => {
             user_id: userId || null,
             event_type: eventType,
             station_id: data.station_id || data.stationId || null,
+            brand_id: brandId,
             severity: deriveSeverity(eventType),
             message: (data.message || JSON.stringify(data)).substring(0, 500),
             data_json: JSON.stringify(data),
