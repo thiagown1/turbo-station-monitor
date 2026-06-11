@@ -94,8 +94,8 @@ router.put('/:convId/link', (req, res) => {
   const conv = groupConv(req.params.convId, req);
   if (!conv) return res.status(404).json({ error: 'group conversation not found' });
   const { partnerId, partnerUserId, partnerName, allowedTools, brandId, linkedBy } = req.body || {};
-  if (!partnerId || !partnerUserId) {
-    return res.status(400).json({ error: 'partnerId and partnerUserId are required' });
+  if (!partnerId) {
+    return res.status(400).json({ error: 'partnerId is required' });
   }
   const now = nowIso();
   const tools = JSON.stringify(Array.isArray(allowedTools) ? allowedTools : []);
@@ -114,7 +114,7 @@ router.put('/:convId/link', (req, res) => {
       updated_at      = excluded.updated_at
   `).run(
     conv.customer_phone, conv.id, brandId || conv.brand_id,
-    partnerId, partnerUserId, partnerName || partnerId, tools,
+    partnerId, partnerUserId || '', partnerName || partnerId, tools,
     linkedBy || null, now, now,
   );
   const links = listLinks(conv.customer_phone);
