@@ -163,6 +163,11 @@ safeAddColumn('copilot_settings', 'auto_respond', 'INTEGER DEFAULT 0');
 safeAddColumn('copilot_settings', 'auto_suggest_groups', 'INTEGER DEFAULT 1');
 // Style profile mined from real operator replies (bot calibration)
 safeAddColumn('copilot_settings', 'style_profile', 'TEXT DEFAULT NULL');
+// Auto-respond gradual rollout (phase 4) — all default to fail-closed:
+// percent 0 + empty allowlist means nothing is auto-sent even if auto_respond=1.
+safeAddColumn('copilot_settings', 'auto_respond_allowlist', 'TEXT DEFAULT NULL');
+safeAddColumn('copilot_settings', 'auto_respond_percent', 'INTEGER DEFAULT 0');
+safeAddColumn('copilot_settings', 'auto_respond_business_hours', 'TEXT DEFAULT NULL');
 
 // Shadow mode (bot calibration): pairs a silently-generated suggestion with
 // what the operator actually sent, so we can measure how close the bot is to

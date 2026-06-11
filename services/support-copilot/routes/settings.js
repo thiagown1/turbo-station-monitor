@@ -38,6 +38,10 @@ router.get('/:brandId', (req, res) => {
       quick_replies: [],
       auto_suggest: false,
       auto_respond: false,
+      auto_suggest_groups: true,
+      auto_respond_allowlist: [],
+      auto_respond_percent: 0,
+      auto_respond_business_hours: null,
       is_default: true,
     });
   }
@@ -54,6 +58,10 @@ router.get('/:brandId', (req, res) => {
     quick_replies: quickReplies,
     auto_suggest: !!row.auto_suggest,
     auto_respond: !!row.auto_respond,
+    auto_suggest_groups: row.auto_suggest_groups == null ? true : !!row.auto_suggest_groups,
+    auto_respond_allowlist: row.auto_respond_allowlist ? JSON.parse(row.auto_respond_allowlist) : [],
+    auto_respond_percent: row.auto_respond_percent || 0,
+    auto_respond_business_hours: row.auto_respond_business_hours ? JSON.parse(row.auto_respond_business_hours) : null,
     is_default: false,
     updated_at: row.updated_at,
   });
@@ -63,22 +71,41 @@ router.get('/:brandId', (req, res) => {
 
 router.put('/:brandId', (req, res) => {
   const { brandId } = req.params;
-  const { tone_rules, business_info, quick_replies, auto_suggest, auto_respond } = req.body;
+  const { tone_rules, business_info, quick_replies, auto_suggest, auto_respond, auto_suggest_groups,
+    auto_respond_allowlist, auto_respond_percent, auto_respond_business_hours } = req.body;
 
   const now = nowIso();
   const quickRepliesJson = JSON.stringify(quick_replies || []);
 
   db.prepare(`
-    INSERT INTO copilot_settings (brand_id, tone_rules, business_info, quick_replies_json, auto_suggest, auto_respond, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO copilot_settings (brand_id, tone_rules, business_info, quick_replies_json, auto_suggest, auto_respond, auto_suggest_groups, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(brand_id) DO UPDATE SET
       tone_rules = excluded.tone_rules,
       business_info = excluded.business_info,
       quick_replies_json = excluded.quick_replies_json,
       auto_suggest = excluded.auto_suggest,
       auto_respond = excluded.auto_respond,
+      auto_suggest_groups = excluded.auto_suggest_groups,
       updated_at = excluded.updated_at
-  `).run(brandId, tone_rules || '', business_info || '', quickRepliesJson, auto_suggest ? 1 : 0, auto_respond ? 1 : 0, now);
+  `).run(brandId, tone_rules || '', business_info || '', quickRepliesJson, auto_suggest ? 1 : 0, auto_respond ? 1 : 0, auto_suggest_groups == null ? 1 : (auto_suggest_groups ? 1 : 0), now);
+
+  // Rollout config — only overwrite a field when the client actually sent it,
+  // so a normal settings save never accidentally resets the rollout.
+  if (auto_respond_allowlist !== undefined || auto_respond_percent !== undefined || auto_respond_business_hours !== undefined) {
+    db.prepare(`
+      UPDATE copilot_settings SET
+        auto_respond_allowlist = COALESCE(?, auto_respond_allowlist),
+        auto_respond_percent = COALESCE(?, auto_respond_percent),
+        auto_respond_business_hours = COALESCE(?, auto_respond_business_hours)
+      WHERE brand_id = ?
+    `).run(
+      auto_respond_allowlist === undefined ? null : JSON.stringify(Array.isArray(auto_respond_allowlist) ? auto_respond_allowlist : []),
+      auto_respond_percent === undefined ? null : Math.max(0, Math.min(100, Number(auto_respond_percent) || 0)),
+      auto_respond_business_hours === undefined ? null : (auto_respond_business_hours ? JSON.stringify(auto_respond_business_hours) : null),
+      brandId,
+    );
+  }
 
   // Invalidate all session contexts for this brand so the next suggestion
   // sends the full context with the updated rules
@@ -98,6 +125,7 @@ router.put('/:brandId', (req, res) => {
     quick_replies: quick_replies || [],
     auto_suggest: !!auto_suggest,
     auto_respond: !!auto_respond,
+    auto_suggest_groups: auto_suggest_groups == null ? true : !!auto_suggest_groups,
     updated_at: now,
   });
 });

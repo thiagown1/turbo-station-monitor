@@ -30,6 +30,8 @@ const fs = require('fs');
 const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
 const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
+const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
+const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const { emitEvent } = require('../lib/sse');
 
 const router = Router();
@@ -269,8 +271,24 @@ router.post('/', (req, res) => {
 
     if (existing) {
       conversationId = existing.id;
-      db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?')
-        .run(now, existing.id);
+
+      // Reopen a closed group on new inbound (mirrors 1:1) so it resurfaces
+      // and the copilot can suggest a reply. Groups get auto-closed after
+      // inactivity, so without this the suggestion path would always skip them.
+      if (existing.status === 'closed' && direction === 'inbound') {
+        db.prepare(`UPDATE conversations SET status = 'open', updated_at = ? WHERE id = ?`)
+          .run(now, existing.id);
+        try {
+          db.prepare(`UPDATE session_context SET compacted_at = NULL, full_context_sent = 0, last_msg_index = 0 WHERE conversation_id = ?`)
+            .run(existing.id);
+        } catch (_) { /* session_context may not exist yet */ }
+        db.prepare(`INSERT INTO audit_log (id, brand_id, conversation_id, action, actor_user_id, metadata_json, created_at) VALUES (?,?,?,?,?,?,?)`)
+          .run(randomId('audit'), brandId, existing.id, 'support.reopen', null, JSON.stringify({ reason: 'new_inbound_message', channel: 'whatsapp-group' }), now);
+        emitEvent({ type: 'conversation_update', conversationId: existing.id, brandId });
+      } else {
+        db.prepare('UPDATE conversations SET updated_at = ? WHERE id = ?')
+          .run(now, existing.id);
+      }
 
       // Backfill group name if still using fallback JID-based name
       if (existing.customer_name && existing.customer_name.startsWith('Grupo 1')) {
@@ -319,6 +337,25 @@ router.post('/', (req, res) => {
 
     console.log(`${LOG_TAG} Group ingest: ${created ? 'new' : 'existing'} conv ${conversationId}, msg ${msgId}, group ${groupJid}, sender ${senderName}`);
 
+    // Track group participants (phone + name) for partner resolution / linking.
+    if (direction === 'inbound' && key.participant) {
+      try {
+        const participantPhone = normalizePhone(phoneFromJid(key.participant));
+        if (participantPhone) {
+          db.prepare(`
+            INSERT INTO group_participants (group_jid, phone, name, msg_count, first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, 1, ?, ?)
+            ON CONFLICT(group_jid, phone) DO UPDATE SET
+              name = COALESCE(excluded.name, group_participants.name),
+              msg_count = group_participants.msg_count + 1,
+              last_seen_at = excluded.last_seen_at
+          `).run(groupJid, participantPhone, senderName || null, now, now);
+        }
+      } catch (e) {
+        console.warn(`${LOG_TAG} participant upsert failed:`, e.message);
+      }
+    }
+
     // Push SSE event
     const updatedConv = stmts.getConversation.get(conversationId);
     emitEvent({
@@ -351,6 +388,11 @@ router.post('/', (req, res) => {
         tags: updatedConv.tags_json ? JSON.parse(updatedConv.tags_json) : [],
       } : null,
     });
+
+    // Pre-generate a copilot suggestion for the dashboard (groups: suggest-only).
+    if (direction === 'inbound') {
+      scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+    }
 
     return res.status(201).json({
       id: msgId,
@@ -750,14 +792,30 @@ router.post('/', (req, res) => {
               model: result.model,
             });
 
-            // Auto-respond if enabled
-            if (settings.auto_respond && result.model !== 'template-fallback') {
-              const { sendText } = require('../lib/evolution-client');
+            // Auto-respond gate (phase 4) — fail-closed: flag + allowlist/percent +
+            // escalation triggers + business hours all decided in one pure function.
+            const gate = evaluateAutoRespond({
+              conv,
+              lastInboundText: body,
+              suggestion: { text: result.text, model: result.model, tags: result.tags },
+              settings,
+              nowMs: Date.now(),
+            });
+            if (!gate.allow) {
+              if (settings.auto_respond) {
+                console.log(`${LOG_TAG} [auto-respond] held for ${conversationId}: ${gate.reason}`);
+              }
+            } else {
+              const { sendText, sendPresence } = require('../lib/evolution-client');
               const customerPhone = conv.customer_phone || (conv.channel === 'whatsapp' && conv.phone_aliases ? `${conv.phone_aliases.split(',')[0]}@lid` : null);
               if (customerPhone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
                 // Resolve the Evolution API instance name for this brand
                 const instanceName = Object.entries(EVOLUTION_INSTANCE_BRAND_MAP)
                   .find(([, brand]) => brand === brandId)?.[0] || brandId;
+                // Humanize: show "typing…" then wait before sending (best-effort).
+                if (gate.typing) { await sendPresence(instanceName, customerPhone, 'composing', gate.delayMs || 0); }
+                if (gate.delayMs) { await new Promise(r => setTimeout(r, Math.min(gate.delayMs, 9000))); }
+                console.log(`${LOG_TAG} [auto-respond] sending (${gate.reason}) to ${conversationId} after ${gate.delayMs}ms`);
                 await sendText(instanceName, customerPhone, result.text);
 
                 // Save outbound message
