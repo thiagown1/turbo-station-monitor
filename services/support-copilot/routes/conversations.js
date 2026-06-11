@@ -174,7 +174,8 @@ router.post('/:id/messages', async (req, res) => {
       WHERE conversation_id = ? AND status = 'pending'
       ORDER BY created_at DESC LIMIT 1
     `).get(conv.id);
-    if (pendingSug && (!conv.last_inbound_at || pendingSug.created_at >= conv.last_inbound_at)) {
+    const isRealCustomerConv = !conv.is_staff && conv.channel === 'whatsapp' && conv.customer_phone;
+    if (isRealCustomerConv && pendingSug && (!conv.last_inbound_at || pendingSug.created_at >= conv.last_inbound_at)) {
       db.prepare(`
         INSERT INTO shadow_comparisons (id, conversation_id, brand_id, suggestion_id, suggestion_text, operator_text, model_name, suggestion_created_at, operator_replied_at, created_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)

@@ -186,6 +186,10 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} shadow_comparisons migration:`, err.message);
 }
+// LLM-judge columns (filled later by scripts/judge-shadow.js)
+safeAddColumn('shadow_comparisons', 'judge_score', 'INTEGER DEFAULT NULL');
+safeAddColumn('shadow_comparisons', 'judge_verdict', 'TEXT DEFAULT NULL');
+safeAddColumn('shadow_comparisons', 'judged_at', 'TEXT DEFAULT NULL');
 
 // Group -> partner link + captured group participants (Phase 2)
 // 2026-06-10: a group may be linked to MULTIPLE partners (e.g. Arena group has
