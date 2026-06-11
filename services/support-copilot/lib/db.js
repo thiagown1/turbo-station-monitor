@@ -161,6 +161,31 @@ try {
 safeAddColumn('copilot_settings', 'auto_suggest', 'INTEGER DEFAULT 0');
 safeAddColumn('copilot_settings', 'auto_respond', 'INTEGER DEFAULT 0');
 safeAddColumn('copilot_settings', 'auto_suggest_groups', 'INTEGER DEFAULT 1');
+// Style profile mined from real operator replies (bot calibration)
+safeAddColumn('copilot_settings', 'style_profile', 'TEXT DEFAULT NULL');
+
+// Shadow mode (bot calibration): pairs a silently-generated suggestion with
+// what the operator actually sent, so we can measure how close the bot is to
+// the real support style before enabling auto_respond.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS shadow_comparisons (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT,
+      suggestion_id TEXT NOT NULL,
+      suggestion_text TEXT NOT NULL,
+      operator_text TEXT NOT NULL,
+      model_name TEXT,
+      suggestion_created_at TEXT,
+      operator_replied_at TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_shadow_conv ON shadow_comparisons(conversation_id);');
+} catch (err) {
+  console.warn(`${LOG_TAG} shadow_comparisons migration:`, err.message);
+}
 
 // Group -> partner link + captured group participants (Phase 2)
 // 2026-06-10: a group may be linked to MULTIPLE partners (e.g. Arena group has

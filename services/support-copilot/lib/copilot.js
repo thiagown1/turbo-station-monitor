@@ -184,6 +184,13 @@ function buildAgentPrompt(conversation, messages, { userData, tags, enrichmentBl
       `- Máximo 1-2 linhas. Sem cumprimentos desnecessários.`,
       `- Comece respondendo ou agindo, não cumprimentando nem lamentando`,
     ]),
+    // Style profile mined from real operator replies -- makes the bot match
+    // how the team actually writes (calibration for auto_respond).
+    ...(customSettings?.style_profile ? [
+      ``,
+      `PERFIL DE ESTILO DO ATENDIMENTO REAL (imite fielmente -- vocabulário, saudações, emojis, comprimento):`,
+      customSettings.style_profile,
+    ] : []),
     ``,
     `REGRAS DE COMPORTAMENTO (obrigatórias):`,
     `- IDENTIDADE: Você é um atendente humano. NUNCA admita ser IA/robô/chatbot. Se perguntarem, responda com humor casual: "que isso? tá achando que eu sou um bot? kkk" ou "sou eu mesmo, do suporte 😄". Se insistirem, mantenha a persona com humor e redirecione: "kkkk me diz oq vc precisa que eu te ajudo".`,
@@ -267,6 +274,7 @@ function buildContextHash(conversation, { userData, tags, enrichmentBlock, custo
     // Include settings so hash changes when rules are edited
     customSettings?.tone_rules || '',
     customSettings?.business_info || '',
+    customSettings?.style_profile || '',
     // Include learned rules so hash changes when rules are added/removed
     JSON.stringify((customSettings?.learnedRules || []).map(r => r.rule_text)),
   ];
@@ -733,7 +741,7 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   // Fetch custom copilot settings (tone rules, business info)
   let customSettings = null;
   try {
-    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json FROM copilot_settings WHERE brand_id = ?')
+    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json, style_profile FROM copilot_settings WHERE brand_id = ?')
       .get(conversation.brand_id);
   } catch (err) {
     console.warn(`${LOG_TAG} Could not fetch copilot settings:`, err.message);
@@ -1052,7 +1060,7 @@ function buildContextPreview(conversation, messages, { userData, tags } = {}) {
   // Fetch custom copilot settings
   let customSettings = null;
   try {
-    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json FROM copilot_settings WHERE brand_id = ?')
+    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json, style_profile FROM copilot_settings WHERE brand_id = ?')
       .get(conversation.brand_id);
   } catch (err) {
     // ignore

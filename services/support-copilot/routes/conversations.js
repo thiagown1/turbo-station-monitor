@@ -165,6 +165,28 @@ router.post('/:id/messages', async (req, res) => {
 
   console.log(`${LOG_TAG} Message sent in conv ${conv.id}`);
 
+  // Shadow mode (bot calibration): if a pending suggestion exists for the
+  // current turn, pair it with what the operator actually sent. The decide
+  // PATCH (accepted/edited) arrives after this and overwrites 'superseded'.
+  try {
+    const pendingSug = db.prepare(`
+      SELECT id, suggestion_text, model_name, created_at FROM suggestions
+      WHERE conversation_id = ? AND status = 'pending'
+      ORDER BY created_at DESC LIMIT 1
+    `).get(conv.id);
+    if (pendingSug && (!conv.last_inbound_at || pendingSug.created_at >= conv.last_inbound_at)) {
+      db.prepare(`
+        INSERT INTO shadow_comparisons (id, conversation_id, brand_id, suggestion_id, suggestion_text, operator_text, model_name, suggestion_created_at, operator_replied_at, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+      `).run(randomId('shadow'), conv.id, conv.brand_id, pendingSug.id, pendingSug.suggestion_text, msgBody, pendingSug.model_name, pendingSug.created_at, now, now);
+      db.prepare(`UPDATE suggestions SET status = 'superseded', decided_at = ?, updated_at = ? WHERE id = ?`)
+        .run(now, now, pendingSug.id);
+      console.log(`${LOG_TAG} Shadow comparison recorded for conv ${conv.id} (sug ${pendingSug.id})`);
+    }
+  } catch (err) {
+    console.warn(`${LOG_TAG} Shadow comparison failed (non-blocking):`, err.message);
+  }
+
   // Send to WhatsApp via Evolution API (1:1 or group)
   let deliveryStatus = 'sent';
   const targetPhone = conv.customer_phone || (conv.channel === 'whatsapp' && conv.phone_aliases ? `${conv.phone_aliases.split(',')[0]}@lid` : null);
