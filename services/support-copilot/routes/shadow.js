@@ -60,8 +60,11 @@ router.get('/comparisons', (req, res) => {
   const brandId = resolveBrand(req);
   const limit = Math.min(parseInt(req.query.limit, 10) || 50, 200);
   const offset = parseInt(req.query.offset, 10) || 0;
-  const where = brandId ? 'WHERE s.brand_id = ?' : '';
-  const args = brandId ? [brandId] : [];
+  const clauses = [];
+  const args = [];
+  if (brandId) { clauses.push('s.brand_id = ?'); args.push(brandId); }
+  if (req.query.unjudged === '1') clauses.push('s.judge_score IS NULL');
+  const where = clauses.length ? 'WHERE ' + clauses.join(' AND ') : '';
   const rows = db.prepare(`
     SELECT s.*, c.customer_name, c.channel
     FROM shadow_comparisons s
@@ -119,6 +122,24 @@ router.get('/stats', (req, res) => {
     judgedCount: judged,
     avgJudgeScore: judged ? Math.round(sumJudge / judged) : null,
   });
+});
+
+// Batch-write LLM-judge scores (called by the Next.js judge route after it
+// scores unjudged pairs via OpenRouter). Idempotent per id.
+router.post('/judge', (req, res) => {
+  const scores = Array.isArray(req.body?.scores) ? req.body.scores.slice(0, 100) : [];
+  if (scores.length === 0) return res.status(400).json({ error: 'scores[] required' });
+  const now = new Date().toISOString();
+  const upd = db.prepare('UPDATE shadow_comparisons SET judge_score = ?, judge_verdict = ?, judged_at = ? WHERE id = ?');
+  let updated = 0;
+  for (const sc of scores) {
+    const score = Number(sc.score);
+    if (!sc.id || !Number.isFinite(score)) continue;
+    const clamped = Math.max(0, Math.min(100, Math.round(score)));
+    const verdict = typeof sc.verdict === 'string' ? sc.verdict.slice(0, 500) : null;
+    updated += upd.run(clamped, verdict, now, String(sc.id)).changes;
+  }
+  res.json({ updated });
 });
 
 module.exports = router;
