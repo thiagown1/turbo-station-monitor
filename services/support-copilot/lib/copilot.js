@@ -743,8 +743,8 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   let learnedRules = [];
   try {
     learnedRules = db.prepare(
-      "SELECT rule_text, example_original, example_edited FROM copilot_learned_rules WHERE brand_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 20"
-    ).all(conversation.brand_id);
+      "SELECT rule_text, example_original, example_edited FROM copilot_learned_rules WHERE brand_id = ? AND status = 'active' AND (scope = 'all' OR scope = ?) ORDER BY created_at DESC LIMIT 20"
+    ).all(conversation.brand_id, scopeForChannel(conversation.channel));
   } catch (err) {
     console.warn(`${LOG_TAG} Could not fetch learned rules:`, err.message);
   }
@@ -754,6 +754,39 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
     customSettings.learnedRules = learnedRules;
   } else if (learnedRules.length > 0) {
     customSettings = { tone_rules: null, business_info: null, learnedRules };
+  }
+
+  // Group -> partner context (Phase 3): when this group is linked to one or
+  // more partners, make the agent act on those partners' behalf (account,
+  // stations, recharges). Appended to business_info so it flows through
+  // buildAgentPrompt AND the context hash (a link change re-sends context).
+  if (conversation.channel === 'whatsapp-group') {
+    try {
+      const links = db.prepare(
+        'SELECT partner_id, partner_name, allowed_tools, enabled FROM group_partner_links WHERE group_jid = ? AND enabled = 1 ORDER BY linked_at ASC'
+      ).all(conversation.customer_phone);
+      if (links.length > 0) {
+        const partnerLines = links.map(link => {
+          let tools = [];
+          try { tools = JSON.parse(link.allowed_tools || '[]'); } catch {}
+          return `- "${link.partner_name}" (id: ${link.partner_id})` +
+            (tools.length ? ` — capacidades liberadas: ${tools.join(', ')}` : '');
+        });
+        const partnerBlock = [
+          '',
+          links.length === 1 ? '[PARCEIRO VINCULADO A ESTE GRUPO]' : '[PARCEIROS VINCULADOS A ESTE GRUPO]',
+          ...partnerLines,
+          'Trate as solicitacoes como vindas desses parceiros (estacoes, recargas e financeiro das contas deles).',
+        ].filter(Boolean).join('\n');
+        if (customSettings) {
+          customSettings = { ...customSettings, business_info: (customSettings.business_info || '') + '\n' + partnerBlock };
+        } else {
+          customSettings = { tone_rules: null, business_info: partnerBlock, learnedRules: [] };
+        }
+      }
+    } catch (err) {
+      console.warn(`${LOG_TAG} group partner context lookup failed:`, err.message);
+    }
   }
 
   // Fetch context enrichment (OCPP, Vercel, station data)
@@ -1010,8 +1043,8 @@ function buildContextPreview(conversation, messages, { userData, tags } = {}) {
   let learnedRules = [];
   try {
     learnedRules = db.prepare(
-      "SELECT rule_text, example_original, example_edited FROM copilot_learned_rules WHERE brand_id = ? AND status = 'active' ORDER BY created_at DESC LIMIT 20"
-    ).all(conversation.brand_id);
+      "SELECT rule_text, example_original, example_edited FROM copilot_learned_rules WHERE brand_id = ? AND status = 'active' AND (scope = 'all' OR scope = ?) ORDER BY created_at DESC LIMIT 20"
+    ).all(conversation.brand_id, scopeForChannel(conversation.channel));
   } catch (err) {
     // ignore
   }
@@ -1242,6 +1275,18 @@ async function compactSession(conversationId, brandId) {
  * @param {string} edited - What the operator changed it to
  * @param {string} [conversationId] - Conversation ID for context
  */
+/** Learned-rule scope from a conversation channel: 'group' vs 'direct'. */
+function scopeForChannel(channel) {
+  return channel === 'whatsapp-group' ? 'group' : 'direct';
+}
+function scopeForConversationId(conversationId) {
+  if (!conversationId) return 'all';
+  try {
+    const c = db.prepare('SELECT channel FROM conversations WHERE id = ?').get(conversationId);
+    return c ? scopeForChannel(c.channel) : 'all';
+  } catch { return 'all'; }
+}
+
 async function extractLearnedRule(brandId, suggestionId, original, edited, conversationId) {
   if (!original || !edited || original.trim() === edited.trim()) return;
 
@@ -1317,10 +1362,11 @@ async function extractLearnedRule(brandId, suggestionId, original, edited, conve
     }
 
     const id = `rule_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+    const scope = scopeForConversationId(conversationId);
     db.prepare(`
-      INSERT INTO copilot_learned_rules (id, brand_id, rule_text, example_original, example_edited, source_suggestion_id, status, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-    `).run(id, brandId, ruleText, original, edited, suggestionId, nowIso());
+      INSERT INTO copilot_learned_rules (id, brand_id, rule_text, example_original, example_edited, source_suggestion_id, status, scope, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+    `).run(id, brandId, ruleText, original, edited, suggestionId, scope, nowIso());
 
     console.log(`${LOG_TAG} ✅ Learned rule extracted: "${ruleText.substring(0, 60)}..."`);
   } catch (err) {
@@ -1421,10 +1467,17 @@ async function analyzeEdit(brandId, original, edited, conversationId) {
  */
 function saveLearnedRule(brandId, ruleText, original, edited, suggestionId) {
   const id = `rule_${Math.random().toString(36).slice(2, 10)}${Date.now().toString(36)}`;
+  let scope = 'all';
+  if (suggestionId) {
+    try {
+      const s = db.prepare('SELECT conversation_id FROM suggestions WHERE id = ?').get(suggestionId);
+      if (s) scope = scopeForConversationId(s.conversation_id);
+    } catch {}
+  }
   db.prepare(`
-    INSERT INTO copilot_learned_rules (id, brand_id, rule_text, example_original, example_edited, source_suggestion_id, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, 'active', ?)
-  `).run(id, brandId, ruleText, original, edited, suggestionId || null, nowIso());
+    INSERT INTO copilot_learned_rules (id, brand_id, rule_text, example_original, example_edited, source_suggestion_id, status, scope, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+  `).run(id, brandId, ruleText, original, edited, suggestionId || null, scope, nowIso());
   console.log(`${LOG_TAG} ✅ Learned rule saved: "${ruleText.substring(0, 60)}..."`);
   return id;
 }

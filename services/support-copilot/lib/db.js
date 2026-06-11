@@ -160,6 +160,51 @@ try {
 }
 safeAddColumn('copilot_settings', 'auto_suggest', 'INTEGER DEFAULT 0');
 safeAddColumn('copilot_settings', 'auto_respond', 'INTEGER DEFAULT 0');
+safeAddColumn('copilot_settings', 'auto_suggest_groups', 'INTEGER DEFAULT 1');
+
+// Group -> partner link + captured group participants (Phase 2)
+// 2026-06-10: a group may be linked to MULTIPLE partners (e.g. Arena group has
+// Luan + Damião) — PK is now (group_jid, partner_id). The old single-link table
+// (PK group_jid) was empty in prod, so dropping it loses nothing.
+try {
+  const pkCols = db.prepare(`PRAGMA table_info('group_partner_links')`).all()
+    .filter(c => c.pk > 0).map(c => c.name);
+  if (pkCols.length === 1 && pkCols[0] === 'group_jid') {
+    db.exec('DROP TABLE group_partner_links');
+    console.log(`${LOG_TAG} Migration: recreated group_partner_links with (group_jid, partner_id) PK`);
+  }
+} catch (err) {
+  console.warn(`${LOG_TAG} group_partner_links PK migration:`, err.message);
+}
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS group_partner_links (
+      group_jid TEXT NOT NULL,
+      conversation_id TEXT,
+      brand_id TEXT,
+      partner_id TEXT NOT NULL,
+      partner_user_id TEXT NOT NULL,
+      partner_name TEXT,
+      allowed_tools TEXT,
+      enabled INTEGER DEFAULT 1,
+      linked_by TEXT,
+      linked_at TEXT,
+      updated_at TEXT,
+      PRIMARY KEY (group_jid, partner_id)
+    );
+    CREATE TABLE IF NOT EXISTS group_participants (
+      group_jid TEXT NOT NULL,
+      phone TEXT NOT NULL,
+      name TEXT,
+      msg_count INTEGER DEFAULT 0,
+      first_seen_at TEXT,
+      last_seen_at TEXT,
+      PRIMARY KEY (group_jid, phone)
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} group link/participant migration:`, err.message);
+}
 
 // Copilot learned rules — extracted from operator edits to suggestions
 try {
@@ -178,6 +223,7 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} copilot_learned_rules migration:`, err.message);
 }
+safeAddColumn('copilot_learned_rules', 'scope', "TEXT DEFAULT 'all'");
 
 // Knowledge documents — per-brand knowledge base managed from the dashboard
 try {
