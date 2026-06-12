@@ -14,6 +14,36 @@ const fs = require('fs');
 const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
 
+// --- OCPP fault parsing (added 2026-06-09) -------------------------------
+// The collector stores StatusNotification fault detail as free-text `message`
+// with meta=null, e.g.:
+//   STATUS_NOTIF ... charger=ME.. connector=1 status=Faulted error=OtherError, vendor_error=The emergency stop button was pressed
+// so the actual fault was invisible in alerts. Parse it back into fields.
+function parseStatusNotif(message) {
+    const out = { connectorId: null, status: null, error: null, info: null, vendorError: null };
+    if (!message) return out;
+    const conn = message.match(/connector[=:]?\s*(\d+)/i);
+    const status = message.match(/status[=:]?\s*([A-Za-z]+)/i);
+    const err = message.match(/(?:^|\s)error[=:]?\s*([^,]+?)(?:,|\s+info|\s+vendor_error|$)/i);
+    const info = message.match(/info[=:]?\s*([^,]+?)(?:,|\s+vendor_error|$)/i);
+    const vendor = message.match(/vendor_error[=:]?\s*(.+?)\s*$/i);
+    if (conn) out.connectorId = Number(conn[1]);
+    if (status) out.status = status[1];
+    if (err) out.error = err[1].trim();
+    if (info) out.info = info[1].trim();
+    if (vendor) out.vendorError = vendor[1].trim();
+    return out;
+}
+
+// True when a "fault" is really an operator pressing the physical e-stop button.
+// These have their own dedicated WhatsApp alert and are NOT charger failures,
+// so they must not escalate into critical "Charger + Backend" correlations.
+function isEmergencyStopFault(parsed, rawMessage) {
+    const hay = [(parsed && parsed.info) || '', (parsed && parsed.vendorError) || '', rawMessage || ''].join(' ');
+    // Matches 'EmergencyButtonPressed', 'EmergencyStop', and 'The emergency stop button was pressed'.
+    return /emergency/i.test(hay);
+}
+
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
 const OCPP_DB_PATH = path.join(DB_DIR, 'ocpp.db');
@@ -26,6 +56,17 @@ const ALERTS_DB_PATH = path.join(DB_DIR, 'logs.db');
 // Disabled by default (Thiago request 2026-02-26). To enable:
 //   export ALERT_TELEGRAM_GROUP='telegram:-5102620169'
 const TELEGRAM_GROUP = process.env.ALERT_TELEGRAM_GROUP || null;
+// WhatsApp alerts via the support-copilot → Evolution transport (the openclaw
+// WhatsApp-Web gateway is NOT linked, so `openclaw message send` fails). This is
+// the same path the Next whatsapp-notifier and the manual tests use, confirmed
+// delivering to the "Notificações Turbo Station" group. Set ALERT_WHATSAPP_CONV=''
+// to disable WhatsApp dispatch.
+const WHATSAPP_CONV = process.env.ALERT_WHATSAPP_CONV !== undefined
+    ? process.env.ALERT_WHATSAPP_CONV
+    : 'conv_jiuijxjtmnet23i9';
+const WHATSAPP_BRAND = process.env.ALERT_WHATSAPP_BRAND || 'turbo_station';
+const SUPPORT_API_BASE = (process.env.SUPPORT_API_URL || 'https://logs.turbostation.com.br').replace(/\/+$/, '');
+const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
 
 // Freshness guard
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send alerts older than 10 minutes
@@ -38,6 +79,32 @@ const DEBOUNCE_WINDOW = 60 * 60 * 1000; // 1 hour
 // Time windows for queries (in milliseconds)
 const QUERY_WINDOW = 5 * 60 * 1000; // Last 5 minutes
 const CORRELATION_WINDOW = 30 * 1000; // ±30 seconds for correlation
+
+// --- Causal correlation gate (added 2026-06-12) --------------------------
+// A charger fault and a backend error are only CAUSALLY related when the
+// backend failure could actually have blocked a charge action on THAT charger
+// (e.g. user hit "start charge" → the start route 5xx'd → the charger never
+// started). Mere temporal coincidence — any 4xx/5xx anywhere in the ±30s
+// window — was the #1 false-critical source: a random `/api/stations/accessible
+// 403` + `/api/users/<uid> 404` got bundled as "backend afetou carregador".
+//
+// We now require BOTH:
+//   (a) the backend endpoint is a charge-ACTION route (start/stop/authorize/…),
+//   (b) it references THIS charger's id/serial in its path or query.
+// Generic reads (analytics, pricing, health, accessible, user lookups) and
+// errors on other chargers never escalate a fault to critical. Charger faults
+// and backend errors otherwise alert as two independent streams.
+const CHARGE_ACTION_ROUTE = /(remote[-_]?start|remote[-_]?stop|start[-_]?transaction|stop[-_]?transaction|\/authorize\b|\/pnc\/|\/charging\b|\/charge\b|\/sessions?\b)/i;
+
+function endpointReferencesCharger(endpoint, chargerId) {
+    if (!endpoint || !chargerId) return false;
+    return String(endpoint).includes(String(chargerId));
+}
+
+function isCausalBackendError(endpoint, chargerId) {
+    if (!endpoint) return false;
+    return CHARGE_ACTION_ROUTE.test(endpoint) && endpointReferencesCharger(endpoint, chargerId);
+}
 
 // Ingest watchdog (if no new rows, alert)
 const INGEST_STALL_OCPP_MS = 10 * 60 * 1000;
@@ -206,15 +273,18 @@ class AlertEngine {
     detectVercel5xxErrors() {
         const cutoff = Date.now() - QUERY_WINDOW;
         
+        // Catch 5xx on ANY endpoint (was previously scoped to /api/ocpp, which
+        // silently missed /api/payments/process etc. — the PIX incident).
+        // Grouping by endpoint + shouldSendAlert (1h debounce per endpoint) keeps
+        // a storm to one alert per endpoint.
         const query = `
             SELECT id, timestamp, endpoint, status_code, duration_ms, meta
             FROM vercel_logs
             WHERE status_code >= 500
               AND status_code < 600
-              AND endpoint LIKE '%/api/ocpp%'
               AND timestamp > ?
             ORDER BY timestamp DESC
-            LIMIT 10
+            LIMIT 50
         `;
 
         const errors = this.vercelDb.prepare(query).all(cutoff);
@@ -242,7 +312,7 @@ class AlertEngine {
             const alert = {
                 type: 'vercel_5xx',
                 severity: 'critical',
-                title: `Erro ${firstError.status_code} no backend OCPP`,
+                title: `Erro ${firstError.status_code} no backend`,
                 description: `${count} erro(s) 5xx em ${endpoint} nos últimos 5 minutos`,
                 endpoint: endpoint,
                 status_code: firstError.status_code,
@@ -437,7 +507,7 @@ class AlertEngine {
 
         // Get recent OCPP errors
         const ocppErrorsQuery = `
-            SELECT id, timestamp, charger_id, event_type, meta
+            SELECT id, timestamp, charger_id, event_type, meta, message
             FROM ocpp_events
             WHERE charger_id IS NOT NULL
               AND (
@@ -457,22 +527,35 @@ class AlertEngine {
         const alerts = [];
 
         for (const ocppError of ocppErrors) {
-            // Look for Vercel errors within ±30s
-            // NOTE: we exclude 405 by default from correlation (low-signal/method mismatch noise).
+            // Emergency-stop presses are operator actions, not charger faults
+            // (they have their own dedicated WhatsApp alert). Don't escalate them
+            // into critical Charger+Backend correlations — #1 false-critical source.
+            const ocppFault = parseStatusNotif(ocppError.message);
+            if (isEmergencyStopFault(ocppFault, ocppError.message)) {
+                continue;
+            }
+
+            // Pull backend errors within ±30s, then keep ONLY the ones that are
+            // causally linked to THIS charger (charge-action route + references
+            // this charger id). 405 excluded (low-signal method mismatch noise).
+            // Temporal-only matches are dropped here — that was the bogus-alert
+            // source the screenshots showed.
             const vercelErrorsQuery = `
-                SELECT id, timestamp, endpoint, status_code, duration_ms
+                SELECT id, timestamp, endpoint, method, status_code, duration_ms
                 FROM vercel_logs
                 WHERE status_code >= 400
                   AND status_code != 405
                   AND timestamp BETWEEN ? AND ?
                 ORDER BY timestamp
-                LIMIT 10
+                LIMIT 50
             `;
 
-            const vercelErrors = this.vercelDb.prepare(vercelErrorsQuery).all(
+            const vercelCandidates = this.vercelDb.prepare(vercelErrorsQuery).all(
                 ocppError.timestamp - CORRELATION_WINDOW,
                 ocppError.timestamp + CORRELATION_WINDOW
             );
+
+            const vercelErrors = vercelCandidates.filter(v => isCausalBackendError(v.endpoint, ocppError.charger_id));
 
             if (vercelErrors.length > 0) {
                 // Found correlation!
@@ -496,7 +579,7 @@ class AlertEngine {
                     type: 'ocpp_vercel_correlation',
                     severity: 'critical',
                     title: `Erro correlacionado: Charger + Backend`,
-                    description: `Erro OCPP (${ocppError.event_type}) correlacionado com ${vercelErrors.length} erro(s) backend`,
+                    description: `Erro OCPP (${ocppError.event_type}${ocppFault.error ? `: ${ocppFault.error}` : ''}${ocppFault.info ? ` / ${ocppFault.info}` : ''}) correlacionado com ${vercelErrors.length} erro(s) backend`,
                     charger_id: ocppError.charger_id,
                     event_type: ocppError.event_type,
                     vercel_errors: vercelErrors.length,
@@ -509,6 +592,92 @@ class AlertEngine {
 
                 alerts.push(alert);
             }
+        }
+
+        return alerts;
+    }
+
+    /**
+     * Standalone charger-fault alerts (added 2026-06-12).
+     *
+     * Before this, an OCPP fault only surfaced if it coincided with a backend
+     * error within ±30s (detectOcppVercelCorrelation). Real faults with no
+     * backend coincidence were therefore SILENT, while coincidental noise made
+     * false "backend afetou carregador" criticals. Charger faults and backend
+     * errors are now independent streams; this detector owns the charger side.
+     * e-stop presses are excluded (operator action, has its own alert).
+     */
+    detectChargerFaults() {
+        const cutoff = Date.now() - QUERY_WINDOW;
+
+        const faults = this.ocppDb.prepare(`
+            SELECT id, timestamp, charger_id, event_type, meta, message
+            FROM ocpp_events
+            WHERE charger_id IS NOT NULL
+              AND (
+                  event_type LIKE '%fault%'
+                  OR event_type LIKE '%error%'
+                  OR event_type LIKE '%failed%'
+              )
+              AND timestamp > ?
+            ORDER BY timestamp DESC
+            LIMIT 50
+        `).all(cutoff);
+
+        if (faults.length === 0) return [];
+
+        const alerts = [];
+        const seen = new Set();
+
+        for (const ev of faults) {
+            const parsed = parseStatusNotif(ev.message);
+            if (isEmergencyStopFault(parsed, ev.message)) continue;
+
+            // One alert per charger+errorCode per run; shouldSendAlert adds the
+            // 1h debounce so a flapping charger doesn't spam.
+            const errKey = parsed.error || ev.event_type || 'fault';
+            const dedupeKey = `${ev.charger_id}::${errKey}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+
+            if (!this.shouldSendAlert('charger_fault', dedupeKey)) continue;
+
+            // Evidence shaped like the correlation alert so formatAlertMessage's
+            // OCPP-details block renders (it parses ocpp.event.message). No
+            // `vercel` key → no "Backend afetado" section.
+            const evidence = {
+                kind: 'charger_fault',
+                ocpp: {
+                    event: {
+                        id: ev.id,
+                        timestamp: ev.timestamp,
+                        charger_id: ev.charger_id,
+                        event_type: ev.event_type,
+                        message: ev.message,
+                    },
+                    meta: null,
+                    raw: null,
+                },
+            };
+
+            const detailBits = [
+                parsed.status ? `status=${parsed.status}` : null,
+                parsed.error ? `erro=${parsed.error}` : null,
+                parsed.info ? `info=${parsed.info}` : null,
+            ].filter(Boolean).join(', ');
+
+            alerts.push({
+                type: 'charger_fault',
+                severity: 'warning',
+                title: `Carregador em falha`,
+                description: `Carregador reportou falha${detailBits ? ` (${detailBits})` : ` (${ev.event_type})`}`,
+                charger_id: ev.charger_id,
+                event_type: ev.event_type,
+                ocpp_log_ids: JSON.stringify([ev.id]),
+                evidence_json: JSON.stringify(evidence),
+                event_ts: ev.timestamp,
+                timestamp: Date.now(),
+            });
         }
 
         return alerts;
@@ -605,6 +774,8 @@ class AlertEngine {
                 msg += `🆔 ${alert.charger_id}\\n\\n`;
             } else {
                 msg += `🔌 *Carregador: ${alert.charger_id}*\\n\\n`;
+                // Surface unknown chargers so we can backfill station-lookup.
+                console.warn(`⚠️ Charger sem cadastro no station-lookup: ${alert.charger_id}`);
             }
         }
 
@@ -616,12 +787,15 @@ class AlertEngine {
             try {
                 const ev = JSON.parse(alert.evidence_json);
                 const ocppMeta = ev && ev.ocpp && ev.ocpp.meta ? ev.ocpp.meta : null;
+                // Collector stores fault detail as free-text `message` (meta=null),
+                // so fall back to parsing the StatusNotification line.
+                const parsedMsg = parseStatusNotif(ev && ev.ocpp && ev.ocpp.event ? ev.ocpp.event.message : '');
 
-                const connectorId = ocppMeta?.connectorId ?? ocppMeta?.connector_id;
-                const status = ocppMeta?.status;
-                const errorCode = ocppMeta?.errorCode ?? ocppMeta?.error_code;
-                const info = ocppMeta?.info;
-                const vendorErrorCode = ocppMeta?.vendorErrorCode ?? ocppMeta?.vendor_error_code;
+                const connectorId = ocppMeta?.connectorId ?? ocppMeta?.connector_id ?? parsedMsg.connectorId;
+                const status = ocppMeta?.status ?? parsedMsg.status;
+                const errorCode = ocppMeta?.errorCode ?? ocppMeta?.error_code ?? parsedMsg.error;
+                const info = ocppMeta?.info ?? parsedMsg.info;
+                const vendorErrorCode = ocppMeta?.vendorErrorCode ?? ocppMeta?.vendor_error_code ?? parsedMsg.vendorError;
 
                 const hasAny = connectorId != null || status || errorCode || info || vendorErrorCode;
                 if (hasAny) {
@@ -631,6 +805,31 @@ class AlertEngine {
                     if (errorCode) msg += `- errorCode: ${errorCode}\\n`;
                     if (vendorErrorCode) msg += `- vendorErrorCode: ${vendorErrorCode}\\n`;
                     if (info) msg += `- info: ${String(info).slice(0, 160)}\\n`;
+                }
+                // For correlation alerts, surface WHICH backend endpoints failed.
+                // The evidence carries the full Vercel rows but they were never rendered.
+                const vercelRows = ev && Array.isArray(ev.vercel) ? ev.vercel : [];
+                if (vercelRows.length > 0) {
+                    // Group by "METHOD endpoint → status" so repeats collapse into a count.
+                    const groups = new Map();
+                    for (const v of vercelRows) {
+                        if (!v) continue;
+                        const method = v.method ? `${String(v.method).toUpperCase()} ` : '';
+                        const endpoint = v.endpoint || '(endpoint desconhecido)';
+                        const status = v.status_code != null ? ` → ${v.status_code}` : '';
+                        const key = `${method}${endpoint}${status}`;
+                        const g = groups.get(key) || { key, count: 0, maxDur: 0 };
+                        g.count += 1;
+                        if (typeof v.duration_ms === 'number') g.maxDur = Math.max(g.maxDur, v.duration_ms);
+                        groups.set(key, g);
+                    }
+
+                    msg += `\\n🌐 *Backend afetado*\\n`;
+                    for (const g of groups.values()) {
+                        const times = g.count > 1 ? ` (${g.count}x)` : '';
+                        const slow = g.maxDur >= 1000 ? ` ⏱️${Math.round(g.maxDur)}ms` : '';
+                        msg += `- ${g.key}${times}${slow}\\n`;
+                    }
                 }
             } catch (_) {
                 // ignore parse errors
@@ -671,6 +870,9 @@ class AlertEngine {
             case 'ocpp_vercel_correlation':
                 msg += `\\n⚡ Ação: Problema no backend afetou carregador - prioridade!`;
                 break;
+            case 'charger_fault':
+                msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
+                break;
         }
 
         return msg;
@@ -697,6 +899,50 @@ class AlertEngine {
                 resolve(true);
             });
         });
+    }
+
+    /**
+     * Send alert to the WhatsApp alerts group ("Notificações Turbo Station").
+     * Uses the same `openclaw message send` transport as alert-processor.
+     */
+    async sendWhatsappAlert(message) {
+        if (!WHATSAPP_CONV || !SUPPORT_API_SECRET) return false;
+        // formatAlertMessage emits literal "\n" (for the Telegram CLI); convert to
+        // real newlines for the JSON/Evolution path.
+        const text = message.replace(/\\n/g, '\n');
+        try {
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(WHATSAPP_CONV)}/messages?brandId=${encodeURIComponent(WHATSAPP_BRAND)}`;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-secret': SUPPORT_API_SECRET,
+                    'x-brand-id': WHATSAPP_BRAND,
+                },
+                body: JSON.stringify({ body: text, source: 'system' }),
+            });
+            if (!res.ok) {
+                console.error(`❌ Error sending WhatsApp: support API ${res.status}`);
+                return false;
+            }
+            console.log('✅ Alert sent to WhatsApp');
+            return true;
+        } catch (e) {
+            console.error(`❌ Error sending WhatsApp: ${e && e.message}`);
+            return false;
+        }
+    }
+
+    /**
+     * Dispatch an alert message to every configured channel. Returns true if at
+     * least one channel accepted it (so the alert is marked sent).
+     */
+    async dispatchAlert(message) {
+        const results = await Promise.allSettled([
+            this.sendTelegramAlert(message),
+            this.sendWhatsappAlert(message),
+        ]);
+        return results.some((r) => r.status === 'fulfilled' && r.value === true);
     }
 
     /**
@@ -821,6 +1067,7 @@ class AlertEngine {
             ...runDetector('detectVercel5xxErrors', () => this.detectVercel5xxErrors()),
             ...runDetector('detectVercelTimeouts', () => this.detectVercelTimeouts()),
             ...runDetector('detectHighLatency', () => this.detectHighLatency()),
+            ...runDetector('detectChargerFaults', () => this.detectChargerFaults()),
             ...runDetector('detectOcppVercelCorrelation', () => this.detectOcppVercelCorrelation())
         ];
 
@@ -849,9 +1096,9 @@ class AlertEngine {
                     continue;
                 }
 
-                // Format and send via Telegram
+                // Format and send to every configured channel (Telegram + WhatsApp)
                 const message = this.formatAlertMessage(alert);
-                const sent = await this.sendTelegramAlert(message);
+                const sent = await this.dispatchAlert(message);
 
                 // Mark as sent only if actually sent
                 if (sent) {
@@ -935,3 +1182,9 @@ if (require.main === module) {
 }
 
 module.exports = AlertEngine;
+// Pure helpers exported for unit tests (causal-correlation gate + fault parsing).
+module.exports.isCausalBackendError = isCausalBackendError;
+module.exports.endpointReferencesCharger = endpointReferencesCharger;
+module.exports.CHARGE_ACTION_ROUTE = CHARGE_ACTION_ROUTE;
+module.exports.parseStatusNotif = parseStatusNotif;
+module.exports.isEmergencyStopFault = isEmergencyStopFault;
