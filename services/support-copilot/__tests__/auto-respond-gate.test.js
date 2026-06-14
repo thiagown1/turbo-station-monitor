@@ -308,6 +308,30 @@ test('flag_off takes precedence over an escalation-worthy message', () => {
   assert.equal(r.reason, 'flag_off');
 });
 
+console.log('-- regression: phrases caught by bot-eval harness');
+
+const REGRESSIONS = [
+  ['duas cobranças no cartão', 'apareceu duas cobranças no meu cartão pelo mesmo valor', 'financeiro'],
+  ['me cobraram a mais', 'fui cobrado como se tivesse carregado 25, me cobraram a mais', 'financeiro'],
+  ['dinheiro de volta', 'quero meu dinheiro de volta, cobraram sem eu carregar', 'financeiro'],
+  ['falar com o responsável (artigo o)', 'prefiro falar com o responsável por isso direto', 'pedido_humano'],
+  ['falar com o gerente', 'ja é a terceira vez, quero falar com o gerente de vcs', 'pedido_humano'],
+  ['atendimento humano', 'atendimento humano pfv', 'pedido_humano'],
+];
+for (const [label, text, type] of REGRESSIONS) {
+  test(`regression escalates: ${label}`, () => {
+    const r = evaluateAutoRespond(ok({ lastInboundText: text }));
+    assert.equal(r.allow, false, `expected block for "${text}"`);
+    assert.equal(r.reason, `escalate:${type}`);
+  });
+}
+
+// Guard against false positives: a normal price question must still auto-respond
+test('regression: "quanto vocês cobram por kWh" is NOT financeiro', () => {
+  const r = evaluateAutoRespond(ok({ lastInboundText: 'quanto vocês cobram por kWh?' }));
+  assert.equal(r.allow, true);
+});
+
 // Summary
 console.log(`\n${'─'.repeat(50)}`);
 console.log(`Results: ${passed} passed, ${failed} failed, ${passed + failed} total`);

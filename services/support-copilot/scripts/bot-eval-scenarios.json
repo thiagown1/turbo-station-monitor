@@ -1,0 +1,932 @@
+[
+ {
+  "id": "charging_technical-estacao-offline-simples",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi boa tarde, to aqui no carregador mas ele aparece offline no app, nao consigo iniciar"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Boa tarde! Poxa, que chato. Me passa o número da estação, por gentileza? Vou verificar o status dela aqui pra você 😊"
+ },
+ {
+  "id": "charging_technical-conector-nao-conecta-multiturn",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "encaixei o conector no carro mas nao começa a carregar de jeito nenhum"
+   },
+   {
+    "from": "operator",
+    "text": "Entendi! Pode me passar o número da estação e qual conector você está usando, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "é a estaçao SN00000012, conector 2, o CCS"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Obrigado! Tenta desencaixar o conector, esperar uns 10 segundos e encaixar de novo firme até travar. Se não pegar, me avisa que eu inicio a recarga remotamente daqui pra você 😉"
+ },
+ {
+  "id": "charging_technical-recarga-lenta",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "ta carregando mas muito devagar, ta marcando so 7kw sendo q é carregador rapido"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Entendo! Às vezes a potência cai quando a bateria passa de 80% ou por limite do próprio carro. Me passa o número da estação, por gentileza, que eu confiro quanto estamos entregando agora."
+ },
+ {
+  "id": "charging_technical-recarga-parou-sozinha",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "a recarga parou sozinha do nada, tava em 40% e estancou"
+   },
+   {
+    "from": "operator",
+    "text": "Poxa, vamos resolver! Me informa o número da estação, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "SN00000007"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Obrigado, já localizei aqui. Pode deixar o conector encaixado que eu reinicio a recarga remotamente pra você agora. Em alguns segundos deve voltar a carregar 😊"
+ },
+ {
+  "id": "charging_technical-erro-falha-comunicacao",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "apareceu uma mensagem de erro na tela do carregador, ta escrito \"Falha de comunicação\" oq faço?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Esse erro costuma ser temporário. Me envia o número da estação e, se der, uma foto da tela, por gentileza? Vou verificar a conexão dela aqui do nosso lado."
+ },
+ {
+  "id": "charging_technical-botao-emergencia-acionado",
+  "category": "charging_technical",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "acho q alguem apertou o botao vermelho de emergencia do carregador, agora nada funciona"
+   },
+   {
+    "from": "operator",
+    "text": "Obrigado por avisar! O botão de emergência trava a estação por segurança. Me passa o número dela, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "ta na estaçao SN00000003"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Perfeito! Pra liberar é só girar o botão vermelho no sentido da seta até ele soltar, aí a estação reinicia sozinha em alguns segundos. Me avisa quando voltar que eu inicio a recarga pra você 😉"
+ },
+ {
+  "id": "pricing_info-preco-kwh-simples",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi boa tarde, quanto ta o kwh pra carregar ai?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Boa tarde! O valor varia por estação. Me diz em qual estação você está (ou a cidade) que eu confirmo a tarifa certinha pra você 😊"
+ },
+ {
+  "id": "pricing_info-horario-funcionamento",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "vcs funcionam 24h? queria carregar de madrugada"
+   },
+   {
+    "from": "operator",
+    "text": "Oi! A maioria das nossas estações funciona 24h, sim. Me confirma qual estação você pretende usar?"
+   },
+   {
+    "from": "customer",
+    "text": "a do shopping ali do centro"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Essa fica dentro do estacionamento do shopping, então o acesso segue o horário dele. Quando o estacionamento está aberto, os carregadores ficam disponíveis. Ajudo em algo mais? 😊"
+ },
+ {
+  "id": "pricing_info-valor-cupom",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "recebi um cupom de desconto por email mas nao sei quanto eh, vc consegue ver?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Claro! Pode me enviar o código do cupom, por gentileza? Assim eu confirmo o valor e a validade certinho pra você 😊"
+ },
+ {
+  "id": "pricing_info-velocidade-carga",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "essa estaçao carrega rapido? meu carro é um byd dolphin"
+   },
+   {
+    "from": "operator",
+    "text": "Oi! Me confirma qual estação você vai usar que eu te passo a potência dela."
+   },
+   {
+    "from": "customer",
+    "text": "to na estaçao do posto da rodovia"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Essa é um carregador rápido DC de até 60 kW, então no seu Dolphin o carregamento é bem ágil. A velocidade final varia conforme a bateria e a curva de carga do carro. Ajudo em algo mais? 😄"
+ },
+ {
+  "id": "pricing_info-localizacao-estacao",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "tem carregador de vcs aqui em campinas?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Temos sim! No app da Turbo Station você vê todas as estações no mapa com endereço, é só permitir a localização que ele mostra as mais próximas. Quer que eu te mande o link pra baixar? 😊"
+ },
+ {
+  "id": "pricing_info-preco-vs-tempo-multiturn",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "boa noite, a cobrança é por kwh ou por tempo?"
+   },
+   {
+    "from": "operator",
+    "text": "Boa noite! Na maioria das nossas estações a cobrança é por kWh consumido, ou seja, você paga pela energia que entrou no carro. Me confirma qual estação pra eu validar?"
+   },
+   {
+    "from": "customer",
+    "text": "a estaçao SN00000005"
+   },
+   {
+    "from": "operator",
+    "text": "Essa cobra R$1,90 por kWh, sem taxa por tempo. Posso ajudar em algo mais?"
+   },
+   {
+    "from": "customer",
+    "text": "e se eu deixar o carro plugado depois de carregar, paga algo extra?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Nessa estação não há cobrança por tempo, então ficar plugado depois de carregar não gera custo extra. Mas se puder liberar o ponto pros outros usuários, agradecemos! Ajudo em algo mais? 😊"
+ },
+ {
+  "id": "registration-uber-cupom-pedido",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi boa tarde, sou motorista de uber e queria saber do cupom de desconto pra recarregar, como faz?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Boa tarde! Temos sim cupom pra motorista de app 😄 Pra liberar pra você, me envia seu CPF e um print do seu perfil de motorista (Uber/99), por gentileza?"
+ },
+ {
+  "id": "registration-print-perfil-enviado",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "queria o cupom de motorista de aplicativo"
+   },
+   {
+    "from": "operator",
+    "text": "Claro! Me envia seu CPF e um print do seu perfil de motorista de app, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "ja mando o print aqui, meu cpf é 123.456.789-00"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Perfeito, recebi o CPF! Pode mandar o print do perfil quando puder que já libero seu cupom de motorista 😄"
+ },
+ {
+  "id": "registration-como-fazer-cadastro",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "como eu faço pra me cadastrar no app de vcs? acabei de comprar um carro eletrico"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Que ótimo, parabéns pelo carro! É bem rápido: baixa o app Turbo Station na loja, abre e cadastra com seu telefone ou e-mail. Qualquer dúvida no caminho é só me chamar 😄"
+ },
+ {
+  "id": "registration-cupom-99-em-vez-de-uber",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "vi q tem desconto pra uber, mas eu rodo na 99 e na indrive, tbm vale?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Vale sim! Serve pra qualquer app (Uber, 99, InDrive). Me manda seu CPF e um print do perfil de motorista, por gentileza, que eu já aplico o cupom 😄"
+ },
+ {
+  "id": "registration-multiturn-cadastro-erro-codigo",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "to tentando fazer o cadastro mas o app pede um codigo de verificacao e nao chega"
+   },
+   {
+    "from": "operator",
+    "text": "Vamos resolver! O código costuma chegar por SMS em até 1 minuto. Confirma o número que você cadastrou, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "é o 11 98888-7777, ja tentei reenviar umas 3 vezes e nada"
+   },
+   {
+    "from": "operator",
+    "text": "Obrigado! Tenta também conferir a caixa de spam do SMS e se o sinal está estável. Se preferir, dá pra cadastrar pelo e-mail no lugar do telefone."
+   },
+   {
+    "from": "customer",
+    "text": "ah vou tentar pelo email entao"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Isso! Escolhe a opção de e-mail na tela de cadastro que o código chega na sua caixa de entrada. Qualquer coisa me avisa que eu acompanho com você 😄"
+ },
+ {
+  "id": "registration-cupom-aplicado-confirmacao",
+  "category": "registration",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi mandei meu cpf e o print do perfil da uber ontem, ja consegui ver se liberou o cupom?"
+   },
+   {
+    "from": "operator",
+    "text": "Deixa eu verificar aqui rapidinho pra você!"
+   },
+   {
+    "from": "customer",
+    "text": "blz obrigado"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Tudo certo! Seu cupom de motorista de app já está liberado na sua conta, é só usar na próxima recarga. Ajudo em algo mais? 😄"
+ },
+ {
+  "id": "refund_financial-cobranca-duplicada",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "boa tarde, fiz uma recarga ontem mas vi q apareceu duas cobranças no meu cartão pelo mesmo valor"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Boa tarde! Sinto muito por isso. Vou verificar essa cobrança duplicada com o financeiro e já te retorno. Pode me confirmar o CPF do cadastro, por gentileza?"
+ },
+ {
+  "id": "refund_financial-estorno-pix-nao-creditado",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi, paguei um pix de R$50 pra adicionar crédito mas não caiu na minha conta do app"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Pode me enviar o comprovante do Pix, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "mandei aqui o comprovante. já se passaram quase 2 horas e nada, quero o estorno desse valor"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Obrigado pelo comprovante! Vou encaminhar pro financeiro analisar o estorno desse Pix e te retorno o quanto antes."
+ },
+ {
+  "id": "refund_financial-cobrado-a-mais",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "carreguei só 10kWh mas fui cobrado como se tivesse carregado 25, tá errado isso, me cobraram a mais"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Boa tarde! Sinto muito pelo transtorno. Vou levantar o detalhamento dessa sessão com o financeiro pra conferir o valor cobrado. Pode me passar o CPF do cadastro, por gentileza?"
+ },
+ {
+  "id": "refund_financial-cobranca-nao-reconhecida",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "apareceu uma cobrança da turbo station de R$87 na minha fatura e eu nem usei nenhum carregador esse mês, não reconheço esse valor"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Boa tarde! Entendo a preocupação. Vou verificar com o financeiro a origem dessa cobrança e já te retorno. Pode me confirmar o CPF do cadastro, por gentileza?"
+ },
+ {
+  "id": "refund_financial-suspeita-fraude",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "gente acho q clonaram meu cartão, vieram 3 cobranças de vcs q eu não fiz, isso é golpe??"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Boa tarde! Fica tranquilo, vou priorizar isso. Já aciono o financeiro pra investigar essas cobranças e a suspeita de fraude. Pode me passar o CPF do cadastro, por gentileza?"
+ },
+ {
+  "id": "refund_financial-reembolso-creditos-saldo",
+  "category": "refund_financial",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi tudo bem"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Tudo ótimo e com você? Como posso ajudar?"
+   },
+   {
+    "from": "customer",
+    "text": "eu coloquei R$100 de crédito mas não vou mais usar o app, queria o reembolso desse saldo que sobrou de volta no cartão"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Entendo! Esse reembolso de saldo precisa passar pelo financeiro. Vou encaminhar sua solicitação e te dou um retorno. Pode me confirmar o CPF do cadastro, por gentileza?"
+ },
+ {
+  "id": "human_request-falar-com-atendente-direto",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "quero falar com um atendente de verdade por favor"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Boa tarde! Claro, já vou te transferir para um atendente da equipe. Só um instante, por gentileza 😊"
+ },
+ {
+  "id": "human_request-me-liga-telefone",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "da pra vcs me ligarem? prefiro resolver por telefone"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Boa tarde! Sem problema. Vou passar para um atendente da equipe te ligar. Pode me confirmar o melhor número e horário, por gentileza?"
+ },
+ {
+  "id": "human_request-falar-com-responsavel-multiturn",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi, o carregador da estação do shopping não tá iniciando a recarga"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Vou verificar aqui pra você. Consegue me informar o número da estação ou o conector que está tentando usar?"
+   },
+   {
+    "from": "customer",
+    "text": "olha já tentei de tudo, prefiro falar com o responsável por isso direto"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Entendo! Já estou te encaminhando para um responsável da equipe pra resolver isso com você. Só um instante, por favor 🙏"
+ },
+ {
+  "id": "human_request-quero-pessoa-nao-robo",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "isso aqui é robô? quero falar com uma pessoa de verdade"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Boa tarde! Pode deixar, já vou te conectar com um atendente da equipe. Um momentinho, por gentileza 😊"
+ },
+ {
+  "id": "human_request-gerente-reclamacao-multiturn",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "minha recarga parou na metade ontem"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Sinto muito pelo transtorno. Vou checar o que aconteceu na sua última sessão. Pode me enviar seu CPF, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "ja é a terceira vez que acontece, quero falar com o gerente de vcs"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Sinto muito que isso esteja se repetindo. Vou encaminhar seu atendimento direto para um responsável da equipe agora. Só um instante, por favor 🙏"
+ },
+ {
+  "id": "human_request-atendimento-humano-curto",
+  "category": "human_request",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "atendimento humano pfv"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "pedido_humano",
+  "goldenReply": "Oi! Já estou te passando para um atendente da equipe. Um instante, por gentileza 😊"
+ },
+ {
+  "id": "anger-charger-broke-mid-trip",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "que absurdo!!! parei aqui no carregador de voces achando q ia carregar e ta tudo apagado, nao liga nada. to com pressa e agora?? péssimo isso"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Boa tarde! Sinto muito pelo transtorno, imagino a pressa. Já estou acionando nossa equipe pra te ajudar com prioridade. Pode me confirmar o nome ou número da estação onde você está, por gentileza?"
+ },
+ {
+  "id": "anger-charged-and-no-charge",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "to tentando iniciar a recarga faz meia hora"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Vou te ajudar com isso. Pode me dizer qual estação e conector você está usando?"
+   },
+   {
+    "from": "customer",
+    "text": "ja tentei de tudo e nada funciona, isso é uma palhaçada viu, descaso total com quem paga. nunca mais uso esse app"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Peço muitas desculpas pelo transtorno, você tem razão em ficar chateado. Já estou escalando seu atendimento como prioridade pra um responsável resolver com você agora. Só me confirma a estação e o conector, por gentileza?"
+ },
+ {
+  "id": "anger-app-bug-rage",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "esse app de voces é horrivel, trava o tempo todo, nao consigo nem logar. vergonha de empresa"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Sinto muito pela experiência ruim com o app, peço desculpas. Já vou acionar nossa equipe técnica pra olhar seu caso com prioridade. Pode me informar qual celular você usa (Android ou iPhone) e em que tela trava, por gentileza?"
+ },
+ {
+  "id": "anger-waited-too-long-support",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "boa tarde, mandei mensagem ontem e ninguem respondeu"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Peço desculpas pela demora. Como posso te ajudar?"
+   },
+   {
+    "from": "customer",
+    "text": "ridiculo esperar mais de 24h pra ter resposta, que descaso com o cliente. ja era pra ter resolvido isso"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Você tem razão, peço sinceras desculpas pela demora. Já estou priorizando seu caso e chamando um responsável pra resolver agora. Me conta rapidinho o que aconteceu pra eu adiantar pra equipe, por gentileza?"
+ },
+ {
+  "id": "anger-curse-stuck-cable",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "que merda é essa, o cabo travou no carro e nao solta de jeito nenhum!! to preso aqui ha 20min, resolve isso AGORA"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Que situação chata, peço desculpas pelo susto. Já estou acionando nossa equipe com prioridade máxima pra liberar o cabo o quanto antes. Pode me passar o nome da estação e o número do conector onde você está, por gentileza?"
+ },
+ {
+  "id": "anger-rude-staff-onsite",
+  "category": "anger",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "fui no posto de voces e o atendente me tratou super mal, foi um descaso total. um absurdo a forma como falaram comigo"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "furioso",
+  "goldenReply": "Sinto muito por isso, não é assim que queremos te tratar e peço sinceras desculpas. Já vou escalar seu relato pra um responsável apurar com prioridade. Pode me dizer em qual estação foi e quando aconteceu, por gentileza?"
+ },
+ {
+  "id": "legal_lgpd-procon-cobranca-duplicada",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "ja tentei resolver isso com voces 3 vezes e nada. vou abrir uma reclamacao no procon contra a turbo station"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Boa tarde! Sinto muito por todo esse transtorno. Já vou encaminhar seu caso para um responsável da nossa equipe, que te retorna por aqui o quanto antes pra resolver isso. Pode me confirmar seu CPF, por gentileza?"
+ },
+ {
+  "id": "legal_lgpd-lgpd-exclusao-dados",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "Boa tarde, com base na LGPD eu quero solicitar a exclusao de todos os meus dados pessoais da plataforma de voces. Como faco isso?"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Boa tarde! Claro, vou direcionar sua solicitação de exclusão de dados (LGPD) para a equipe responsável, que cuida desse processo e vai te orientar com todos os passos. Eles te retornam por aqui em breve, tudo bem?"
+ },
+ {
+  "id": "legal_lgpd-advogado-acao-judicial",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "vc me ajuda com um problema no carregador da praça?"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Claro, me conta o que aconteceu que eu te ajudo."
+   },
+   {
+    "from": "customer",
+    "text": "olha já conversei com meu advogado e se nao resolverem isso hoje eu vou entrar com uma ação judicial contra voces"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Entendo a sua preocupação e peço desculpas pelo transtorno. Esse caso eu já vou encaminhar para um responsável da nossa equipe, que te dá o retorno o quanto antes por aqui. Pode aguardar que eles entram em contato, por gentileza?"
+ },
+ {
+  "id": "legal_lgpd-acesso-dados-quais-tem",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi quero saber quais dados pessoais meus voces armazenam e pra quem voces compartilham. tenho direito a isso pela lei"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Boa tarde! Você tem total direito a essas informações. Vou encaminhar seu pedido de acesso aos dados para a equipe responsável pela LGPD, que te envia tudo certinho por aqui. Eles te retornam em breve, combinado?"
+ },
+ {
+  "id": "legal_lgpd-direito-esquecimento-vazamento",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "recebi um monte de spam depois q me cadastrei no app de vcs, acho q vazaram meu numero"
+   },
+   {
+    "from": "operator",
+    "text": "Poxa, sinto muito por isso. Pode me dar mais detalhes do que está acontecendo?"
+   },
+   {
+    "from": "customer",
+    "text": "quero exercer meu direito ao esquecimento e que apaguem meu telefone e email de uma vez. isso é falha de proteção de dados"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Lamento muito pelo ocorrido. Esse tema de proteção de dados e direito ao esquecimento eu vou encaminhar agora para a equipe responsável, que trata seu pedido com prioridade e te retorna por aqui. Obrigado pela paciência!"
+ },
+ {
+  "id": "legal_lgpd-notificacao-extrajudicial",
+  "category": "legal_lgpd",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "meu advogado ja preparou uma notificação extrajudicial pra enviar pra empresa de vcs, pra qual endereço eu mando?"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "juridico",
+  "goldenReply": "Entendi. Para esse assunto vou te direcionar a um responsável da nossa equipe, que é quem cuida dessas tratativas e vai te passar as informações corretas por aqui. Ele te retorna em breve, por gentileza aguarde."
+ },
+ {
+  "id": "ambiguous-so-oi",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Boa tarde! Como posso te ajudar hoje? 😊"
+ },
+ {
+  "id": "ambiguous-so-emoji",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "👍🔌"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Oi! Me conta o que você precisa que eu te ajudo 😄"
+ },
+ {
+  "id": "ambiguous-interrogacao",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "operator",
+    "text": "Boa tarde! Como posso te ajudar?"
+   },
+   {
+    "from": "customer",
+    "text": "?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Você está com alguma dúvida sobre a recarga ou precisa de ajuda com a estação? É só me contar que eu te ajudo 😊"
+ },
+ {
+  "id": "ambiguous-audio-sem-contexto",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "[áudio]"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Oi! Não consegui ouvir o seu áudio direito por aqui. Pode me escrever rapidinho o que você precisa, por gentileza?"
+ },
+ {
+  "id": "ambiguous-texto-confuso",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "entao é q to aq no carro mas nao sei se"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Oi! Parece que a mensagem cortou aqui 😅 Me conta o que está acontecendo aí na estação que eu te ajudo."
+ },
+ {
+  "id": "ambiguous-multiturn-vago",
+  "category": "ambiguous",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "boa tarde"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Como posso te ajudar?"
+   },
+   {
+    "from": "customer",
+    "text": "é sobre o carregador"
+   },
+   {
+    "from": "operator",
+    "text": "Claro! Pode me dizer o que aconteceu com o carregador, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "isso"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Pra eu te ajudar certinho, me diz: você não está conseguindo iniciar a recarga ou apareceu algum erro? E qual estação você está usando?"
+ },
+ {
+  "id": "multiturn-cpf-localizar-conta-cobranca",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "oi minha recarga nao iniciou e ja descontou do meu saldo"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Que chato isso, vou verificar. Pode me enviar seu CPF, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "claro 045.812.337-90 quero meu dinheiro de volta, cobraram sem eu carregar"
+   }
+  ],
+  "expectGateAllow": false,
+  "expectEscalationType": "financeiro",
+  "goldenReply": "Obrigado pelos dados! Já localizei sua conta e vou acionar a equipe pra revisar essa cobrança e o estorno. Te retorno por aqui assim que tiver a posição, tá? 😊"
+ },
+ {
+  "id": "multiturn-qual-estacao-resposta",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "o carregador nao ta ligando"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Pra eu verificar, em qual estação você está, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "to na metropole shopping 2"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Perfeito, já estou olhando a Metrópole Shopping 2 aqui. Me diz o número do ponto que você está tentando usar, por gentileza?"
+ },
+ {
+  "id": "multiturn-iniciar-recarga-remota",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "boa tarde, plugue ja ta conectado no carro mas nao começa"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Sem problema, posso iniciar a recarga remotamente pra você. Em qual estação e qual ponto está conectado, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "posto parana formosa, ponto 1"
+   },
+   {
+    "from": "operator",
+    "text": "Show! Confirma só pra mim: o cabo já está bem encaixado no carro e na estação?"
+   },
+   {
+    "from": "customer",
+    "text": "sim ta tudo encaixado certinho"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Perfeito! Vou disparar o início da recarga agora pelo ponto 1. Me avisa em uns segundos se começou aí no display 😊"
+ },
+ {
+  "id": "multiturn-placa-consumo-ultima-recarga",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "queria saber quantos kwh entraram na minha ultima recarga"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! Claro, vou puxar aqui. Me confirma a placa do veículo, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "FQH4J28"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Obrigado! Achei o veículo aqui. Já te trago o consumo e a duração da última recarga, só um instante 😊"
+ },
+ {
+  "id": "multiturn-cupom-aplicar-confirmacao",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "fiquei 20 min parado pq o app nao deixava iniciar, perdi tempo"
+   },
+   {
+    "from": "operator",
+    "text": "Poxa, sinto muito pelo transtorno! Pelo ocorrido posso te enviar um cupom de desconto pra próxima recarga. Pode ser?"
+   },
+   {
+    "from": "customer",
+    "text": "pode sim, agradeço"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Perfeito! Gerei o cupom *TURBO20* com 20% de desconto, válido até *30/06*. É só aplicar na tela de pagamento do app. Ajudo em algo mais?"
+ },
+ {
+  "id": "multiturn-preco-estacao-especifica",
+  "category": "multiturn",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "qual o valor do kwh de vcs?"
+   },
+   {
+    "from": "operator",
+    "text": "Boa tarde! O preço varia por estação. Em qual você pretende carregar, por gentileza?"
+   },
+   {
+    "from": "customer",
+    "text": "na decathlon de goiania"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "Na Decathlon (Goiânia) o valor é *R$ 2,29/kWh*. O preço atualizado também aparece sempre na tela da estação no app antes de iniciar. Ajudo em algo mais?"
+ }
+]

@@ -32,11 +32,11 @@
 // Any hit means a human must handle it — the bot never auto-sends.
 const ESCALATION_PATTERNS = [
   // Money / refunds / disputes
-  { type: 'financeiro', re: /\b(reembols\w*|estorn\w*|cobran[çc]a indevida|cobrad\w* a mais|chargeback|estelionato|golpe|fraude|n[ãa]o reconhe[çc]o|valor errad\w*|duplicad\w*)\b/i },
+  { type: 'financeiro', re: /\b(reembols\w*|estorn\w*|cobran[çc]a indevida|cobran[çc]a duplicada|duas cobran\w*|cobr\w* a mais|cobr\w* sem|dinheiro de volta|chargeback|estelionato|golpe|fraude|n[ãa]o reconhe[çc]o|valor errad\w*|duplicad\w*)\b/i },
   // Legal / regulators
   { type: 'juridico', re: /\b(procon|advogad\w*|processar|processo judicial|a[çc][ãa]o judicial|justi[çc]a|c[óo]digo de defesa|lgpd|dados pessoais|direito ao esquecimento)\b/i },
   // Explicit request for a human / phone call
-  { type: 'pedido_humano', re: /\b(falar com (um |uma )?(atendente|humano|pessoa|respons[áa]vel|gerente|supervisor)|atendente humano|pessoa de verdade|algu[ée]m de verdade|me liga\w*|ligar para mim|liga[çc][ãa]o|telefone para contato)\b/i },
+  { type: 'pedido_humano', re: /\b(falar com (o |a |um |uma |meu |minha |algu[ée]m )?(atendente|humano|pessoa|respons[áa]vel|gerente|supervisor)|atend\w* humano|pessoa de verdade|algu[ée]m de verdade|gente de verdade|me liga\w*|liga(r|m) para mim|liga[çc][ãa]o|telefone para contato)\b/i },
   // Anger / strong dissatisfaction / profanity
   { type: 'furioso', re: /\b(absurd\w*|rid[íi]cul\w*|p[ée]ssim\w*|horr[íi]vel|vergonha|inadmiss[íi]vel|palha[çc]ada|descaso|merda|porra|caralh\w*|vsf|vtnc|fdp)\b/i },
 ];
