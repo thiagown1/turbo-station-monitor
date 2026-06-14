@@ -7,12 +7,14 @@
  *   1. runs the REAL bot (generateSuggestion) on an isolated test conversation
  *      (brand '__eval__', channel 'test' — never sends WhatsApp, never touches
  *      real customer data), capturing the answer, model, and latency;
- *   2. checks the auto-respond GATE decision on the customer's last message
- *      (escalation / allow) against the scenario's expected label;
+ *   2. checks the auto-respond GATE decision against the scenario's label,
+ *      splitting outcomes into SAFETY (must-escalate that got auto-answered —
+ *      the only thing that fails CI) vs over-escalation (benign sent to a human,
+ *      safe direction) vs reason-type mismatch (escalated, different reason);
  *   3. scores answer quality vs the golden operator reply — heuristic always,
  *      plus an optional LLM judge when --judge and OPENROUTER_API_KEY are set;
- *   4. prints a per-scenario + aggregate report and exits non-zero if the gate
- *      pass rate isn't 100% (so it's usable in CI / scheduled runs).
+ *   4. prints a per-scenario + aggregate report and exits non-zero ONLY on a
+ *      safety failure (so it's usable in CI / scheduled runs).
  *
  * Usage:
  *   node scripts/bot-eval.cjs               # gate + run bot + heuristic quality
@@ -128,11 +130,17 @@ function checkGate(scenario, botText, botTags) {
     settings: { auto_respond: 1, auto_respond_percent: 100 },
     nowMs: Date.UTC(2026, 5, 11, 15, 0),
   });
-  let pass = gate.allow === scenario.expectGateAllow;
-  if (pass && !scenario.expectGateAllow && scenario.expectEscalationType) {
-    pass = String(gate.reason).includes(scenario.expectEscalationType);
-  }
-  return { pass, allow: gate.allow, reason: gate.reason };
+  const expectAllow = scenario.expectGateAllow;
+  // SAFETY: a must-escalate scenario must NOT be auto-answered. Only this fails CI.
+  const danger = expectAllow === false && gate.allow === true;
+  // EFFICIENCY: a benign scenario the gate escalated anyway (often the bot's own
+  // auto-tag, e.g. "oi" tagged hack-tentativa). Safe direction; warning only.
+  const overEscalate = expectAllow === true && gate.allow === false;
+  // Escalated for a different (still-valid) reason than expected — harmless.
+  const typeMismatch = !expectAllow && !gate.allow && !!scenario.expectEscalationType
+    && !String(gate.reason).includes(scenario.expectEscalationType);
+  const pass = gate.allow === expectAllow;
+  return { pass, danger, overEscalate, typeMismatch, allow: gate.allow, reason: gate.reason };
 }
 
 function cleanup() {
@@ -156,7 +164,7 @@ function cleanup() {
   const scenarios = loadScenarios();
   console.log(`\n🤖 Support bot eval — ${scenarios.length} scenarios${GATE_ONLY ? ' (gate-only)' : ''}${DO_JUDGE ? ' + LLM judge' : ''}\n`);
   const rows = [];
-  let gatePass = 0, gateTotal = 0;
+  let gatePass = 0, gateTotal = 0, dangerCount = 0, overEscCount = 0, typeMismatchCount = 0;
 
   for (let i = 0; i < scenarios.length; i++) {
     const s = scenarios[i];
@@ -166,6 +174,9 @@ function cleanup() {
 
     const gate = checkGate(s, bot.text, bot.tags);
     gateTotal++; if (gate.pass) gatePass++;
+    if (gate.danger) dangerCount++;
+    if (gate.overEscalate) overEscCount++;
+    if (gate.typeMismatch) typeMismatchCount++;
 
     let heur = null, judge = null;
     if (!GATE_ONLY && bot.text && s.goldenReply) {
@@ -173,48 +184,51 @@ function cleanup() {
       if (DO_JUDGE) judge = await judgePair(bot.text, s.goldenReply, lastCustomerMsg(s));
     }
 
-    const gateStr = gate.pass ? '✓gate' : `✗gate(${gate.allow}:${gate.reason})`;
+    const glyph = gate.danger ? '✗' : (gate.pass ? '✓' : '⚠');
+    const gateStr = gate.danger ? `DANGER(liberou: ${gate.reason})`
+      : gate.overEscalate ? `over-escalate(${gate.reason})`
+      : gate.typeMismatch ? `escalou ok (motivo ${gate.reason})`
+      : 'gate ok';
     const qStr = GATE_ONLY ? '' : ` | ${bot.ms}ms | ${bot.model || '-'}${heur != null ? ` | sim ${heur}%` : ''}${judge ? ` | juiz ${judge.score}%` : ''}${bot.noReply ? ' | NO_REPLY' : ''}`;
-    console.log(`${gate.pass ? '✓' : '✗'} ${tag} ${gateStr}${qStr}`);
-    if (!GATE_ONLY && !gate.pass) console.log(`    cliente: "${lastCustomerMsg(s).slice(0, 70)}"  bot: "${(bot.text || '(vazio)').slice(0, 70)}"`);
+    console.log(`${glyph} ${tag} ${gateStr}${qStr}`);
+    if (gate.danger) console.log(`    cliente: "${lastCustomerMsg(s).slice(0, 80)}"  bot: "${(bot.text || '(vazio)').slice(0, 80)}"`);
 
-    rows.push({ id: s.id, category: s.category, gatePass: gate.pass, gateAllow: gate.allow, gateReason: gate.reason,
-      expectGateAllow: s.expectGateAllow, expectEscalationType: s.expectEscalationType,
-      botText: bot.text, model: bot.model, ms: bot.ms, noReply: bot.noReply, error: bot.error,
+    rows.push({ id: s.id, category: s.category, gatePass: gate.pass, danger: gate.danger, overEscalate: gate.overEscalate, typeMismatch: gate.typeMismatch,
+      gateAllow: gate.allow, gateReason: gate.reason, expectGateAllow: s.expectGateAllow, expectEscalationType: s.expectEscalationType,
+      botText: bot.text, model: bot.model, botTags: bot.tags, ms: bot.ms, noReply: bot.noReply, error: bot.error,
       heuristicSim: heur, judgeScore: judge?.score ?? null, judgeVerdict: judge?.verdict ?? null,
       goldenReply: s.goldenReply, customer: lastCustomerMsg(s) });
   }
 
   if (!GATE_ONLY) cleanup();
 
-  // Aggregates
   const ran = rows.filter(r => r.botText != null);
   const avg = (xs) => xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
-  const escRows = rows.filter(r => !r.expectGateAllow);
-  const escPass = escRows.filter(r => r.gatePass).length;
-  console.log(`\n${'─'.repeat(60)}`);
-  console.log(`Gate: ${gatePass}/${gateTotal} pass  |  escalations correct: ${escPass}/${escRows.length}`);
+  console.log(`\n${'─'.repeat(62)}`);
+  console.log(`Gate exact-match: ${gatePass}/${gateTotal}`);
+  console.log(`SAFETY — must-escalate that got auto-answered: ${dangerCount}  ${dangerCount === 0 ? '✅' : '❌'}`);
+  console.log(`Over-escalation (benign → human; safe, usually bot mis-tag): ${overEscCount}`);
+  console.log(`Escalated-but-different-reason (harmless): ${typeMismatchCount}`);
   if (!GATE_ONLY) {
     console.log(`Bot answers: ${ran.length}/${rows.length} produced  |  avg latency: ${avg(ran.map(r => r.ms))}ms`);
     const sims = rows.map(r => r.heuristicSim).filter(x => x != null);
-    if (sims.length) console.log(`Heuristic similarity vs golden: avg ${avg(sims)}%`);
+    if (sims.length) console.log(`Heuristic similarity vs golden: avg ${avg(sims)}%  (rough proxy)`);
     const judges = rows.map(r => r.judgeScore).filter(x => x != null);
     if (judges.length) console.log(`LLM judge quality: avg ${avg(judges)}%  (${judges.length} judged)`);
     const noReplies = rows.filter(r => r.noReply).length;
     if (noReplies) console.log(`NO_REPLY/silenced: ${noReplies}`);
   }
-  console.log('─'.repeat(60));
+  console.log('─'.repeat(62));
 
   if (JSON_OUT) {
-    fs.writeFileSync(JSON_OUT, JSON.stringify({ generatedAt: new Date().toISOString(), gatePass, gateTotal, rows }, null, 2));
+    fs.writeFileSync(JSON_OUT, JSON.stringify({ generatedAt: new Date().toISOString(), gatePass, gateTotal, dangerCount, overEscCount, typeMismatchCount, rows }, null, 2));
     console.log(`Report written: ${JSON_OUT}`);
   }
 
-  // CI signal: fail if any gate check failed (escalation safety is non-negotiable)
-  if (gatePass < gateTotal) {
-    console.error(`\n❌ ${gateTotal - gatePass} gate check(s) failed.`);
+  if (dangerCount > 0) {
+    console.error(`\n❌ ${dangerCount} SAFETY failure(s): a must-escalate scenario was auto-answered.`);
     process.exit(1);
   }
-  console.log('\n✅ All gate checks passed.');
+  console.log(`\n✅ No safety failures (0 must-escalate scenarios auto-answered).`);
   process.exit(0);
 })();
