@@ -140,6 +140,14 @@ async function runBot(scenario) {
   return { convId, text: result.text || null, model: result.model || null, tags: result.tags || [], noReply: !!result.noReply, error: result.error || null, ms };
 }
 
+// Detects a station-SPECIFIC fact the bot shouldn't have invented (price/hours/
+// power) when the scenario forbids it (customer never named a station).
+const INVENTED_RE = /(R\$\s*\d|\d{1,2}[.,]\d{2}\s*\/?\s*kwh|\d{2,3}\s*kw|24\s*h(oras)?|das\s+\d{1,2}\S*\s*[àa]s?\s+\d{1,2})/i;
+function looksInvented(scenario, botText) {
+  if (!scenario.forbidInvented || !botText) return false;
+  return INVENTED_RE.test(botText);
+}
+
 function lastCustomerMsg(scenario) {
   for (let i = scenario.messages.length - 1; i >= 0; i--) {
     if (scenario.messages[i].from === 'customer') return scenario.messages[i].text;
@@ -196,20 +204,21 @@ function cleanup() {
       heur = jaccard(bot.text, s.goldenReply);
       if (DO_JUDGE) judge = await judgeClaude(bot.text, s.goldenReply, lastCustomerMsg(s));
     }
+    const invented = looksInvented(s, bot.text);
     done++;
     const glyph = gate.danger ? '✗' : (gate.pass ? '✓' : '⚠');
     const gateStr = gate.danger ? `DANGER(liberou: ${gate.reason})`
       : gate.overEscalate ? `over-escalate(${gate.reason})`
       : gate.typeMismatch ? `escalou ok (motivo ${gate.reason})`
       : 'gate ok';
-    const qStr = GATE_ONLY ? '' : ` | ${bot.ms}ms${heur != null ? ` | sim ${heur}%` : ''}${judge ? ` | juiz ${judge.score}%` : ''}${bot.noReply ? ' | NO_REPLY' : ''}`;
+    const qStr = GATE_ONLY ? '' : ` | ${bot.ms}ms${heur != null ? ` | sim ${heur}%` : ''}${judge ? ` | juiz ${judge.score}%` : ''}${bot.noReply ? ' | NO_REPLY' : ''}${invented ? ' | ⚠INVENTOU' : ''}`;
     console.log(`${glyph} [${done}/${scenarios.length}] ${s.id || s.category} ${gateStr}${qStr}`);
     if (gate.danger) console.log(`    cliente: "${lastCustomerMsg(s).slice(0, 80)}"  bot: "${(bot.text || '(vazio)').slice(0, 80)}"`);
 
     return { id: s.id, category: s.category, gatePass: gate.pass, danger: gate.danger, overEscalate: gate.overEscalate, typeMismatch: gate.typeMismatch,
       gateAllow: gate.allow, gateReason: gate.reason, expectGateAllow: s.expectGateAllow, expectEscalationType: s.expectEscalationType,
       botText: bot.text, model: bot.model, botTags: bot.tags, ms: bot.ms, noReply: bot.noReply, error: bot.error,
-      heuristicSim: heur, judgeScore: judge?.score ?? null, judgeVerdict: judge?.verdict ?? null,
+      heuristicSim: heur, judgeScore: judge?.score ?? null, judgeVerdict: judge?.verdict ?? null, invented,
       goldenReply: s.goldenReply, customer: lastCustomerMsg(s) };
   });
 
@@ -219,6 +228,8 @@ function cleanup() {
   const dangerCount = rows.filter(r => r.danger).length;
   const overEscCount = rows.filter(r => r.overEscalate).length;
   const typeMismatchCount = rows.filter(r => r.typeMismatch).length;
+  const inventedCount = rows.filter(r => r.invented).length;
+  const forbidTotal = rows.filter(r => { const sc = scenarios.find(x => x.id === r.id); return sc && sc.forbidInvented; }).length;
   const ran = rows.filter(r => r.botText != null);
   const avg = (xs) => xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
 
@@ -227,6 +238,7 @@ function cleanup() {
   console.log(`SAFETY — must-escalate that got auto-answered: ${dangerCount}  ${dangerCount === 0 ? '✅' : '❌'}`);
   console.log(`Over-escalation (benign → human; safe, usually bot mis-tag): ${overEscCount}`);
   console.log(`Escalated-but-different-reason (harmless): ${typeMismatchCount}`);
+  if (forbidTotal) console.log(`Hallucination (inventou dado de estação sem ter): ${inventedCount}/${forbidTotal}  ${inventedCount === 0 ? '✅' : '⚠'}`);
   if (!GATE_ONLY) {
     console.log(`Bot answers: ${ran.length}/${rows.length} produced  |  avg latency: ${avg(ran.map(r => r.ms))}ms`);
     const sims = rows.map(r => r.heuristicSim).filter(x => x != null);

@@ -96,11 +96,33 @@ async function callOpenRouter(prompt, { timeoutMs = 45000, model = OPENROUTER_MO
  * @param backend one of agent|claude-cli|openrouter
  * @param opts.callAgent  copilot.js's callOpenClawAgent (passed in to avoid a cycle)
  */
-async function callSuggestionBackend(backend, { prompt, sessionId, agentId, attachments, callAgent }) {
+// Stateless backends fall back to the OTHER stateless backend on error, so a
+// claude-cli hiccup degrades to openrouter (and vice-versa) instead of failing
+// the suggestion. The agent backend has its own retry loop in copilot.js.
+const FALLBACK = { 'claude-cli': 'openrouter', 'openrouter': 'claude-cli' };
+
+function backendUsable(backend) {
+  if (backend === 'openrouter') return !!process.env.OPENROUTER_API_KEY;
+  return true; // claude-cli (bin) / agent always attemptable
+}
+
+async function runBackend(backend, { prompt, sessionId, agentId, attachments, callAgent }) {
   if (backend === 'claude-cli') return callClaudeCli(prompt);
   if (backend === 'openrouter') return callOpenRouter(prompt);
-  // default: agent
   return callAgent(sessionId, prompt, agentId, { attachments: attachments || [] });
+}
+
+async function callSuggestionBackend(backend, opts) {
+  try {
+    return await runBackend(backend, opts);
+  } catch (err) {
+    const fb = FALLBACK[backend];
+    if (fb && backendUsable(fb)) {
+      console.warn(`[support-copilot] backend '${backend}' failed (${err.message}); falling back to '${fb}'`);
+      return runBackend(fb, opts);
+    }
+    throw err;
+  }
 }
 
 module.exports = {

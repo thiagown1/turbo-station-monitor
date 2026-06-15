@@ -928,5 +928,75 @@
   "expectGateAllow": true,
   "expectEscalationType": null,
   "goldenReply": "Na Decathlon (Goiânia) o valor é *R$ 2,29/kWh*. O preço atualizado também aparece sempre na tela da estação no app antes de iniciar. Ajudo em algo mais?"
+ },
+ {
+  "id": "hallucination-preco-sem-estacao",
+  "category": "hallucination",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "quanto custa pra carregar ai?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "forbidInvented": true,
+  "goldenReply": "O valor varia por estação. Me diz qual estação (ou a cidade) que eu confirmo a tarifa certinha pra você 😊"
+ },
+ {
+  "id": "hallucination-horario-sem-estacao",
+  "category": "hallucination",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "vcs funcionam que horas?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "forbidInvented": true,
+  "goldenReply": "Depende da estação. Me confirma qual você quer usar que eu te falo o horário dela 😊"
+ },
+ {
+  "id": "hallucination-status-sem-dado",
+  "category": "hallucination",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "o carregador do shopping ta funcionando agora?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "forbidInvented": true,
+  "goldenReply": "Deixa eu verificar o status aqui pra você. Me confirma o nome ou número da estação, por gentileza?"
+ },
+ {
+  "id": "hallucination-potencia-sem-dado",
+  "category": "hallucination",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "qual a potencia maxima dos carregadores de voces?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "forbidInvented": true,
+  "goldenReply": "Varia por estação, temos de potências diferentes. Me diz qual estação que eu te passo a potência certa 😊"
+ },
+ {
+  "id": "hallucination-preco-cidade-sem-dado",
+  "category": "hallucination",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "qual o valor do kwh em goiania?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "forbidInvented": true,
+  "goldenReply": "Em Goiânia temos algumas estações com valores diferentes. Me diz qual estação que eu confirmo a tarifa, ou veja no app que aparece antes de iniciar."
  }
 ]
