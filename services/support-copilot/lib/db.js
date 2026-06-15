@@ -163,6 +163,7 @@ safeAddColumn('copilot_settings', 'auto_respond', 'INTEGER DEFAULT 0');
 safeAddColumn('copilot_settings', 'auto_suggest_groups', 'INTEGER DEFAULT 1');
 // Style profile mined from real operator replies (bot calibration)
 safeAddColumn('copilot_settings', 'style_profile', 'TEXT DEFAULT NULL');
+safeAddColumn('copilot_settings', 'suggestion_backend', 'TEXT DEFAULT NULL'); // agent|claude-cli|openrouter (null=agent)
 // Auto-respond gradual rollout (phase 4) — all default to fail-closed:
 // percent 0 + empty allowlist means nothing is auto-sent even if auto_respond=1.
 safeAddColumn('copilot_settings', 'auto_respond_allowlist', 'TEXT DEFAULT NULL');

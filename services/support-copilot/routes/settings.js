@@ -42,6 +42,7 @@ router.get('/:brandId', (req, res) => {
       auto_respond_allowlist: [],
       auto_respond_percent: 0,
       auto_respond_business_hours: null,
+      suggestion_backend: 'agent',
       is_default: true,
     });
   }
@@ -62,6 +63,7 @@ router.get('/:brandId', (req, res) => {
     auto_respond_allowlist: row.auto_respond_allowlist ? JSON.parse(row.auto_respond_allowlist) : [],
     auto_respond_percent: row.auto_respond_percent || 0,
     auto_respond_business_hours: row.auto_respond_business_hours ? JSON.parse(row.auto_respond_business_hours) : null,
+    suggestion_backend: row.suggestion_backend || 'agent',
     is_default: false,
     updated_at: row.updated_at,
   });
@@ -72,7 +74,7 @@ router.get('/:brandId', (req, res) => {
 router.put('/:brandId', (req, res) => {
   const { brandId } = req.params;
   const { tone_rules, business_info, quick_replies, auto_suggest, auto_respond, auto_suggest_groups,
-    auto_respond_allowlist, auto_respond_percent, auto_respond_business_hours } = req.body;
+    auto_respond_allowlist, auto_respond_percent, auto_respond_business_hours, suggestion_backend } = req.body;
 
   const now = nowIso();
   const quickRepliesJson = JSON.stringify(quick_replies || []);
@@ -92,17 +94,19 @@ router.put('/:brandId', (req, res) => {
 
   // Rollout config — only overwrite a field when the client actually sent it,
   // so a normal settings save never accidentally resets the rollout.
-  if (auto_respond_allowlist !== undefined || auto_respond_percent !== undefined || auto_respond_business_hours !== undefined) {
+  if (auto_respond_allowlist !== undefined || auto_respond_percent !== undefined || auto_respond_business_hours !== undefined || suggestion_backend !== undefined) {
     db.prepare(`
       UPDATE copilot_settings SET
         auto_respond_allowlist = COALESCE(?, auto_respond_allowlist),
         auto_respond_percent = COALESCE(?, auto_respond_percent),
-        auto_respond_business_hours = COALESCE(?, auto_respond_business_hours)
+        auto_respond_business_hours = COALESCE(?, auto_respond_business_hours),
+        suggestion_backend = COALESCE(?, suggestion_backend)
       WHERE brand_id = ?
     `).run(
       auto_respond_allowlist === undefined ? null : JSON.stringify(Array.isArray(auto_respond_allowlist) ? auto_respond_allowlist : []),
       auto_respond_percent === undefined ? null : Math.max(0, Math.min(100, Number(auto_respond_percent) || 0)),
       auto_respond_business_hours === undefined ? null : (auto_respond_business_hours ? JSON.stringify(auto_respond_business_hours) : null),
+      suggestion_backend === undefined ? null : (['agent','claude-cli','openrouter'].includes(suggestion_backend) ? suggestion_backend : 'agent'),
       brandId,
     );
   }

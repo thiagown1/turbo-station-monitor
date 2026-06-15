@@ -11,6 +11,7 @@
  */
 
 const { execFile } = require('child_process');
+const { resolveSuggestionBackend, callSuggestionBackend, isStateless } = require('./suggestion-backends');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -741,7 +742,7 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   // Fetch custom copilot settings (tone rules, business info)
   let customSettings = null;
   try {
-    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json, style_profile FROM copilot_settings WHERE brand_id = ?')
+    customSettings = db.prepare('SELECT tone_rules, business_info, quick_replies_json, style_profile, suggestion_backend FROM copilot_settings WHERE brand_id = ?')
       .get(conversation.brand_id);
   } catch (err) {
     console.warn(`${LOG_TAG} Could not fetch copilot settings:`, err.message);
@@ -763,6 +764,11 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   } else if (learnedRules.length > 0) {
     customSettings = { tone_rules: null, business_info: null, learnedRules };
   }
+
+  // Resolve the generation backend (env > per-brand setting > 'agent').
+  // Stateless backends (claude-cli/openrouter) have no session memory → full prompt.
+  const backend = resolveSuggestionBackend(customSettings && customSettings.suggestion_backend);
+  const useFullPrompt = forceFullPrompt || isStateless(backend);
 
   // Group -> partner context (Phase 3): when this group is linked to one or
   // more partners, make the agent act on those partners' behalf (account,
@@ -817,7 +823,7 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
 
   // Build incremental prompt (only sends deltas) — or full prompt if forced
   let incremental;
-  if (forceFullPrompt) {
+  if (useFullPrompt) {
     // Force full prompt with all rules (used by test runner to ensure every scenario gets complete context)
     const prompt = buildAgentPrompt(conversation, messages, {
       userData, tags, enrichmentBlock, otherConversations, customSettings,
@@ -836,6 +842,7 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
     });
   }
 
+  console.log(`${LOG_TAG} Backend: ${backend}`);
   console.log(`${LOG_TAG} Incremental mode: ${incremental.mode} | ` +
     `new msgs: ${incremental.newMessagesCount}/${incremental.totalMessages} | ` +
     `tokens: ~${incremental.tokens} | hash: ${incremental.currentHash}`);
@@ -858,8 +865,11 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   
   while (retries > 0) {
     try {
-      result = await callOpenClawAgent(sessionId, incremental.prompt, agentId, {
+      result = await callSuggestionBackend(backend, {
+        prompt: incremental.prompt,
+        sessionId, agentId,
         attachments: multimodalAttachments,
+        callAgent: callOpenClawAgent,
       });
       break;
     } catch (err) {
