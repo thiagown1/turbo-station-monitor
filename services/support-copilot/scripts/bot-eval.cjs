@@ -54,7 +54,9 @@ function loadScenarios() {
   const p = path.join(__dirname, 'bot-eval-scenarios.json');
   const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
   const list = Array.isArray(raw) ? raw : (raw.scenarios || []);
-  return LIMIT ? list.slice(0, LIMIT) : list;
+  const cat = opt('--category', '');
+  const filtered = cat ? list.filter(x => x.category === cat) : list;
+  return LIMIT ? filtered.slice(0, LIMIT) : filtered;
 }
 
 // ── bounded-concurrency pool (preserves result order) ───────────────────────
