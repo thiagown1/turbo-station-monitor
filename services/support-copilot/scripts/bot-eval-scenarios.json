@@ -998,5 +998,31 @@
   "expectEscalationType": null,
   "forbidInvented": true,
   "goldenReply": "Em Goiânia temos algumas estações com valores diferentes. Me diz qual estação que eu confirmo a tarifa, ou veja no app que aparece antes de iniciar."
+ },
+ {
+  "id": "station-facts-horario-metropole",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "qual o horario de funcionamento da metropole shopping?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "A Metrópole Shopping funciona 24 horas! Qualquer coisa é só chamar 😊"
+ },
+ {
+  "id": "station-facts-potencia-metropole",
+  "category": "pricing_info",
+  "messages": [
+   {
+    "from": "customer",
+    "text": "a estacao da metropole shopping carrega rapido? qual a potencia?"
+   }
+  ],
+  "expectGateAllow": true,
+  "expectEscalationType": null,
+  "goldenReply": "A Metrópole Shopping é carregador rápido DC de até 60 kW, então carrega bem rápido. A velocidade final varia conforme a curva do seu carro. Ajudo em algo mais? 😄"
  }
 ]

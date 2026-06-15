@@ -313,8 +313,60 @@ function enrichContext({ tags = [], userData = null } = {}) {
   ].join('\n');
 }
 
+// ─── Station facts from the conversation text (anti-hallucination) ──────────
+// stations-map.json carries real name/location/hours/powerKw per station. When
+// the customer names a station (by name or id), inject the REAL facts so the bot
+// answers hours/power correctly instead of inventing. Price is NOT in the map →
+// the prompt guard still defers price to the app.
+function loadStationsMap() {
+  try {
+    const fs = require('fs');
+    if (!fs.existsSync(STATIONS_MAP_PATH)) return {};
+    const data = JSON.parse(fs.readFileSync(STATIONS_MAP_PATH, 'utf-8'));
+    return data.stations || data || {};
+  } catch { return {}; }
+}
+
+function normStr(v) {
+  return String(v || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+}
+
+const GENERIC_STATION_WORDS = new Set(['shopping', 'posto', 'estacao', 'station', 'turbo', 'carregador', 'eletroposto', 'shop', 'mall']);
+
+function resolveStationsFromText(text) {
+  const map = loadStationsMap();
+  const ids = Object.keys(map);
+  if (!ids.length || !text) return [];
+  const norm = normStr(text);
+  const matched = [];
+  for (const id of ids) {
+    if (id && id.length >= 4 && norm.includes(normStr(id))) matched.push(map[id]);
+  }
+  for (const id of ids) {
+    const st = map[id];
+    if (!st || !st.name || matched.includes(st)) continue;
+    const tokens = normStr(st.name).split(/\s+/).filter(t => t.length >= 4 && !GENERIC_STATION_WORDS.has(t));
+    if (tokens.length && tokens.every(t => norm.includes(t))) matched.push(st);
+  }
+  return [...new Set(matched)].slice(0, 3);
+}
+
+function buildStationFactsBlock(text) {
+  const stations = resolveStationsFromText(text);
+  if (!stations.length) return '';
+  const lines = stations.map(st => {
+    const facts = [];
+    if (st.hours) facts.push(`horário ${st.hours}`);
+    if (st.powerKw) facts.push(`potência até ${st.powerKw} kW`);
+    return `- ${st.name}${st.location ? ` (${st.location})` : ''}${facts.length ? ': ' + facts.join(', ') : ''}`;
+  });
+  return ['[DADOS REAIS DA ESTAÇÃO MENCIONADA — use estes, NÃO invente; preço NÃO está aqui, oriente a ver no app]:', ...lines].join('\n');
+}
+
 module.exports = {
   enrichContext,
+  buildStationFactsBlock,
+  resolveStationsFromText,
   lookupStation,
   getRecentOcppEvents,
   getChargerStatus,

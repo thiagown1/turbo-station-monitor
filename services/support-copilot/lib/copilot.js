@@ -814,6 +814,17 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
     console.warn(`${LOG_TAG} Context enrichment failed:`, err.message);
   }
 
+  // Inject REAL station facts (hours/power/location) when the customer names a
+  // station in the recent messages — kills hours/power hallucination.
+  try {
+    const { buildStationFactsBlock } = require('./context-enrichment');
+    const recentText = (messages || []).slice(-6).map(m => m.body || '').join(' ');
+    const stationFacts = buildStationFactsBlock(recentText);
+    if (stationFacts) enrichmentBlock = (enrichmentBlock ? enrichmentBlock + String.fromCharCode(10, 10) : '') + stationFacts;
+  } catch (err) {
+    console.warn(`${LOG_TAG} Station-facts enrichment failed:`, err.message);
+  }
+
   // Fetch other conversations for multi-session awareness
   let otherConversations = [];
   try {
