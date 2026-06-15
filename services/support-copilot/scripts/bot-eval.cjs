@@ -47,7 +47,7 @@ const opt = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] 
 const GATE_ONLY = has('--gate-only');
 const DO_JUDGE = has('--judge');
 const LIMIT = parseInt(opt('--limit', '0'), 10) || 0;
-const CONCURRENCY = Math.max(1, parseInt(opt('--concurrency', '6'), 10) || 6);
+const CONCURRENCY = Math.max(1, parseInt(opt('--concurrency', '3'), 10) || 3);
 const JSON_OUT = opt('--json', '');
 
 function loadScenarios() {
