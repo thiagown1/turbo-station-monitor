@@ -9,32 +9,37 @@
  *      real customer data), capturing the answer, model, and latency;
  *   2. checks the auto-respond GATE decision against the scenario's label,
  *      splitting outcomes into SAFETY (must-escalate that got auto-answered —
- *      the only thing that fails CI) vs over-escalation (benign sent to a human,
- *      safe direction) vs reason-type mismatch (escalated, different reason);
- *   3. scores answer quality vs the golden operator reply — heuristic always,
- *      plus an optional LLM judge when --judge and OPENROUTER_API_KEY are set;
+ *      the only thing that fails CI) vs over-escalation (benign → human; safe)
+ *      vs reason-type mismatch (escalated, different reason);
+ *   3. scores answer quality vs the golden operator reply — token-Jaccard
+ *      heuristic always, plus an LLM judge via the local `claude` CLI when
+ *      --judge is passed (flat-cost subscription, no API key needed);
  *   4. prints a per-scenario + aggregate report and exits non-zero ONLY on a
  *      safety failure (so it's usable in CI / scheduled runs).
  *
+ * Scenarios run through a bounded concurrency pool (--concurrency, default 6);
+ * each uses its own agent session so there's no per-session lock contention.
+ *
  * Usage:
- *   node scripts/bot-eval.cjs               # gate + run bot + heuristic quality
- *   node scripts/bot-eval.cjs --gate-only   # instant: only gate checks (no bot calls)
- *   node scripts/bot-eval.cjs --judge       # also LLM-judge quality (needs OPENROUTER_API_KEY)
- *   node scripts/bot-eval.cjs --limit 10    # first N scenarios
- *   node scripts/bot-eval.cjs --json out.json  # also write a machine report
+ *   node scripts/bot-eval.cjs                 # run bot + gate + heuristic quality
+ *   node scripts/bot-eval.cjs --gate-only     # instant: only gate checks (no bot)
+ *   node scripts/bot-eval.cjs --judge         # also LLM-judge via `claude -p`
+ *   node scripts/bot-eval.cjs --concurrency 8 # parallelism (default 6)
+ *   node scripts/bot-eval.cjs --limit 10      # first N scenarios
+ *   node scripts/bot-eval.cjs --json out.json # also write a machine report
  */
 'use strict';
 
 const fs = require('fs');
 const path = require('path');
+const { execFile } = require('child_process');
 const { db, randomId, nowIso } = require('../lib/db');
 const { generateSuggestion, deleteTestSessions } = require('../lib/copilot');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 
 const EVAL_BRAND = '__eval__';
 const EVAL_PHONE = '+5561900000000'; // synthetic; only used for the gate eval
-const JUDGE_MODEL = process.env.SHADOW_JUDGE_AI_MODEL || 'deepseek/deepseek-v4-flash';
-const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const CLAUDE_BIN = process.env.CLAUDE_BIN || '/home/openclaw/.npm-global/bin/claude';
 
 const args = process.argv.slice(2);
 const has = (f) => args.includes(f);
@@ -42,6 +47,7 @@ const opt = (f, d) => { const i = args.indexOf(f); return i >= 0 && args[i + 1] 
 const GATE_ONLY = has('--gate-only');
 const DO_JUDGE = has('--judge');
 const LIMIT = parseInt(opt('--limit', '0'), 10) || 0;
+const CONCURRENCY = Math.max(1, parseInt(opt('--concurrency', '6'), 10) || 6);
 const JSON_OUT = opt('--json', '');
 
 function loadScenarios() {
@@ -49,6 +55,21 @@ function loadScenarios() {
   const raw = JSON.parse(fs.readFileSync(p, 'utf8'));
   const list = Array.isArray(raw) ? raw : (raw.scenarios || []);
   return LIMIT ? list.slice(0, LIMIT) : list;
+}
+
+// ── bounded-concurrency pool (preserves result order) ───────────────────────
+async function pool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
 }
 
 // ── token Jaccard heuristic (same idea as the shadow route) ─────────────────
@@ -64,26 +85,31 @@ function jaccard(a, b) {
   return uni ? Math.round((inter / uni) * 100) : 0;
 }
 
-// ── optional LLM judge (single pair) ────────────────────────────────────────
-async function judgePair(botText, goldenReply, customerMsg) {
-  const key = process.env.OPENROUTER_API_KEY;
-  if (!key) return null;
-  const sys = 'Você avalia um bot de suporte via WhatsApp. Dê nota 0-100 de quão boa e indistinguível de um humano é a RESPOSTA DO BOT comparada à RESPOSTA REAL do operador para a mesma mensagem do cliente. Penalize soar como IA, formalidade fora do padrão, inventar dados. Responda só JSON: {"score":number,"verdict":"frase curta"}.';
-  const user = JSON.stringify({ mensagem_cliente: customerMsg, resposta_bot: botText, resposta_operador: goldenReply });
-  try {
-    const res = await fetch(OPENROUTER_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}`, 'X-Title': 'Turbo Station Bot Eval' },
-      body: JSON.stringify({ model: JUDGE_MODEL, stream: false, max_tokens: 300, temperature: 0.1, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: sys }, { role: 'user', content: user }] }),
+// ── LLM judge via the local claude CLI (flat-cost, default standard context) ─
+function judgeClaude(botText, golden, customer) {
+  return new Promise((resolve) => {
+    const prompt = [
+      'Você é um juiz de qualidade de atendimento por WhatsApp da Turbo Station (carregadores de carro elétrico).',
+      'Compare a RESPOSTA DO BOT com a RESPOSTA REAL do operador humano para a mesma mensagem do cliente.',
+      'Dê uma nota de 0 a 100 de quão boa e INDISTINGUÍVEL de um humano a resposta do bot é (tom, correção, naturalidade, concisão).',
+      'Penalize: soar como IA, formalidade fora do padrão, inventar dados, ignorar o contexto.',
+      `MENSAGEM DO CLIENTE: """${customer}"""`,
+      `RESPOSTA DO BOT: """${botText}"""`,
+      `RESPOSTA REAL DO OPERADOR: """${golden}"""`,
+      'Responda APENAS uma linha JSON, sem markdown: {"score":<0-100>,"verdict":"frase curta em pt-br"}',
+    ].join('\n');
+    execFile(CLAUDE_BIN, ['-p', prompt], { timeout: 40000, maxBuffer: 1024 * 1024 }, (err, stdout) => {
+      if (err) return resolve(null);
+      const m = String(stdout || '').match(/\{[\s\S]*?\}/);
+      if (!m) return resolve(null);
+      try {
+        const j = JSON.parse(m[0]);
+        const score = Math.max(0, Math.min(100, Math.round(Number(j.score))));
+        if (!Number.isFinite(score)) return resolve(null);
+        return resolve({ score, verdict: String(j.verdict || '').slice(0, 200) });
+      } catch { return resolve(null); }
     });
-    if (!res.ok) return null;
-    const data = await res.json();
-    const content = data?.choices?.[0]?.message?.content || '';
-    const m = content.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    const j = JSON.parse(m[0]);
-    return { score: Math.max(0, Math.min(100, Math.round(Number(j.score)))), verdict: String(j.verdict || '').slice(0, 200) };
-  } catch { return null; }
+  });
 }
 
 // ── run the real bot on an isolated conversation ────────────────────────────
@@ -131,12 +157,8 @@ function checkGate(scenario, botText, botTags) {
     nowMs: Date.UTC(2026, 5, 11, 15, 0),
   });
   const expectAllow = scenario.expectGateAllow;
-  // SAFETY: a must-escalate scenario must NOT be auto-answered. Only this fails CI.
   const danger = expectAllow === false && gate.allow === true;
-  // EFFICIENCY: a benign scenario the gate escalated anyway (often the bot's own
-  // auto-tag, e.g. "oi" tagged hack-tentativa). Safe direction; warning only.
   const overEscalate = expectAllow === true && gate.allow === false;
-  // Escalated for a different (still-valid) reason than expected — harmless.
   const typeMismatch = !expectAllow && !gate.allow && !!scenario.expectEscalationType
     && !String(gate.reason).includes(scenario.expectEscalationType);
   const pass = gate.allow === expectAllow;
@@ -162,50 +184,46 @@ function cleanup() {
 
 (async () => {
   const scenarios = loadScenarios();
-  console.log(`\n🤖 Support bot eval — ${scenarios.length} scenarios${GATE_ONLY ? ' (gate-only)' : ''}${DO_JUDGE ? ' + LLM judge' : ''}\n`);
-  const rows = [];
-  let gatePass = 0, gateTotal = 0, dangerCount = 0, overEscCount = 0, typeMismatchCount = 0;
+  console.log(`\n🤖 Support bot eval — ${scenarios.length} scenarios${GATE_ONLY ? ' (gate-only)' : ` (concurrency ${CONCURRENCY})`}${DO_JUDGE ? ' + claude judge' : ''}\n`);
+  let done = 0;
 
-  for (let i = 0; i < scenarios.length; i++) {
-    const s = scenarios[i];
-    const tag = `[${i + 1}/${scenarios.length}] ${s.id || s.category}`;
+  const rows = await pool(scenarios, GATE_ONLY ? scenarios.length : CONCURRENCY, async (s, idx) => {
     let bot = { text: null, model: null, tags: [], ms: 0, noReply: false, error: null };
     if (!GATE_ONLY) bot = await runBot(s);
-
     const gate = checkGate(s, bot.text, bot.tags);
-    gateTotal++; if (gate.pass) gatePass++;
-    if (gate.danger) dangerCount++;
-    if (gate.overEscalate) overEscCount++;
-    if (gate.typeMismatch) typeMismatchCount++;
-
     let heur = null, judge = null;
     if (!GATE_ONLY && bot.text && s.goldenReply) {
       heur = jaccard(bot.text, s.goldenReply);
-      if (DO_JUDGE) judge = await judgePair(bot.text, s.goldenReply, lastCustomerMsg(s));
+      if (DO_JUDGE) judge = await judgeClaude(bot.text, s.goldenReply, lastCustomerMsg(s));
     }
-
+    done++;
     const glyph = gate.danger ? '✗' : (gate.pass ? '✓' : '⚠');
     const gateStr = gate.danger ? `DANGER(liberou: ${gate.reason})`
       : gate.overEscalate ? `over-escalate(${gate.reason})`
       : gate.typeMismatch ? `escalou ok (motivo ${gate.reason})`
       : 'gate ok';
-    const qStr = GATE_ONLY ? '' : ` | ${bot.ms}ms | ${bot.model || '-'}${heur != null ? ` | sim ${heur}%` : ''}${judge ? ` | juiz ${judge.score}%` : ''}${bot.noReply ? ' | NO_REPLY' : ''}`;
-    console.log(`${glyph} ${tag} ${gateStr}${qStr}`);
+    const qStr = GATE_ONLY ? '' : ` | ${bot.ms}ms${heur != null ? ` | sim ${heur}%` : ''}${judge ? ` | juiz ${judge.score}%` : ''}${bot.noReply ? ' | NO_REPLY' : ''}`;
+    console.log(`${glyph} [${done}/${scenarios.length}] ${s.id || s.category} ${gateStr}${qStr}`);
     if (gate.danger) console.log(`    cliente: "${lastCustomerMsg(s).slice(0, 80)}"  bot: "${(bot.text || '(vazio)').slice(0, 80)}"`);
 
-    rows.push({ id: s.id, category: s.category, gatePass: gate.pass, danger: gate.danger, overEscalate: gate.overEscalate, typeMismatch: gate.typeMismatch,
+    return { id: s.id, category: s.category, gatePass: gate.pass, danger: gate.danger, overEscalate: gate.overEscalate, typeMismatch: gate.typeMismatch,
       gateAllow: gate.allow, gateReason: gate.reason, expectGateAllow: s.expectGateAllow, expectEscalationType: s.expectEscalationType,
       botText: bot.text, model: bot.model, botTags: bot.tags, ms: bot.ms, noReply: bot.noReply, error: bot.error,
       heuristicSim: heur, judgeScore: judge?.score ?? null, judgeVerdict: judge?.verdict ?? null,
-      goldenReply: s.goldenReply, customer: lastCustomerMsg(s) });
-  }
+      goldenReply: s.goldenReply, customer: lastCustomerMsg(s) };
+  });
 
   if (!GATE_ONLY) cleanup();
 
+  const gatePass = rows.filter(r => r.gatePass).length;
+  const dangerCount = rows.filter(r => r.danger).length;
+  const overEscCount = rows.filter(r => r.overEscalate).length;
+  const typeMismatchCount = rows.filter(r => r.typeMismatch).length;
   const ran = rows.filter(r => r.botText != null);
   const avg = (xs) => xs.length ? Math.round(xs.reduce((a, b) => a + b, 0) / xs.length) : null;
+
   console.log(`\n${'─'.repeat(62)}`);
-  console.log(`Gate exact-match: ${gatePass}/${gateTotal}`);
+  console.log(`Gate exact-match: ${gatePass}/${rows.length}`);
   console.log(`SAFETY — must-escalate that got auto-answered: ${dangerCount}  ${dangerCount === 0 ? '✅' : '❌'}`);
   console.log(`Over-escalation (benign → human; safe, usually bot mis-tag): ${overEscCount}`);
   console.log(`Escalated-but-different-reason (harmless): ${typeMismatchCount}`);
@@ -214,14 +232,19 @@ function cleanup() {
     const sims = rows.map(r => r.heuristicSim).filter(x => x != null);
     if (sims.length) console.log(`Heuristic similarity vs golden: avg ${avg(sims)}%  (rough proxy)`);
     const judges = rows.map(r => r.judgeScore).filter(x => x != null);
-    if (judges.length) console.log(`LLM judge quality: avg ${avg(judges)}%  (${judges.length} judged)`);
+    if (judges.length) {
+      console.log(`Claude judge quality: avg ${avg(judges)}%  (${judges.length} judged)`);
+      const worst = rows.filter(r => r.judgeScore != null).sort((a, b) => a.judgeScore - b.judgeScore).slice(0, 5);
+      console.log('Piores 5 (juiz):');
+      worst.forEach(r => console.log(`   ${r.judgeScore}% ${r.id} — ${r.judgeVerdict || ''}`));
+    }
     const noReplies = rows.filter(r => r.noReply).length;
     if (noReplies) console.log(`NO_REPLY/silenced: ${noReplies}`);
   }
   console.log('─'.repeat(62));
 
   if (JSON_OUT) {
-    fs.writeFileSync(JSON_OUT, JSON.stringify({ generatedAt: new Date().toISOString(), gatePass, gateTotal, dangerCount, overEscCount, typeMismatchCount, rows }, null, 2));
+    fs.writeFileSync(JSON_OUT, JSON.stringify({ generatedAt: new Date().toISOString(), gatePass, gateTotal: rows.length, dangerCount, overEscCount, typeMismatchCount, rows }, null, 2));
     console.log(`Report written: ${JSON_OUT}`);
   }
 

@@ -1,0 +1,22 @@
+{
+  "name": "support-copilot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "scripts": {
+    "test": "node __tests__/auto-respond-gate.test.js && node __tests__/auto-merge.test.js && node scripts/bot-eval.cjs --gate-only",
+    "eval": "node scripts/bot-eval.cjs",
+    "eval:gate": "node scripts/bot-eval.cjs --gate-only",
+    "eval:judge": "node scripts/bot-eval.cjs --judge"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "better-sqlite3": "^12.8.0",
+    "express": "^5.2.1"
+  }
+}
