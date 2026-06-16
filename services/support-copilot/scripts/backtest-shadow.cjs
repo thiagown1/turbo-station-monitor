@@ -75,6 +75,7 @@ function contextBefore(convId, replyAt) {
     const ctx = contextBefore(t.conversation_id, t.reply_at);
     if (ctx.length === 0) continue;
     if (ctx[ctx.length - 1].direction !== 'inbound') continue; // last before reply must be the customer
+    if (/^\s*\[/.test(t.operator_text || '')) continue; // operator reply is media/contact ([img/audio/pdf/contato]) — a text bot can't match
     turns.push({ ...t, ctx });
   }
   console.log(`\n🕰️  Shadow backtest — ${turns.length} real turns (brand ${BRAND}, concurrency ${CONCURRENCY})\n`);
