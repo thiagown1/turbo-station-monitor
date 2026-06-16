@@ -32,6 +32,7 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
+const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 
 const router = Router();
@@ -768,7 +769,9 @@ router.post('/', (req, res) => {
 
             emitEvent({ type: 'copilot_started', conversationId, brandId });
 
-            const result = await generateSuggestion(conv, allMsgs);
+            let acctData = null;
+            try { acctData = await resolveCustomerData(conv.customer_phone, brandId); } catch (e) {}
+            const result = await generateSuggestion(conv, allMsgs, acctData ? { userData: acctData } : undefined);
             // generateSuggestion returns { text, model, waiting?, noReply?, tags? }
             if (!result?.text || result.waiting || result.noReply) return;
 
