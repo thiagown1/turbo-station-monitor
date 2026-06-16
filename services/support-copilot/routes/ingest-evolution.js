@@ -770,7 +770,7 @@ router.post('/', (req, res) => {
             emitEvent({ type: 'copilot_started', conversationId, brandId });
 
             let acctData = null;
-            try { acctData = await resolveCustomerData(conv.customer_phone, brandId); } catch (e) {}
+            try { const convText = allMsgs.map(mm => mm.body || '').join(' | '); acctData = await resolveCustomerData(conv.customer_phone, brandId, convText); } catch (e) {}
             const result = await generateSuggestion(conv, allMsgs, acctData ? { userData: acctData } : undefined);
             // generateSuggestion returns { text, model, waiting?, noReply?, tags? }
             if (!result?.text || result.waiting || result.noReply) return;

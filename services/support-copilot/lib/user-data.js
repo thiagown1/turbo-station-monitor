@@ -1,18 +1,21 @@
 /**
- * Customer account data resolver — Support Copilot
+ * Customer account data resolver — Support Copilot (VERIFICATION-GATED)
  *
- * Resolves a WhatsApp contact's REAL account state (credits, recent recharges,
- * active/pending transactions) by calling the Next.js prod API, so the bot can
- * answer account/recharge questions with facts instead of inventing. This is the
- * structural fix the real-traffic backtest pointed at (the live auto-suggest path
- * previously passed NO userData).
+ * Resolves a WhatsApp contact's REAL account state, but only shares it once the
+ * customer is VERIFIED — i.e. they provided a CPF in the conversation that
+ * matches the account's CPF (the same check the human operators do before
+ * sharing anything). Phone-match alone is NOT verification (a phone can be
+ * shared/spoofed; prompt-injection could try to extract data otherwise).
  *
- * Requires NEXT_API_KEY (an API key scoped to users:search + admin view-users).
- * Without it, returns null → the bot works exactly as before (no account data).
+ * Security/privacy:
+ *  - CPF comparison happens HERE (server-side); the account CPF/email/phone are
+ *    NEVER returned/injected into the LLM prompt (can't leak what isn't there).
+ *  - Unverified → returns { verified:false } so the prompt makes the bot ask for
+ *    the CPF before sharing any account data.
+ *  - Never logs the CPF.
  *
- * Privacy (LGPD minimização): returns OPERATIONAL state only. Drops raw CPF /
- * email / phone so they're never sent to the LLM — the bot needs the account
- * STATE to help, not the identifiers.
+ * Requires NEXT_API_KEY (scoped users:search + admin view-users). Without it →
+ * null (graceful: bot works as before, no account data).
  */
 'use strict';
 
@@ -22,10 +25,28 @@ const LOG_TAG = '[support-copilot]';
 
 function digitsOf(s) { return String(s || '').replace(/\D/g, ''); }
 
-async function resolveCustomerData(phone, brandId) {
-  if (!NEXT_API_KEY) return null; // not configured → graceful no-op
+/** All 11-digit sequences in the text (formatted or raw) — CPF candidates. */
+function extractCpfCandidates(text) {
+  const out = new Set();
+  const re = /\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}/g;
+  let m;
+  while ((m = re.exec(String(text || '')))) {
+    const d = m[0].replace(/\D/g, '');
+    if (d.length === 11) out.add(d);
+  }
+  return out;
+}
+
+/**
+ * @param phone customer phone
+ * @param brandId
+ * @param conversationText recent messages joined (to find the customer-provided CPF)
+ * @returns null | { verified:false } | { verified:true, ...operational state }
+ */
+async function resolveCustomerData(phone, brandId, conversationText) {
+  if (!NEXT_API_KEY) return null;
   const digits = digitsOf(phone);
-  if (digits.length < 10 || digits.length > 13) return null; // skip LIDs / junk
+  if (digits.length < 10 || digits.length > 13) return null;
   const headers = {
     Accept: 'application/json',
     'x-api-key': NEXT_API_KEY,
@@ -37,7 +58,6 @@ async function resolveCustomerData(phone, brandId) {
     if (!sRes.ok) return null;
     const sData = await sRes.json();
     const users = Array.isArray(sData.users) ? sData.users : [];
-    // Verify the phone actually matches (search is fuzzy) — compare last 8 digits.
     const tail = digits.slice(-8);
     const match = users.find(u => digitsOf(u.phoneNumber).endsWith(tail)) || null;
     if (!match || !match.id) return null;
@@ -46,8 +66,18 @@ async function resolveCustomerData(phone, brandId) {
     if (!cRes.ok) return null;
     const ctx = await cRes.json();
 
-    // PII-minimized: operational state + first name only. No CPF/email/phone.
+    // ── Verification: does a CPF in the conversation match the account's CPF? ──
+    const acctCpf = digitsOf(ctx.cpf || ctx.document);
+    const provided = extractCpfCandidates(conversationText);
+    const verified = acctCpf.length === 11 && provided.has(acctCpf);
+
+    if (!verified) {
+      return { verified: false }; // account exists, but not proven to be this person
+    }
+
+    // Verified → operational state only. NO cpf/email/phone (never to the LLM).
     return {
+      verified: true,
       id: ctx.id,
       displayName: (ctx.displayName || '').trim().split(/\s+/)[0] || null, // first name only
       credits: typeof ctx.credits === 'number' ? ctx.credits : null,
