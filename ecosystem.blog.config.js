@@ -36,6 +36,22 @@ module.exports = {
       merge_logs: true,
       env: { ...dotenv, BLOG_API_PORT: '3300' },
     },
-    // blog-generator (daily cron_restart) is added in a later step.
+    {
+      name: 'blog-generator',
+      script: './services/blog-generator.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      // One-shot daily job: pm2 runs it, it generates + exits; cron re-runs it.
+      autorestart: false,
+      cron_restart: '0 10 * * *', // 10:00 UTC = 07:00 BRT (morning)
+      watch: false,
+      max_memory_restart: '200M',
+      error_file: './logs/blog-generator-error.log',
+      out_file: './logs/blog-generator-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: { ...dotenv, BLOG_API_BASE_LOCAL: 'http://127.0.0.1:3300' },
+    },
   ],
 };
