@@ -1,0 +1,229 @@
+#!/usr/bin/env node
+/**
+ * Turbo Station blog-api
+ *
+ * Express + better-sqlite3 service that stores AI-generated blog posts on the
+ * OpenClaw VPS and serves them to the Next.js site (which fetches via its
+ * VpsApiBlogSource, cached + fail-soft). The daily blog-generator writes posts
+ * here; the Next dashboard reads/manages them; the public blog reads published
+ * posts.
+ *
+ * All endpoints (except /health) require the shared secret header
+ * `x-blog-api-key` === BLOG_API_KEY. Next is the only client; nginx exposes this
+ * at logs.turbostation.com.br/blog/api on a loopback port.
+ *
+ * Schema lives here (created on boot). The generator inserts; this api never
+ * calls an LLM.
+ */
+const express = require('express');
+const Database = require('better-sqlite3');
+const path = require('path');
+
+const PORT = Number(process.env.BLOG_API_PORT || 3300);
+const API_KEY = (process.env.BLOG_API_KEY || '').trim();
+const DB_PATH = process.env.BLOG_DB_PATH || path.join(__dirname, '..', 'db', 'blog.db');
+
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+db.exec(`
+  CREATE TABLE IF NOT EXISTS posts (
+    slug TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    date TEXT NOT NULL,
+    updated TEXT,
+    author TEXT DEFAULT 'Equipe Turbo Station',
+    category TEXT DEFAULT 'Geral',
+    tags TEXT DEFAULT '[]',            -- JSON array
+    coverImage TEXT,
+    body TEXT DEFAULT '',
+    draft INTEGER NOT NULL DEFAULT 1,  -- 1 = hidden from public
+    status TEXT NOT NULL DEFAULT 'draft', -- draft | published | rejected
+    readingTime INTEGER DEFAULT 1,
+    generationModel TEXT,
+    generationSources TEXT DEFAULT '[]', -- JSON array
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS config (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    autopublish INTEGER NOT NULL DEFAULT 0,
+    disabledReason TEXT,
+    updatedBy TEXT,
+    updatedAt TEXT
+  );
+  CREATE TABLE IF NOT EXISTS covered_topics (
+    topicKey TEXT PRIMARY KEY,
+    title TEXT,
+    slug TEXT,
+    createdAt TEXT NOT NULL
+  );
+  CREATE TABLE IF NOT EXISTS gen_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    day TEXT,
+    status TEXT,        -- published | held | skipped | error
+    reason TEXT,
+    slug TEXT,
+    createdAt TEXT NOT NULL
+  );
+  INSERT OR IGNORE INTO config (id, enabled, autopublish, updatedAt)
+    VALUES (1, 1, 0, datetime('now'));
+`);
+
+function rowToMeta(r) {
+  return {
+    slug: r.slug,
+    title: r.title,
+    description: r.description || '',
+    date: r.date,
+    updated: r.updated || undefined,
+    author: r.author || 'Equipe Turbo Station',
+    category: r.category || 'Geral',
+    tags: safeJson(r.tags, []),
+    coverImage: r.coverImage || undefined,
+    draft: r.draft === 1,
+    readingTime: r.readingTime || 1,
+  };
+}
+function rowToPost(r) {
+  return { ...rowToMeta(r), body: r.body || '' };
+}
+function safeJson(s, fallback) {
+  try { return JSON.parse(s); } catch { return fallback; }
+}
+
+const app = express();
+app.use(express.json({ limit: '2mb' }));
+
+// Constant-time-ish secret gate (skips /health).
+app.use((req, res, next) => {
+  if (req.path === '/health') return next();
+  const provided = (req.get('x-blog-api-key') || '').trim();
+  if (!API_KEY || provided !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+});
+
+app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ---- public-read endpoints (consumed by Next VpsApiBlogSource) ----
+app.get('/posts', (_req, res) => {
+  const rows = db.prepare(
+    "SELECT * FROM posts WHERE draft = 0 AND status = 'published' ORDER BY date DESC"
+  ).all();
+  res.json({ posts: rows.map(rowToMeta) });
+});
+
+app.get('/slugs', (_req, res) => {
+  const rows = db.prepare("SELECT slug FROM posts WHERE draft = 0 AND status = 'published'").all();
+  res.json({ slugs: rows.map((r) => r.slug) });
+});
+
+app.get('/posts/:slug', (req, res) => {
+  const row = db.prepare(
+    "SELECT * FROM posts WHERE slug = ? AND draft = 0 AND status = 'published'"
+  ).get(req.params.slug);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  res.json(rowToPost(row));
+});
+
+// ---- admin endpoints (dashboard via Next proxy, + the generator) ----
+app.get('/admin/posts', (_req, res) => {
+  const rows = db.prepare('SELECT * FROM posts ORDER BY createdAt DESC').all();
+  res.json({ posts: rows.map((r) => ({ ...rowToPost(r), status: r.status })) });
+});
+
+app.get('/config', (_req, res) => {
+  const c = db.prepare('SELECT * FROM config WHERE id = 1').get();
+  res.json({ enabled: c.enabled === 1, autopublish: c.autopublish === 1, disabledReason: c.disabledReason || null, updatedBy: c.updatedBy || null, updatedAt: c.updatedAt || null });
+});
+
+app.put('/config', (req, res) => {
+  const { enabled, autopublish, updatedBy, disabledReason } = req.body || {};
+  const now = new Date().toISOString();
+  const cur = db.prepare('SELECT * FROM config WHERE id = 1').get();
+  db.prepare('UPDATE config SET enabled = ?, autopublish = ?, disabledReason = ?, updatedBy = ?, updatedAt = ? WHERE id = 1').run(
+    typeof enabled === 'boolean' ? (enabled ? 1 : 0) : cur.enabled,
+    typeof autopublish === 'boolean' ? (autopublish ? 1 : 0) : cur.autopublish,
+    enabled === false ? (disabledReason || null) : null,
+    updatedBy || cur.updatedBy || null,
+    now,
+  );
+  const c = db.prepare('SELECT * FROM config WHERE id = 1').get();
+  res.json({ enabled: c.enabled === 1, autopublish: c.autopublish === 1, disabledReason: c.disabledReason || null, updatedBy: c.updatedBy, updatedAt: c.updatedAt });
+});
+
+// Create / upsert a post (used by the generator).
+app.post('/posts', (req, res) => {
+  const p = req.body || {};
+  if (!p.slug || !p.title || !p.date) return res.status(400).json({ error: 'slug, title, date required' });
+  const now = new Date().toISOString();
+  const exists = db.prepare('SELECT slug FROM posts WHERE slug = ?').get(p.slug);
+  db.prepare(`
+    INSERT INTO posts (slug,title,description,date,updated,author,category,tags,coverImage,body,draft,status,readingTime,generationModel,generationSources,createdAt,updatedAt)
+    VALUES (@slug,@title,@description,@date,@updated,@author,@category,@tags,@coverImage,@body,@draft,@status,@readingTime,@generationModel,@generationSources,@createdAt,@updatedAt)
+    ON CONFLICT(slug) DO UPDATE SET
+      title=@title, description=@description, date=@date, updated=@updated, author=@author,
+      category=@category, tags=@tags, coverImage=@coverImage, body=@body, draft=@draft, status=@status,
+      readingTime=@readingTime, generationModel=@generationModel, generationSources=@generationSources, updatedAt=@updatedAt
+  `).run({
+    slug: p.slug,
+    title: p.title,
+    description: p.description || '',
+    date: p.date,
+    updated: p.updated || null,
+    author: p.author || 'Equipe Turbo Station',
+    category: p.category || 'Geral',
+    tags: JSON.stringify(Array.isArray(p.tags) ? p.tags : []),
+    coverImage: p.coverImage || null,
+    body: p.body || '',
+    draft: p.draft === false ? 0 : 1,
+    status: p.status || (p.draft === false ? 'published' : 'draft'),
+    readingTime: Number(p.readingTime) > 0 ? Math.round(Number(p.readingTime)) : 1,
+    generationModel: p.generationModel || null,
+    generationSources: JSON.stringify(Array.isArray(p.generationSources) ? p.generationSources : []),
+    createdAt: exists ? (db.prepare('SELECT createdAt FROM posts WHERE slug = ?').get(p.slug).createdAt) : now,
+    updatedAt: now,
+  });
+  res.json({ ok: true, slug: p.slug, created: !exists });
+});
+
+app.post('/posts/:slug/publish', (req, res) => {
+  const now = new Date().toISOString();
+  const r = db.prepare("UPDATE posts SET draft = 0, status = 'published', updatedAt = ? WHERE slug = ?").run(now, req.params.slug);
+  res.json({ ok: r.changes > 0 });
+});
+app.post('/posts/:slug/unpublish', (req, res) => {
+  const now = new Date().toISOString();
+  const r = db.prepare("UPDATE posts SET draft = 1, status = 'draft', updatedAt = ? WHERE slug = ?").run(now, req.params.slug);
+  res.json({ ok: r.changes > 0 });
+});
+
+// Covered-topics ledger (generator dedup).
+app.get('/covered-topics', (_req, res) => {
+  res.json({ topics: db.prepare('SELECT * FROM covered_topics ORDER BY createdAt DESC').all() });
+});
+app.post('/covered-topics', (req, res) => {
+  const { topicKey, title, slug } = req.body || {};
+  if (!topicKey) return res.status(400).json({ error: 'topicKey required' });
+  db.prepare('INSERT OR IGNORE INTO covered_topics (topicKey, title, slug, createdAt) VALUES (?,?,?,?)')
+    .run(topicKey, title || null, slug || null, new Date().toISOString());
+  res.json({ ok: true });
+});
+
+// Generation-run audit log.
+app.post('/gen-runs', (req, res) => {
+  const { day, status, reason, slug } = req.body || {};
+  db.prepare('INSERT INTO gen_runs (day, status, reason, slug, createdAt) VALUES (?,?,?,?,?)')
+    .run(day || null, status || null, reason || null, slug || null, new Date().toISOString());
+  res.json({ ok: true });
+});
+app.get('/gen-runs', (_req, res) => {
+  res.json({ runs: db.prepare('SELECT * FROM gen_runs ORDER BY id DESC LIMIT 30').all() });
+});
+
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`[blog-api] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+});
