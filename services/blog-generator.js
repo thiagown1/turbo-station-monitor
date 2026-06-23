@@ -232,20 +232,30 @@ const HIGGSFIELD_BIN = process.env.HIGGSFIELD_BIN || '/usr/local/bin/higgsfield'
 const IMG_PUBLIC_BASE = (process.env.BLOG_PUBLIC_BASE || 'https://logs.turbostation.com.br/blog/api').replace(/\/+$/, '');
 const IMG_DB_PATH = process.env.BLOG_DB_PATH || path.join(__dirname, '..', 'db', 'blog.db');
 
-function buildImagePrompt(style, category, topic) {
+function buildImagePrompt(style, category, sceneOverride) {
   const map = style.subjectByCategory || {};
-  const subject = map[category] || map.default || 'an electric car charging at a public charging station';
-  const topicLine = topic
-    ? ` O artigo é sobre "${topic}" — represente esse tema de forma visual e sutil (objetos, cenário, ação), mas NÃO escreva nenhum texto.`
-    : '';
-  const tpl = style.promptTemplate || '{style}, 16:9 aspect ratio. {subject}.{topic} {brandHint}. {negative}.';
-  let prompt = tpl
+  const subject = sceneOverride || map[category] || map.default || 'an electric car charging at a public charging station';
+  const tpl = style.promptTemplate || '{style}, 16:9 aspect ratio. {subject}. {brandHint}. {negative}.';
+  return tpl
     .replace('{style}', style.style || '')
     .replace('{subject}', subject)
     .replace('{brandHint}', style.brandHint || '')
     .replace('{negative}', style.negative || '');
-  prompt = prompt.includes('{topic}') ? prompt.replace('{topic}', topicLine) : prompt + topicLine;
-  return prompt;
+}
+
+// Turn a post title into a concrete, drawable illustration scene so the cover
+// reflects the actual topic (not the generic per-category subject). Returns null
+// on any problem; the caller then falls back to the category subject.
+function coverSceneFromTopic(topic) {
+  if (!topic) return null;
+  try {
+    const s = claude(`Para um artigo de blog intitulado "${topic}", descreva em UMA frase curta em inglês (máx 25 palavras) uma cena de ilustração CONCRETA e específica que represente o tema — com objetos e ação que remetam ao assunto, sempre incluindo um carro elétrico e uma estação de recarga pública. Responda só a cena, sem aspas e sem nenhum texto na imagem.`)
+      .trim()
+      .replace(/^["'\s]+|["'\s]+$/g, '');
+    return s && s.length > 12 && s.length < 400 && !s.includes('\n') ? s : null;
+  } catch {
+    return null;
+  }
 }
 
 // Generate a branded cover via the higgsfield CLI, optimize to webp, store the
@@ -259,7 +269,9 @@ async function generateCoverImage(slug, category, imageStyleJson, topic) {
     if (!style || !style.style) return null;
     const st = spawnSync(HIGGSFIELD_BIN, ['account', 'status'], { encoding: 'utf8' });
     if (st.status !== 0) { log('cover: higgsfield CLI unavailable/unauthed — skipping image'); return null; }
-    const prompt = buildImagePrompt(style, category, topic);
+    const scene = coverSceneFromTopic(topic);
+    if (scene) log(`cover scene: ${scene.slice(0, 90)}`);
+    const prompt = buildImagePrompt(style, category, scene);
     const r = spawnSync(HIGGSFIELD_BIN, ['generate', 'create', style.provider || 'recraft_v4_1',
       '--prompt', prompt, '--aspect_ratio', style.aspect_ratio || '16:9',
       '--resolution', style.resolution || '1k', '--model_type', style.model_type || 'standard',
