@@ -17,6 +17,7 @@
  *      (optional; called on autopublish).
  */
 const { spawnSync } = require('node:child_process');
+const path = require('node:path');
 
 const CLAUDE_BIN = process.env.CLAUDE_BIN || '/home/openclaw/.npm-global/bin/claude';
 const API = (process.env.BLOG_API_BASE_LOCAL || 'http://127.0.0.1:3300').replace(/\/+$/, '');
@@ -221,6 +222,60 @@ async function runRevise(slug) {
   log(`revised "${slug}" (editor approved=${verdict?.approved})`);
 }
 
+const HIGGSFIELD_BIN = process.env.HIGGSFIELD_BIN || '/usr/local/bin/higgsfield';
+const IMG_PUBLIC_BASE = (process.env.BLOG_PUBLIC_BASE || 'https://logs.turbostation.com.br/blog/api').replace(/\/+$/, '');
+const IMG_DB_PATH = process.env.BLOG_DB_PATH || path.join(__dirname, '..', 'db', 'blog.db');
+
+function buildImagePrompt(style, category) {
+  const map = style.subjectByCategory || {};
+  const subject = map[category] || map.default || 'an electric car charging at a public charging station';
+  const tpl = style.promptTemplate || '{style}, 16:9 aspect ratio. {subject}. {brandHint}. {negative}.';
+  return tpl
+    .replace('{style}', style.style || '')
+    .replace('{subject}', subject)
+    .replace('{brandHint}', style.brandHint || '')
+    .replace('{negative}', style.negative || '');
+}
+
+// Generate a branded cover via the higgsfield CLI, optimize to webp, store the
+// blob in blog.db, and return the public coverImage URL. Fail-soft: returns null
+// on any problem (CLI missing/unauthed, gen/download/encode/db error) so the post
+// is still created without a cover. No-ops when imageStyle is unset.
+async function generateCoverImage(slug, category, imageStyleJson) {
+  try {
+    if (!imageStyleJson) return null;
+    const style = JSON.parse(imageStyleJson);
+    if (!style || !style.style) return null;
+    const st = spawnSync(HIGGSFIELD_BIN, ['account', 'status'], { encoding: 'utf8' });
+    if (st.status !== 0) { log('cover: higgsfield CLI unavailable/unauthed — skipping image'); return null; }
+    const prompt = buildImagePrompt(style, category);
+    const r = spawnSync(HIGGSFIELD_BIN, ['generate', 'create', style.provider || 'recraft_v4_1',
+      '--prompt', prompt, '--aspect_ratio', style.aspect_ratio || '16:9',
+      '--resolution', style.resolution || '1k', '--model_type', style.model_type || 'standard',
+      '--wait', '--wait-timeout', '8m', '--json'], { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 });
+    if (r.status !== 0) { log('cover: generate failed:', (r.stderr || r.stdout || '').slice(0, 200)); return null; }
+    const url = (JSON.parse(r.stdout)[0] || {}).result_url;
+    if (!url) { log('cover: no result_url in CLI output'); return null; }
+    const dl = spawnSync('curl', ['-fsSL', url], { maxBuffer: 32 * 1024 * 1024 });
+    if (!dl.stdout || !dl.stdout.length) { log('cover: download failed'); return null; }
+    const sharp = require('sharp');
+    let q = 86, webp;
+    do { webp = await sharp(dl.stdout).resize({ width: 1344 }).webp({ quality: q }).toBuffer(); q -= 8; }
+    while (webp.length > 200 * 1024 && q > 40);
+    const hash = require('node:crypto').createHash('sha1').update(webp).digest('hex').slice(0, 8);
+    const key = slug + '-' + hash + '.webp';
+    const db = new (require('better-sqlite3'))(IMG_DB_PATH);
+    db.exec("CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, slug TEXT, contentType TEXT DEFAULT 'image/webp', bytes BLOB NOT NULL, createdAt TEXT NOT NULL);");
+    db.prepare('INSERT OR REPLACE INTO media (key, slug, contentType, bytes, createdAt) VALUES (?,?,?,?,?)')
+      .run(key, slug, 'image/webp', webp, new Date().toISOString());
+    db.prepare('DELETE FROM media WHERE slug = ? AND key != ?').run(slug, key);
+    db.close();
+    const cover = IMG_PUBLIC_BASE + '/media/' + key;
+    log('cover: ' + Math.round(webp.length / 1024) + 'KB -> ' + cover);
+    return cover;
+  } catch (e) { log('cover: error —', ((e && e.message) || e).toString().slice(0, 200)); return null; }
+}
+
 async function main() {
   if (!KEY) throw new Error('BLOG_API_KEY is required');
 
@@ -293,6 +348,7 @@ async function main() {
 
   if (DRY) { log('DRY run — would publish:', JSON.stringify({ slug, title, draft: post.draft, words: body.split(/\s+/).length })); return; }
 
+  post.coverImage = (await generateCoverImage(post.slug, post.category, cfg.imageStyle)) || undefined;
   await api('POST', '/posts', post);
   await api('POST', '/covered-topics', { topicKey: slugify(topic), title: topic, slug });
   await recordRun(cfg.autopublish ? 'published' : 'held', cfg.autopublish ? 'published' : 'draft_pending_review', slug);
@@ -303,4 +359,8 @@ async function main() {
   }
 }
 
-main().catch((e) => { log('ERROR:', e.message); recordRun('error', e.message.slice(0, 300)).finally(() => process.exit(1)); });
+module.exports = { generateCoverImage, buildImagePrompt };
+
+if (require.main === module) {
+  main().catch((e) => { log('ERROR:', e.message); recordRun('error', e.message.slice(0, 300)).finally(() => process.exit(1)); });
+}
