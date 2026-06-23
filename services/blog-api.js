@@ -87,6 +87,7 @@ function ensureColumn(table, col, type) {
 }
 ensureColumn('config', 'guidelines', 'TEXT'); // editable content principles ("nossas ideias")
 ensureColumn('posts', 'revisionFeedback', 'TEXT'); // operator considerations for a re-write
+ensureColumn('config', 'imageStyle', 'TEXT'); // JSON template for AI cover-image generation
 
 function rowToMeta(r) {
   return {
@@ -173,6 +174,7 @@ function configOut(c) {
     autopublish: c.autopublish === 1,
     disabledReason: c.disabledReason || null,
     guidelines: c.guidelines || '',
+    imageStyle: c.imageStyle || '',
     updatedBy: c.updatedBy || null,
     updatedAt: c.updatedAt || null,
   };
@@ -183,14 +185,15 @@ app.get('/config', (_req, res) => {
 });
 
 app.put('/config', (req, res) => {
-  const { enabled, autopublish, updatedBy, disabledReason, guidelines } = req.body || {};
+  const { enabled, autopublish, updatedBy, disabledReason, guidelines, imageStyle } = req.body || {};
   const now = new Date().toISOString();
   const cur = db.prepare('SELECT * FROM config WHERE id = 1').get();
-  db.prepare('UPDATE config SET enabled = ?, autopublish = ?, disabledReason = ?, guidelines = ?, updatedBy = ?, updatedAt = ? WHERE id = 1').run(
+  db.prepare('UPDATE config SET enabled = ?, autopublish = ?, disabledReason = ?, guidelines = ?, imageStyle = ?, updatedBy = ?, updatedAt = ? WHERE id = 1').run(
     typeof enabled === 'boolean' ? (enabled ? 1 : 0) : cur.enabled,
     typeof autopublish === 'boolean' ? (autopublish ? 1 : 0) : cur.autopublish,
     enabled === false ? (disabledReason || null) : null,
     typeof guidelines === 'string' ? guidelines : (cur.guidelines || null),
+    typeof imageStyle === 'string' ? imageStyle : (cur.imageStyle || null),
     updatedBy || cur.updatedBy || null,
     now,
   );
