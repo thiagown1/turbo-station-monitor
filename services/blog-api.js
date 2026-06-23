@@ -18,6 +18,8 @@
 const express = require('express');
 const Database = require('better-sqlite3');
 const path = require('path');
+const fs = require('node:fs');
+const { spawn } = require('node:child_process');
 
 const PORT = Number(process.env.BLOG_API_PORT || 3300);
 const API_KEY = (process.env.BLOG_API_KEY || '').trim();
@@ -70,6 +72,14 @@ db.exec(`
   INSERT OR IGNORE INTO config (id, enabled, autopublish, updatedAt)
     VALUES (1, 1, 0, datetime('now'));
 `);
+
+// Lightweight migrations for columns added after the initial schema.
+function ensureColumn(table, col, type) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+  if (!cols.includes(col)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+}
+ensureColumn('config', 'guidelines', 'TEXT'); // editable content principles ("nossas ideias")
+ensureColumn('posts', 'revisionFeedback', 'TEXT'); // operator considerations for a re-write
 
 function rowToMeta(r) {
   return {
@@ -132,27 +142,43 @@ app.get('/posts/:slug', (req, res) => {
 // ---- admin endpoints (dashboard via Next proxy, + the generator) ----
 app.get('/admin/posts', (_req, res) => {
   const rows = db.prepare('SELECT * FROM posts ORDER BY createdAt DESC').all();
-  res.json({ posts: rows.map((r) => ({ ...rowToPost(r), status: r.status })) });
+  res.json({ posts: rows.map((r) => ({ ...rowToPost(r), status: r.status, revisionFeedback: r.revisionFeedback || null })) });
 });
 
+app.get('/admin/posts/:slug', (req, res) => {
+  const row = db.prepare('SELECT * FROM posts WHERE slug = ?').get(req.params.slug);
+  if (!row) return res.status(404).json({ error: 'Not found' });
+  res.json({ ...rowToPost(row), status: row.status, revisionFeedback: row.revisionFeedback || null });
+});
+
+function configOut(c) {
+  return {
+    enabled: c.enabled === 1,
+    autopublish: c.autopublish === 1,
+    disabledReason: c.disabledReason || null,
+    guidelines: c.guidelines || '',
+    updatedBy: c.updatedBy || null,
+    updatedAt: c.updatedAt || null,
+  };
+}
+
 app.get('/config', (_req, res) => {
-  const c = db.prepare('SELECT * FROM config WHERE id = 1').get();
-  res.json({ enabled: c.enabled === 1, autopublish: c.autopublish === 1, disabledReason: c.disabledReason || null, updatedBy: c.updatedBy || null, updatedAt: c.updatedAt || null });
+  res.json(configOut(db.prepare('SELECT * FROM config WHERE id = 1').get()));
 });
 
 app.put('/config', (req, res) => {
-  const { enabled, autopublish, updatedBy, disabledReason } = req.body || {};
+  const { enabled, autopublish, updatedBy, disabledReason, guidelines } = req.body || {};
   const now = new Date().toISOString();
   const cur = db.prepare('SELECT * FROM config WHERE id = 1').get();
-  db.prepare('UPDATE config SET enabled = ?, autopublish = ?, disabledReason = ?, updatedBy = ?, updatedAt = ? WHERE id = 1').run(
+  db.prepare('UPDATE config SET enabled = ?, autopublish = ?, disabledReason = ?, guidelines = ?, updatedBy = ?, updatedAt = ? WHERE id = 1').run(
     typeof enabled === 'boolean' ? (enabled ? 1 : 0) : cur.enabled,
     typeof autopublish === 'boolean' ? (autopublish ? 1 : 0) : cur.autopublish,
     enabled === false ? (disabledReason || null) : null,
+    typeof guidelines === 'string' ? guidelines : (cur.guidelines || null),
     updatedBy || cur.updatedBy || null,
     now,
   );
-  const c = db.prepare('SELECT * FROM config WHERE id = 1').get();
-  res.json({ enabled: c.enabled === 1, autopublish: c.autopublish === 1, disabledReason: c.disabledReason || null, updatedBy: c.updatedBy, updatedAt: c.updatedAt });
+  res.json(configOut(db.prepare('SELECT * FROM config WHERE id = 1').get()));
 });
 
 // Create / upsert a post (used by the generator).
@@ -199,6 +225,30 @@ app.post('/posts/:slug/unpublish', (req, res) => {
   const now = new Date().toISOString();
   const r = db.prepare("UPDATE posts SET draft = 1, status = 'draft', updatedAt = ? WHERE slug = ?").run(now, req.params.slug);
   res.json({ ok: r.changes > 0 });
+});
+
+// Operator-requested revision: store the feedback and kick off the generator's
+// --revise mode in the background (the claude calls take ~1 min).
+app.post('/posts/:slug/revise', (req, res) => {
+  const slug = req.params.slug;
+  const feedback = req.body && typeof req.body.feedback === 'string' ? req.body.feedback : '';
+  const exists = db.prepare('SELECT slug FROM posts WHERE slug = ?').get(slug);
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+  db.prepare("UPDATE posts SET revisionFeedback = ?, status = 'revising', updatedAt = ? WHERE slug = ?")
+    .run(feedback, new Date().toISOString(), slug);
+  try {
+    const logFd = fs.openSync(path.join(__dirname, '..', 'logs', 'blog-revise.log'), 'a');
+    const child = spawn(process.execPath, ['services/blog-generator.js', '--revise', slug], {
+      cwd: path.join(__dirname, '..'),
+      detached: true,
+      stdio: ['ignore', logFd, logFd],
+      env: process.env,
+    });
+    child.unref();
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to start revision: ' + e.message });
+  }
+  res.json({ ok: true, status: 'revising' });
 });
 
 // Covered-topics ledger (generator dedup).

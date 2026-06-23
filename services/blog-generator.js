@@ -120,7 +120,13 @@ async function fetchDataMoat() {
   } catch { return null; }
 }
 
-function writerPrompt(topic, data) {
+function guidelinesBlock(guidelines, label) {
+  return guidelines && guidelines.trim()
+    ? `\n${label}:\n${guidelines.trim()}\n`
+    : '';
+}
+
+function writerPrompt(topic, data, guidelines) {
   const dataBlock = data
     ? `\nDADOS REAIS DA NOSSA REDE (use SOMENTE estes números se citar dados; cite a mediana e o tamanho da amostra):\n${JSON.stringify(data).slice(0, 4000)}\n`
     : '\n(Sem dados numéricos disponíveis — escreva um guia útil e preciso sem inventar estatísticas específicas.)\n';
@@ -135,7 +141,7 @@ Requisitos:
 - 600-900 palavras, headings H2/H3, listas quando útil, tom claro e confiável.
 - Inclua 1 link interno para /blog e 1 para o app/contato quando fizer sentido (markdown).
 - Termine com um resumo curto que reforce o valor da recarga pública/em destino.
-${dataBlock}
+${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (nossas ideias — siga à risca)')}${dataBlock}
 Responda APENAS com o arquivo markdown, começando EXATAMENTE com um bloco de frontmatter YAML:
 ---
 title: "<título atraente, < 60 caracteres se possível>"
@@ -146,12 +152,12 @@ tags: ["t1","t2","t3"]
 <corpo em markdown>`;
 }
 
-function editorPrompt(topic, markdown) {
+function editorPrompt(topic, markdown, guidelines) {
   return `Você é editor-chefe rigoroso da Turbo Station (rede de recarga PÚBLICA / em destino). Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
 Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso.
 Reprove TAMBÉM por desalinhamento com o negócio: se o post desencorajar ou depreciar a recarga pública/em destino, concluir que o carro elétrico só vale a pena carregando em casa, tratar recarga pública como mero "plano B", ou não posicionar o valor da recarga pública (e da Turbo Station) de forma natural. O post deve servir ao negócio da Turbo Station mantendo-se honesto e útil.
 Aprove apenas conteúdo realmente útil, preciso, publicável E alinhado ao negócio.
-
+${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA que o post DEVE respeitar (reprove se violar)')}
 Responda APENAS com JSON:
 {"approved": true|false, "reasons": ["..."], "fixes": ["..."]}
 
@@ -163,8 +169,67 @@ async function recordRun(status, reason, slug) {
   try { await api('POST', '/gen-runs', { day: new Date().toISOString().slice(0, 10), status, reason, slug }); } catch {}
 }
 
+function revisePrompt(post, feedback, guidelines) {
+  return `Você é redator da Turbo Station (rede de recarga PÚBLICA / em destino). Reescreva e MELHORE o artigo abaixo aplicando as considerações do revisor humano e as diretrizes da marca. Mantenha o que está bom; mude o que o feedback pede; preserve o foco em recarga pública/em destino.
+${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (siga à risca)')}
+CONSIDERAÇÕES DO REVISOR (prioridade máxima):
+${(feedback && feedback.trim()) || '(sem considerações específicas — melhore qualidade, clareza e alinhamento de negócio.)'}
+
+ARTIGO ATUAL (título: "${post.title}"):
+${(post.body || '').slice(0, 12000)}
+
+Responda APENAS com o markdown revisado, começando EXATAMENTE com o frontmatter YAML:
+---
+title: "<título>"
+description: "<meta description 120-155 caracteres>"
+category: "<categoria>"
+tags: ["t1","t2","t3"]
+---
+<corpo revisado em markdown>`;
+}
+
+async function runRevise(slug) {
+  const cfg = await api('GET', '/config');
+  const post = await api('GET', `/admin/posts/${encodeURIComponent(slug)}`);
+  log(`revising "${slug}"${post.revisionFeedback ? ' with operator feedback' : ''}`);
+
+  let markdown = claude(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
+  if (!markdown.startsWith('---')) markdown = claude(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
+  if (!markdown.startsWith('---')) {
+    log('revise: writer output invalid; leaving post as draft');
+    await api('POST', `/posts/${encodeURIComponent(slug)}/unpublish`).catch(() => {});
+    return;
+  }
+  const verdict = extractJson(claude(editorPrompt(post.title, markdown, cfg.guidelines)));
+  const { data: fm, body } = parseFrontmatter(markdown);
+  await api('POST', '/posts', {
+    slug, // keep the original slug so the revision replaces it in place
+    title: (fm.title || post.title).toString(),
+    description: (fm.description || post.description || '').toString(),
+    date: post.date || new Date().toISOString().slice(0, 10),
+    author: 'Equipe Turbo Station',
+    category: (fm.category || post.category || 'Guias').toString(),
+    tags: Array.isArray(fm.tags) ? fm.tags : post.tags || [],
+    body,
+    draft: true, // revisions land as draft for re-review
+    status: 'draft',
+    readingTime: readingTime(body),
+    generationModel: 'claude -p (revise)',
+    generationSources: post.generationSources || [],
+  });
+  await recordRun('revised', `editor_approved=${verdict?.approved}`, slug);
+  log(`revised "${slug}" (editor approved=${verdict?.approved})`);
+}
+
 async function main() {
   if (!KEY) throw new Error('BLOG_API_KEY is required');
+
+  const reviseIdx = process.argv.indexOf('--revise');
+  if (reviseIdx !== -1) {
+    const slug = process.argv[reviseIdx + 1];
+    if (!slug) throw new Error('--revise requires a slug');
+    return runRevise(slug);
+  }
 
   const cfg = await api('GET', '/config');
   if (!cfg.enabled) { log('disabled via config; skipping'); await recordRun('skipped', 'disabled'); return; }
@@ -192,10 +257,10 @@ async function main() {
   let verdict = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(`writing (attempt ${attempt})...`);
-    markdown = claude(writerPrompt(topic, data));
+    markdown = claude(writerPrompt(topic, data, cfg.guidelines));
     if (!markdown.startsWith('---')) { log('writer output missing frontmatter; retrying'); continue; }
     log('editor reviewing...');
-    verdict = extractJson(claude(editorPrompt(topic, markdown)));
+    verdict = extractJson(claude(editorPrompt(topic, markdown, cfg.guidelines)));
     if (verdict?.approved) break;
     log(`editor held: ${(verdict?.reasons || ['unparseable verdict']).join('; ')}`);
     verdict = verdict || { approved: false, reasons: ['unparseable verdict'] };
