@@ -124,15 +124,17 @@ function writerPrompt(topic, data) {
   const dataBlock = data
     ? `\nDADOS REAIS DA NOSSA REDE (use SOMENTE estes números se citar dados; cite a mediana e o tamanho da amostra):\n${JSON.stringify(data).slice(0, 4000)}\n`
     : '\n(Sem dados numéricos disponíveis — escreva um guia útil e preciso sem inventar estatísticas específicas.)\n';
-  return `Você é redator de conteúdo da Turbo Station, rede brasileira de estações de recarga para carros elétricos.
+  return `Você é redator de conteúdo da Turbo Station, uma REDE DE RECARGA PÚBLICA / EM DESTINO para carros elétricos no Brasil (estações em shoppings, condomínios, estacionamentos, rodovias). O conteúdo precisa ajudar o leitor E servir ao negócio da Turbo Station.
 Escreva um artigo de blog em português do Brasil sobre: "${topic}".
 
 Requisitos:
 - Útil, preciso e acionável para motoristas/empresas brasileiras. Foco em ajudar e gerar tráfego de busca.
+- ALINHAMENTO COM O NEGÓCIO (importante): trate recarga em casa e recarga pública/em destino como COMPLEMENTARES, nunca como concorrentes. NUNCA conclua que o carro elétrico "só vale a pena se carregar em casa", nem desencoraje a recarga pública. Destaque os cenários em que a recarga pública/em destino é essencial: viagens e estradas, quem mora em apartamento ou não tem tomada própria, recarga rápida (DC), recarregar enquanto faz compras/trabalha, frotas e condomínios. Posicione a conveniência e a confiança de autonomia que uma boa rede de recarga (como a Turbo Station) oferece. Cite a Turbo Station de forma natural quando fizer sentido.
+- Seja honesto e equilibrado (não engane nem omita fatos), mas com enquadramento favorável ao negócio.
 - NÃO invente leis, números, prazos ou estatísticas específicas. Se não tiver certeza de um número/lei, fale de forma geral.
 - 600-900 palavras, headings H2/H3, listas quando útil, tom claro e confiável.
 - Inclua 1 link interno para /blog e 1 para o app/contato quando fizer sentido (markdown).
-- Termine com um resumo curto.
+- Termine com um resumo curto que reforce o valor da recarga pública/em destino.
 ${dataBlock}
 Responda APENAS com o arquivo markdown, começando EXATAMENTE com um bloco de frontmatter YAML:
 ---
@@ -145,9 +147,10 @@ tags: ["t1","t2","t3"]
 }
 
 function editorPrompt(topic, markdown) {
-  return `Você é editor-chefe rigoroso. Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
+  return `Você é editor-chefe rigoroso da Turbo Station (rede de recarga PÚBLICA / em destino). Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
 Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso.
-Aprove apenas conteúdo realmente útil, preciso e publicável.
+Reprove TAMBÉM por desalinhamento com o negócio: se o post desencorajar ou depreciar a recarga pública/em destino, concluir que o carro elétrico só vale a pena carregando em casa, tratar recarga pública como mero "plano B", ou não posicionar o valor da recarga pública (e da Turbo Station) de forma natural. O post deve servir ao negócio da Turbo Station mantendo-se honesto e útil.
+Aprove apenas conteúdo realmente útil, preciso, publicável E alinhado ao negócio.
 
 Responda APENAS com JSON:
 {"approved": true|false, "reasons": ["..."], "fixes": ["..."]}
