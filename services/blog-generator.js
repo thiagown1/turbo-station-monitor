@@ -217,6 +217,7 @@ async function runRevise(slug) {
     category: (fm.category || post.category || 'Guias').toString(),
     tags: Array.isArray(fm.tags) ? fm.tags : post.tags || [],
     body,
+    coverImage: post.coverImage || null, // preserve the existing cover across a text revision
     draft: true, // revisions land as draft for re-review
     status: 'draft',
     readingTime: readingTime(body),
