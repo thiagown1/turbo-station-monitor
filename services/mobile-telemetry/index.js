@@ -38,12 +38,15 @@ app.use('/', require('./routes/health'));
 app.use('/api/telemetry/online-users', requireSecret, require('./routes/online-users'));
 app.use('/api/telemetry/heatmap-data', requireSecret, require('./routes/heatmap-data'));
 app.use('/api/telemetry/events', requireSecret, require('./routes/events'));
+app.use('/api/telemetry/funnel-counts', requireSecret, require('./routes/funnel-counts'));
 
 // Mobile app ingestion (auth temporarily disabled — see routes/ingest.js)
 app.use('/api/telemetry/mobile', require('./routes/ingest'));
 
 // User log dumps: POST is public (mobile submits), GET requires secret (admin queries)
 app.use('/api/telemetry/user-logs', require('./routes/user-logs'));
+
+app.use('/api/telemetry/health-summary', requireSecret, require('./routes/health-summary'));
 
 // ─── 404 Fallback ───────────────────────────────────────────────────────────────
 
