@@ -139,7 +139,7 @@ Requisitos:
 - Seja honesto e equilibrado (não engane nem omita fatos), mas com enquadramento favorável ao negócio.
 - NÃO invente leis, números, prazos ou estatísticas específicas. Se não tiver certeza de um número/lei, fale de forma geral.
 - 600-900 palavras, headings H2/H3, listas quando útil, tom claro e confiável.
-- Inclua 1 link interno para /blog e 1 para o app/contato quando fizer sentido (markdown).
+- Inclua links internos APENAS para rotas que existem de fato: /blog, a home / e o contato /#contato (âncora na home). NUNCA use /contato, /contact ou outras rotas inexistentes.
 - Termine com um resumo curto que reforce o valor da recarga pública/em destino.
 ${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (nossas ideias — siga à risca)')}${dataBlock}
 Responda APENAS com o arquivo markdown, começando EXATAMENTE com um bloco de frontmatter YAML:
@@ -154,7 +154,7 @@ tags: ["t1","t2","t3"]
 
 function editorPrompt(topic, markdown, guidelines) {
   return `Você é editor-chefe rigoroso da Turbo Station (rede de recarga PÚBLICA / em destino). Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
-Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso.
+Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso; ou usar links internos para rotas inexistentes (as únicas válidas são /, /blog e /#contato).
 Reprove TAMBÉM por desalinhamento com o negócio: se o post desencorajar ou depreciar a recarga pública/em destino, concluir que o carro elétrico só vale a pena carregando em casa, tratar recarga pública como mero "plano B", ou não posicionar o valor da recarga pública (e da Turbo Station) de forma natural. O post deve servir ao negócio da Turbo Station mantendo-se honesto e útil.
 Aprove apenas conteúdo realmente útil, preciso, publicável E alinhado ao negócio.
 ${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA que o post DEVE respeitar (reprove se violar)')}
