@@ -232,29 +232,34 @@ const HIGGSFIELD_BIN = process.env.HIGGSFIELD_BIN || '/usr/local/bin/higgsfield'
 const IMG_PUBLIC_BASE = (process.env.BLOG_PUBLIC_BASE || 'https://logs.turbostation.com.br/blog/api').replace(/\/+$/, '');
 const IMG_DB_PATH = process.env.BLOG_DB_PATH || path.join(__dirname, '..', 'db', 'blog.db');
 
-function buildImagePrompt(style, category) {
+function buildImagePrompt(style, category, topic) {
   const map = style.subjectByCategory || {};
   const subject = map[category] || map.default || 'an electric car charging at a public charging station';
-  const tpl = style.promptTemplate || '{style}, 16:9 aspect ratio. {subject}. {brandHint}. {negative}.';
-  return tpl
+  const topicLine = topic
+    ? ` O artigo é sobre "${topic}" — represente esse tema de forma visual e sutil (objetos, cenário, ação), mas NÃO escreva nenhum texto.`
+    : '';
+  const tpl = style.promptTemplate || '{style}, 16:9 aspect ratio. {subject}.{topic} {brandHint}. {negative}.';
+  let prompt = tpl
     .replace('{style}', style.style || '')
     .replace('{subject}', subject)
     .replace('{brandHint}', style.brandHint || '')
     .replace('{negative}', style.negative || '');
+  prompt = prompt.includes('{topic}') ? prompt.replace('{topic}', topicLine) : prompt + topicLine;
+  return prompt;
 }
 
 // Generate a branded cover via the higgsfield CLI, optimize to webp, store the
 // blob in blog.db, and return the public coverImage URL. Fail-soft: returns null
 // on any problem (CLI missing/unauthed, gen/download/encode/db error) so the post
 // is still created without a cover. No-ops when imageStyle is unset.
-async function generateCoverImage(slug, category, imageStyleJson) {
+async function generateCoverImage(slug, category, imageStyleJson, topic) {
   try {
     if (!imageStyleJson) return null;
     const style = JSON.parse(imageStyleJson);
     if (!style || !style.style) return null;
     const st = spawnSync(HIGGSFIELD_BIN, ['account', 'status'], { encoding: 'utf8' });
     if (st.status !== 0) { log('cover: higgsfield CLI unavailable/unauthed — skipping image'); return null; }
-    const prompt = buildImagePrompt(style, category);
+    const prompt = buildImagePrompt(style, category, topic);
     const r = spawnSync(HIGGSFIELD_BIN, ['generate', 'create', style.provider || 'recraft_v4_1',
       '--prompt', prompt, '--aspect_ratio', style.aspect_ratio || '16:9',
       '--resolution', style.resolution || '1k', '--model_type', style.model_type || 'standard',
@@ -288,7 +293,7 @@ async function runRegenCover(slug) {
   const cfg = await api('GET', '/config');
   const post = await api('GET', `/admin/posts/${encodeURIComponent(slug)}`);
   log(`regenerating cover for "${slug}"...`);
-  const cover = await generateCoverImage(slug, post.category || 'Guias', cfg.imageStyle);
+  const cover = await generateCoverImage(slug, post.category || 'Guias', cfg.imageStyle, post.title);
   if (!cover) { log('regen-cover: no cover produced (CLI unauthed or error)'); return; }
   await api('POST', '/posts', {
     slug,
@@ -390,7 +395,7 @@ async function main() {
 
   if (DRY) { log('DRY run — would publish:', JSON.stringify({ slug, title, draft: post.draft, words: body.split(/\s+/).length })); return; }
 
-  post.coverImage = (await generateCoverImage(post.slug, post.category, cfg.imageStyle)) || undefined;
+  post.coverImage = (await generateCoverImage(post.slug, post.category, cfg.imageStyle, post.title)) || undefined;
   await api('POST', '/posts', post);
   await api('POST', '/covered-topics', { topicKey: slugify(topic), title: topic, slug });
   await recordRun(cfg.autopublish ? 'published' : 'held', cfg.autopublish ? 'published' : 'draft_pending_review', slug);
