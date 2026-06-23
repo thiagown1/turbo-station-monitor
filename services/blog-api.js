@@ -69,6 +69,13 @@ db.exec(`
     slug TEXT,
     createdAt TEXT NOT NULL
   );
+  CREATE TABLE IF NOT EXISTS media (
+    key TEXT PRIMARY KEY,                 -- e.g. "<slug>.webp"
+    slug TEXT,                            -- owning post (for cleanup)
+    contentType TEXT DEFAULT 'image/webp',
+    bytes BLOB NOT NULL,
+    createdAt TEXT NOT NULL
+  );
   INSERT OR IGNORE INTO config (id, enabled, autopublish, updatedAt)
     VALUES (1, 1, 0, datetime('now'));
 `);
@@ -108,7 +115,7 @@ app.use(express.json({ limit: '2mb' }));
 
 // Constant-time-ish secret gate (skips /health).
 app.use((req, res, next) => {
-  if (req.path === '/health') return next();
+  if (req.path === '/health' || req.path.startsWith('/media/')) return next();
   const provided = (req.get('x-blog-api-key') || '').trim();
   if (!API_KEY || provided !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -117,6 +124,15 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ---- public cover images (no auth: loaded directly by end-user browsers) ----
+app.get('/media/:key', (req, res) => {
+  const row = db.prepare('SELECT contentType, bytes FROM media WHERE key = ?').get(req.params.key);
+  if (!row) return res.status(404).json({ error: 'not found' });
+  res.set('Content-Type', row.contentType || 'image/webp');
+  res.set('Cache-Control', 'public, max-age=31536000, immutable');
+  return res.send(row.bytes);
+});
 
 // ---- public-read endpoints (consumed by Next VpsApiBlogSource) ----
 app.get('/posts', (_req, res) => {
