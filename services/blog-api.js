@@ -270,6 +270,22 @@ app.post('/posts/:slug/revise', (req, res) => {
   res.json({ ok: true, status: 'revising' });
 });
 
+// Manually trigger a new-post generation ("I want a post now"). Spawns the
+// generator with --force (bypasses the daily idempotency + enabled gate).
+// Fire-and-forget; the new draft appears in the dashboard when it finishes.
+app.post('/generate', (_req, res) => {
+  try {
+    const logFd = fs.openSync(path.join(__dirname, '..', 'logs', 'blog-generate.log'), 'a');
+    const child = spawn(process.execPath, ['services/blog-generator.js', '--force'], {
+      cwd: path.join(__dirname, '..'), detached: true, stdio: ['ignore', logFd, logFd], env: process.env,
+    });
+    child.unref();
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to start generation: ' + e.message });
+  }
+  res.json({ ok: true, status: 'generating' });
+});
+
 // Covered-topics ledger (generator dedup).
 app.get('/covered-topics', (_req, res) => {
   res.json({ topics: db.prepare('SELECT * FROM covered_topics ORDER BY createdAt DESC').all() });

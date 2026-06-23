@@ -287,7 +287,7 @@ async function main() {
   }
 
   const cfg = await api('GET', '/config');
-  if (!cfg.enabled) { log('disabled via config; skipping'); await recordRun('skipped', 'disabled'); return; }
+  if (!cfg.enabled && !FORCE) { log('disabled via config; skipping'); await recordRun('skipped', 'disabled'); return; }
 
   const today = new Date().toISOString().slice(0, 10);
   if (!FORCE && !DRY) {
