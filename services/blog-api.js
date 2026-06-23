@@ -286,6 +286,25 @@ app.post('/generate', (_req, res) => {
   res.json({ ok: true, status: 'generating' });
 });
 
+// Regenerate ONLY the cover image for a post (operator "gerar outra capa").
+// Spawns the generator with --regen-cover; fire-and-forget. The new cover (fresh
+// versioned media key so caches bust) lands on the post when it finishes.
+app.post('/posts/:slug/regenerate-cover', (req, res) => {
+  const slug = req.params.slug;
+  const exists = db.prepare('SELECT slug FROM posts WHERE slug = ?').get(slug);
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+  try {
+    const logFd = fs.openSync(path.join(__dirname, '..', 'logs', 'blog-cover.log'), 'a');
+    const child = spawn(process.execPath, ['services/blog-generator.js', '--regen-cover', slug], {
+      cwd: path.join(__dirname, '..'), detached: true, stdio: ['ignore', logFd, logFd], env: process.env,
+    });
+    child.unref();
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to start cover regen: ' + e.message });
+  }
+  res.json({ ok: true, status: 'regenerating' });
+});
+
 // Covered-topics ledger (generator dedup).
 app.get('/covered-topics', (_req, res) => {
   res.json({ topics: db.prepare('SELECT * FROM covered_topics ORDER BY createdAt DESC').all() });

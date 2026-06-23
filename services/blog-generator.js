@@ -127,10 +127,14 @@ function guidelinesBlock(guidelines, label) {
     : '';
 }
 
-function writerPrompt(topic, data, guidelines) {
+function writerPrompt(topic, data, guidelines, related) {
   const dataBlock = data
     ? `\nDADOS REAIS DA NOSSA REDE (use SOMENTE estes números se citar dados; cite a mediana e o tamanho da amostra):\n${JSON.stringify(data).slice(0, 4000)}\n`
     : '\n(Sem dados numéricos disponíveis — escreva um guia útil e preciso sem inventar estatísticas específicas.)\n';
+  const relatedBlock = (Array.isArray(related) && related.length)
+    ? '\nPOSTS JÁ PUBLICADOS (linke 1-2 destes no corpo, se forem relacionados, no formato [titulo](/blog/slug); NÃO invente slugs):\n' +
+      related.slice(0, 20).map((p) => `- ${p.title} -> /blog/${p.slug}`).join('\n') + '\n'
+    : '';
   return `Você é redator de conteúdo da Turbo Station, uma REDE DE RECARGA PÚBLICA / EM DESTINO para carros elétricos no Brasil (estações em shoppings, condomínios, estacionamentos, rodovias). O conteúdo precisa ajudar o leitor E servir ao negócio da Turbo Station.
 Escreva um artigo de blog em português do Brasil sobre: "${topic}".
 
@@ -141,8 +145,9 @@ Requisitos:
 - NÃO invente leis, números, prazos ou estatísticas específicas. Se não tiver certeza de um número/lei, fale de forma geral.
 - 600-900 palavras, headings H2/H3, listas quando útil, tom claro e confiável.
 - Inclua links internos APENAS para rotas que existem de fato: /blog, a home / e o contato /#contato (âncora na home). NUNCA use /contato, /contact ou outras rotas inexistentes.
+- Se a lista de POSTS JÁ PUBLICADOS (abaixo) trouxer algo relacionado, linke 1-2 deles naturalmente no corpo, no formato [titulo](/blog/slug).
 - Termine com um resumo curto que reforce o valor da recarga pública/em destino.
-${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (nossas ideias — siga à risca)')}${dataBlock}
+${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (nossas ideias — siga à risca)')}${dataBlock}${relatedBlock}
 Responda APENAS com o arquivo markdown, começando EXATAMENTE com um bloco de frontmatter YAML:
 ---
 title: "<título atraente, < 60 caracteres se possível>"
@@ -276,6 +281,34 @@ async function generateCoverImage(slug, category, imageStyleJson) {
   } catch (e) { log('cover: error —', ((e && e.message) || e).toString().slice(0, 200)); return null; }
 }
 
+// Regenerate ONLY the cover for an existing post (operator "gerar outra capa"),
+// keeping the body/status. The new cover gets a fresh versioned key so caches bust.
+async function runRegenCover(slug) {
+  const cfg = await api('GET', '/config');
+  const post = await api('GET', `/admin/posts/${encodeURIComponent(slug)}`);
+  log(`regenerating cover for "${slug}"...`);
+  const cover = await generateCoverImage(slug, post.category || 'Guias', cfg.imageStyle);
+  if (!cover) { log('regen-cover: no cover produced (CLI unauthed or error)'); return; }
+  await api('POST', '/posts', {
+    slug,
+    title: post.title,
+    description: post.description || '',
+    date: post.date,
+    author: post.author || 'Equipe Turbo Station',
+    category: post.category || 'Guias',
+    tags: post.tags || [],
+    body: post.body || '',
+    coverImage: cover,
+    draft: post.draft,
+    status: post.status,
+    readingTime: post.readingTime || 1,
+    generationModel: post.generationModel || null,
+    generationSources: post.generationSources || [],
+  });
+  await recordRun('cover_regen', 'manual', slug);
+  log(`regenerated cover for "${slug}" -> ${cover}`);
+}
+
 async function main() {
   if (!KEY) throw new Error('BLOG_API_KEY is required');
 
@@ -284,6 +317,13 @@ async function main() {
     const slug = process.argv[reviseIdx + 1];
     if (!slug) throw new Error('--revise requires a slug');
     return runRevise(slug);
+  }
+
+  const regenIdx = process.argv.indexOf('--regen-cover');
+  if (regenIdx !== -1) {
+    const slug = process.argv[regenIdx + 1];
+    if (!slug) throw new Error('--regen-cover requires a slug');
+    return runRegenCover(slug);
   }
 
   const cfg = await api('GET', '/config');
@@ -305,14 +345,15 @@ async function main() {
   if (!topic) { log('backlog exhausted; nothing new to write'); await recordRun('skipped', 'backlog_exhausted'); return; }
 
   const data = await fetchDataMoat();
-  log(`topic: ${topic}${data ? ' (with network data)' : ''}`);
+  const related = await api('GET', '/posts').then((r) => (r.posts || []).map((p) => ({ slug: p.slug, title: p.title }))).catch(() => []);
+  log(`topic: ${topic}${data ? ' (with network data)' : ''}${related.length ? ` (+${related.length} related for internal links)` : ''}`);
 
   // Write -> review, one regen attempt.
   let markdown = null;
   let verdict = null;
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(`writing (attempt ${attempt})...`);
-    markdown = claude(writerPrompt(topic, data, cfg.guidelines));
+    markdown = claude(writerPrompt(topic, data, cfg.guidelines, related));
     if (!markdown.startsWith('---')) { log('writer output missing frontmatter; retrying'); continue; }
     log('editor reviewing...');
     verdict = extractJson(claude(editorPrompt(topic, markdown, cfg.guidelines)));
