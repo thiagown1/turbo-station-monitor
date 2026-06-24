@@ -306,6 +306,24 @@ app.post('/posts/:slug/regenerate-cover', (req, res) => {
   res.json({ ok: true, status: 'regenerating' });
 });
 
+// Rewrite a post's prose to sound human + strip em-dashes (operator "Humanizar").
+// Spawns the generator with --humanize; fire-and-forget, keeps status/cover.
+app.post('/posts/:slug/humanize', (req, res) => {
+  const slug = req.params.slug;
+  const exists = db.prepare('SELECT slug FROM posts WHERE slug = ?').get(slug);
+  if (!exists) return res.status(404).json({ error: 'Not found' });
+  try {
+    const logFd = fs.openSync(path.join(__dirname, '..', 'logs', 'blog-humanize.log'), 'a');
+    const child = spawn(process.execPath, ['services/blog-generator.js', '--humanize', slug], {
+      cwd: path.join(__dirname, '..'), detached: true, stdio: ['ignore', logFd, logFd], env: process.env,
+    });
+    child.unref();
+  } catch (e) {
+    return res.status(500).json({ error: 'failed to start humanize: ' + e.message });
+  }
+  res.json({ ok: true, status: 'humanizing' });
+});
+
 // List the cover-image history for a post (operator can re-select a previous one).
 app.get('/posts/:slug/covers', (req, res) => {
   const slug = req.params.slug;

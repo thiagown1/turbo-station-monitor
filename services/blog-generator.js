@@ -146,6 +146,8 @@ Requisitos:
 - 600-900 palavras, headings H2/H3, listas quando útil, tom claro e confiável.
 - Inclua links internos APENAS para rotas que existem de fato: /blog, a home / e o contato /#contato (âncora na home). NUNCA use /contato, /contact ou outras rotas inexistentes.
 - Se a lista de POSTS JÁ PUBLICADOS (abaixo) trouxer algo relacionado, linke 1-2 deles naturalmente no corpo, no formato [titulo](/blog/slug).
+- ESCREVA COMO HUMANO, NÃO COMO IA: varie o tamanho das frases (algumas bem curtas), evite simetria e listas perfeitas demais, evite clichês de IA ("no mundo de hoje", "é importante ressaltar", "em um mundo cada vez mais", "vale lembrar", "em resumo", abuso de advérbios). Tom direto e coloquial brasileiro.
+- NUNCA use travessão (o caractere — ou –). Use vírgula, parênteses, ponto, ou hífen comum (-), ou reescreva a frase.
 - Termine com um resumo curto que reforce o valor da recarga pública/em destino.
 ${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA (nossas ideias — siga à risca)')}${dataBlock}${relatedBlock}
 Responda APENAS com o arquivo markdown, começando EXATAMENTE com um bloco de frontmatter YAML:
@@ -160,7 +162,7 @@ tags: ["t1","t2","t3"]
 
 function editorPrompt(topic, markdown, guidelines) {
   return `Você é editor-chefe rigoroso da Turbo Station (rede de recarga PÚBLICA / em destino). Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
-Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso; ou usar links internos para rotas inexistentes (as únicas válidas são /, /blog e /#contato).
+Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~500 palavras; ou prometer algo enganoso; ou usar links internos para rotas inexistentes (as únicas válidas são /, /blog e /#contato); ou usar travessão (— ou –); ou soar como texto de IA (clichês genéricos, frases todas do mesmo tamanho, listas perfeitas demais).
 Reprove TAMBÉM por desalinhamento com o negócio: se o post desencorajar ou depreciar a recarga pública/em destino, concluir que o carro elétrico só vale a pena carregando em casa, tratar recarga pública como mero "plano B", ou não posicionar o valor da recarga pública (e da Turbo Station) de forma natural. O post deve servir ao negócio da Turbo Station mantendo-se honesto e útil.
 Aprove apenas conteúdo realmente útil, preciso, publicável E alinhado ao negócio.
 ${guidelinesBlock(guidelines, 'DIRETRIZES DA MARCA que o post DEVE respeitar (reprove se violar)')}
@@ -192,6 +194,54 @@ category: "<categoria>"
 tags: ["t1","t2","t3"]
 ---
 <corpo revisado em markdown>`;
+}
+
+// Replace any em/en dash with a plain spaced hyphen — safety net so no "—"
+// character survives even if the model leaves one.
+function stripDashes(s) {
+  return (s || '').replace(/\s*[—–]\s*/g, ' - ');
+}
+
+function humanizePrompt(post) {
+  return `Reescreva o CORPO do artigo abaixo para soar HUMANO e natural, NÃO como texto de IA. Mantenha EXATAMENTE o mesmo assunto, fatos, números, headings e os links internos em markdown. NÃO invente nada novo nem mude o tema.
+Regras:
+- Varie o tamanho das frases (algumas bem curtas). Tom direto e coloquial brasileiro, como um especialista explicando pra um amigo.
+- Tire clichês de IA ("no mundo de hoje", "é importante ressaltar", "em um mundo cada vez mais", "vale lembrar", "em resumo", "no entanto" repetido) e a simetria/listas perfeitas demais.
+- NUNCA use travessão (o caractere — ou –): troque por vírgula, parênteses, ponto ou hífen comum (-), ou reescreva.
+- Preserve o alinhamento de negócio (recarga pública/em destino como essencial; cite a Turbo Station de forma natural).
+Responda APENAS com o markdown do corpo revisado (sem frontmatter, sem aspas, sem cercas de código).
+
+TÍTULO: ${post.title}
+CORPO ATUAL:
+${(post.body || '').slice(0, 12000)}`;
+}
+
+// Rewrite an existing post's prose to sound human + strip em-dashes, in place
+// (keeps title/topic/cover/status). Operator-triggered "humanizar".
+async function runHumanize(slug) {
+  const post = await api('GET', `/admin/posts/${encodeURIComponent(slug)}`);
+  log(`humanizing "${slug}"...`);
+  let body = claude(humanizePrompt(post));
+  body = stripDashes((body || '').replace(/^```(?:markdown)?\s*|\s*```$/g, '').trim());
+  if (body.length < 200) { log('humanize: output too short, leaving post as-is'); return; }
+  await api('POST', '/posts', {
+    slug,
+    title: stripDashes(post.title),
+    description: stripDashes(post.description || ''),
+    date: post.date,
+    author: post.author || 'Equipe Turbo Station',
+    category: post.category || 'Guias',
+    tags: post.tags || [],
+    body,
+    coverImage: post.coverImage || null,
+    draft: post.draft,
+    status: post.status,
+    readingTime: readingTime(body),
+    generationModel: `${post.generationModel || 'claude -p'} (humanized)`,
+    generationSources: post.generationSources || [],
+  });
+  await recordRun('humanized', 'manual', slug);
+  log(`humanized "${slug}"`);
 }
 
 async function runRevise(slug) {
@@ -343,6 +393,13 @@ async function main() {
     const slug = process.argv[regenIdx + 1];
     if (!slug) throw new Error('--regen-cover requires a slug');
     return runRegenCover(slug);
+  }
+
+  const humanizeIdx = process.argv.indexOf('--humanize');
+  if (humanizeIdx !== -1) {
+    const slug = process.argv[humanizeIdx + 1];
+    if (!slug) throw new Error('--humanize requires a slug');
+    return runHumanize(slug);
   }
 
   const cfg = await api('GET', '/config');
