@@ -291,7 +291,8 @@ async function generateCoverImage(slug, category, imageStyleJson, topic) {
     db.exec("CREATE TABLE IF NOT EXISTS media (key TEXT PRIMARY KEY, slug TEXT, contentType TEXT DEFAULT 'image/webp', bytes BLOB NOT NULL, createdAt TEXT NOT NULL);");
     db.prepare('INSERT OR REPLACE INTO media (key, slug, contentType, bytes, createdAt) VALUES (?,?,?,?,?)')
       .run(key, slug, 'image/webp', webp, new Date().toISOString());
-    db.prepare('DELETE FROM media WHERE slug = ? AND key != ?').run(slug, key);
+    // Keep a short history (12 most recent) so the operator can re-select a previous cover.
+    db.prepare('DELETE FROM media WHERE slug = ? AND key NOT IN (SELECT key FROM media WHERE slug = ? ORDER BY createdAt DESC LIMIT 12)').run(slug, slug);
     db.close();
     const cover = IMG_PUBLIC_BASE + '/media/' + key;
     log('cover: ' + Math.round(webp.length / 1024) + 'KB -> ' + cover);

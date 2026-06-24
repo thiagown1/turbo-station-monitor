@@ -24,6 +24,7 @@ const { spawn } = require('node:child_process');
 const PORT = Number(process.env.BLOG_API_PORT || 3300);
 const API_KEY = (process.env.BLOG_API_KEY || '').trim();
 const DB_PATH = process.env.BLOG_DB_PATH || path.join(__dirname, '..', 'db', 'blog.db');
+const PUBLIC_BASE = (process.env.BLOG_PUBLIC_BASE || 'https://logs.turbostation.com.br/blog/api').replace(/\/+$/, '');
 
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
@@ -303,6 +304,34 @@ app.post('/posts/:slug/regenerate-cover', (req, res) => {
     return res.status(500).json({ error: 'failed to start cover regen: ' + e.message });
   }
   res.json({ ok: true, status: 'regenerating' });
+});
+
+// List the cover-image history for a post (operator can re-select a previous one).
+app.get('/posts/:slug/covers', (req, res) => {
+  const slug = req.params.slug;
+  const post = db.prepare('SELECT coverImage FROM posts WHERE slug = ?').get(slug);
+  if (!post) return res.status(404).json({ error: 'Not found' });
+  const rows = db.prepare('SELECT key, createdAt FROM media WHERE slug = ? ORDER BY createdAt DESC').all(slug);
+  const active = post.coverImage || '';
+  res.json({
+    covers: rows.map((r) => ({
+      key: r.key,
+      url: `${PUBLIC_BASE}/media/${r.key}`,
+      createdAt: r.createdAt,
+      active: active.endsWith('/' + r.key),
+    })),
+  });
+});
+
+// Set the active cover to a specific already-generated media key for this post.
+app.post('/posts/:slug/select-cover', (req, res) => {
+  const slug = req.params.slug;
+  const key = req.body && typeof req.body.key === 'string' ? req.body.key : '';
+  const media = db.prepare('SELECT key FROM media WHERE slug = ? AND key = ?').get(slug, key);
+  if (!media) return res.status(404).json({ error: 'cover not found for this post' });
+  const url = `${PUBLIC_BASE}/media/${key}`;
+  db.prepare('UPDATE posts SET coverImage = ?, updatedAt = ? WHERE slug = ?').run(url, new Date().toISOString(), slug);
+  res.json({ ok: true, coverImage: url });
 });
 
 // Covered-topics ledger (generator dedup).
