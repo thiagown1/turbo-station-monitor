@@ -18,6 +18,7 @@
  * See config/partner-alert-stations.json.example for the schema.
  *
  * Fault scenarios handled:
+ *   box_door_open      - physical cabinet door open (info=BoxDoorIsOpen or info=Door Open)
  *   secc_can_offline   - SECC CAN bus failure (often triggered by dual-connector load)
  *   connector_fault    - specific connector is faulted
  *   station_offline    - charger unavailable / no communication
@@ -93,6 +94,7 @@ function markSent(key) {
 // ─── Fault classification ─────────────────────────────────────────────────────
 
 const SCENARIO = {
+    BOX_DOOR_OPEN: 'box_door_open',
     SECC_CAN_OFFLINE: 'secc_can_offline',
     CONNECTOR_FAULT: 'connector_fault',
     STATION_OFFLINE: 'station_offline',
@@ -101,6 +103,9 @@ const SCENARIO = {
 
 function classifyFault(parsed, rawMessage) {
     const hay = [parsed.info || '', parsed.vendorError || '', rawMessage || ''].join(' ');
+    // BoxDoorOpen takes priority — physical safety issue
+    // AR chargers: info=BoxDoorIsOpen; TSAC/SINO chargers: info=Door Open (vendor_error=20)
+    if (/BoxDoorIsOpen|Door Open/i.test(parsed.info || '')) return SCENARIO.BOX_DOOR_OPEN;
     if (/secc.*(can|offline)|can.*offline/i.test(hay)) return SCENARIO.SECC_CAN_OFFLINE;
     if (parsed.connectorId != null && parsed.status === 'Faulted') return SCENARIO.CONNECTOR_FAULT;
     if (/unavailable|disconnected/i.test(hay)) return SCENARIO.STATION_OFFLINE;
@@ -121,19 +126,26 @@ function buildPartnerMessage(scenario, parsed, stationName, eventTs) {
     const connLabel = parsed.connectorId != null ? `Conector ${parsed.connectorId}` : 'conector';
 
     switch (scenario) {
+        case SCENARIO.BOX_DOOR_OPEN:
+            return [
+                `🚨 *Porta do carregador aberta — ${stationName}*`,
+                '',
+                `O sensor do carregador indicou que a porta do gabinete está aberta desde ${hora} (horário de Brasília).`,
+                '',
+                `Por favor, verifique o equipamento presencialmente. Pode ser manutenção em andamento, vandalismo ou a porta mal fechada.`,
+                '',
+                `Enquanto a porta estiver aberta, o carregador fica fora de operação por segurança.`,
+            ].join('\n');
+
         case SCENARIO.SECC_CAN_OFFLINE:
             return [
                 `⚡ *Carregador com instabilidade — ${stationName}*`,
                 '',
                 `Identificamos uma falha no *${connLabel}* do carregador às ${hora} (horário de Brasília).`,
                 '',
-                `Isso pode ocorrer quando dois veículos tentam carregar ao mesmo tempo e o sistema de gestão de energia enfrenta uma instabilidade.`,
+                `Isso pode ocorrer quando dois veículos tentam carregar ao mesmo tempo. Geralmente o carregador se recupera em alguns minutos.`,
                 '',
-                `Nossa equipe foi notificada e está acompanhando. Geralmente o carregador se recupera em alguns minutos.`,
-                '',
-                `Se o equipamento ainda mostrar erro após 15 minutos, nos avise.`,
-                '',
-                `📞 Suporte Turbo Station: suporte@turbostation.com.br`,
+                `Se o equipamento ainda mostrar erro após 15 minutos, avise para verificarmos presencialmente.`,
             ].join('\n');
 
         case SCENARIO.CONNECTOR_FAULT:
@@ -144,22 +156,20 @@ function buildPartnerMessage(scenario, parsed, stationName, eventTs) {
                 '',
                 `Usuários que tentarem iniciar uma sessão nesse conector receberão um aviso no aplicativo.`,
                 '',
-                `Nossa equipe técnica foi notificada e está verificando. Avisaremos assim que o equipamento estiver normalizado.`,
-                '',
-                `📞 Suporte Turbo Station: suporte@turbostation.com.br`,
+                `Nossa equipe técnica está verificando. Avisaremos assim que o equipamento estiver normalizado.`,
             ].join('\n');
 
         case SCENARIO.STATION_OFFLINE:
             return [
-                `⚡ *Carregador sem comunicação — ${stationName}*`,
+                `⚠️ *Carregador offline — ${stationName}*`,
                 '',
-                `O carregador está sem comunicação com nossa central desde ${hora} (horário de Brasília).`,
+                `O carregador perdeu comunicação com nossa central às ${hora} (horário de Brasília).`,
                 '',
-                `Possíveis causas: queda de energia, problema de rede ou falha temporária. Nossa equipe está verificando.`,
+                `*Ação necessária:* por favor, verifique presencialmente se:`,
+                `• O disjuntor do carregador está ligado`,
+                `• O roteador/internet do local está funcionando`,
                 '',
-                `Se possível, confirme se o carregador está energizado e se há alguma luz de alerta no equipamento.`,
-                '',
-                `📞 Suporte Turbo Station: suporte@turbostation.com.br`,
+                `Se estiver tudo ok e o carregador não voltar em 10 minutos, nos avise.`,
             ].join('\n');
 
         default: // generic_fault
@@ -168,9 +178,7 @@ function buildPartnerMessage(scenario, parsed, stationName, eventTs) {
                 '',
                 `O carregador (${connLabel}) apresentou uma falha às ${hora} (horário de Brasília).`,
                 '',
-                `Nossa equipe técnica foi notificada e está verificando. Avisaremos assim que o equipamento estiver normalizado.`,
-                '',
-                `📞 Suporte Turbo Station: suporte@turbostation.com.br`,
+                `Nossa equipe técnica está verificando. Avisaremos assim que o equipamento estiver normalizado.`,
             ].join('\n');
     }
 }
