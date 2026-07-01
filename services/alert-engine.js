@@ -124,6 +124,10 @@ class AlertEngine {
         this.vercelDb.pragma('journal_mode = WAL');
         this.mobileDb.pragma('journal_mode = WAL');
 
+        this.ocppDb.pragma('busy_timeout = 5000');
+        this.vercelDb.pragma('busy_timeout = 5000');
+        this.mobileDb.pragma('busy_timeout = 5000');
+
         // Alerts DB (write)
         this.alertsDb = new Database(ALERTS_DB_PATH);
         this.alertsDb.pragma('journal_mode = WAL'); // Better concurrent performance
