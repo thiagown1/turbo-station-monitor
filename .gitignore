@@ -35,6 +35,9 @@ PHASE4_COMPLETE.md
 PHASE4_HANDOFF.md
 PHASE4_QUICKREF.txt
 
+# ─── Partner alert config (gitignored — contains partner names/IDs) ───
+config/partner-alert-stations.json
+
 # ─── Environment ───
 .env
 .env.local

@@ -13,36 +13,8 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
-
-// --- OCPP fault parsing (added 2026-06-09) -------------------------------
-// The collector stores StatusNotification fault detail as free-text `message`
-// with meta=null, e.g.:
-//   STATUS_NOTIF ... charger=ME.. connector=1 status=Faulted error=OtherError, vendor_error=The emergency stop button was pressed
-// so the actual fault was invisible in alerts. Parse it back into fields.
-function parseStatusNotif(message) {
-    const out = { connectorId: null, status: null, error: null, info: null, vendorError: null };
-    if (!message) return out;
-    const conn = message.match(/connector[=:]?\s*(\d+)/i);
-    const status = message.match(/status[=:]?\s*([A-Za-z]+)/i);
-    const err = message.match(/(?:^|\s)error[=:]?\s*([^,]+?)(?:,|\s+info|\s+vendor_error|$)/i);
-    const info = message.match(/info[=:]?\s*([^,]+?)(?:,|\s+vendor_error|$)/i);
-    const vendor = message.match(/vendor_error[=:]?\s*(.+?)\s*$/i);
-    if (conn) out.connectorId = Number(conn[1]);
-    if (status) out.status = status[1];
-    if (err) out.error = err[1].trim();
-    if (info) out.info = info[1].trim();
-    if (vendor) out.vendorError = vendor[1].trim();
-    return out;
-}
-
-// True when a "fault" is really an operator pressing the physical e-stop button.
-// These have their own dedicated WhatsApp alert and are NOT charger failures,
-// so they must not escalate into critical "Charger + Backend" correlations.
-function isEmergencyStopFault(parsed, rawMessage) {
-    const hay = [(parsed && parsed.info) || '', (parsed && parsed.vendorError) || '', rawMessage || ''].join(' ');
-    // Matches 'EmergencyButtonPressed', 'EmergencyStop', and 'The emergency stop button was pressed'.
-    return /emergency/i.test(hay);
-}
+const { notifyPartnerFault } = require('./partner-fault-notifier');
+const { parseStatusNotif, isEmergencyStopFault } = require('./ocpp-utils');
 
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -681,6 +653,9 @@ class AlertEngine {
                 evidence_json: JSON.stringify(evidence),
                 event_ts: ev.timestamp,
                 timestamp: Date.now(),
+                // Pre-parsed fault fields forwarded to partner-fault-notifier to
+                // avoid re-parsing the StatusNotification message a second time.
+                parsed_fault: parsed,
             });
         }
 
@@ -1109,6 +1084,14 @@ class AlertEngine {
                     this.markAlertSent(alertId);
                 }
 
+                // Partner-facing notification for charger faults (fire-and-forget;
+                // failure here never blocks the internal alert path above).
+                if (alert.type === 'charger_fault') {
+                    notifyPartnerFault(alert).catch(e =>
+                        console.error('[partner-alert] error:', e && e.message)
+                    );
+                }
+
                 // Rate limit: 2 seconds between messages
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
@@ -1187,6 +1170,8 @@ if (require.main === module) {
 
 module.exports = AlertEngine;
 // Pure helpers exported for unit tests (causal-correlation gate + fault parsing).
+// parseStatusNotif / isEmergencyStopFault now live in ocpp-utils.js; re-exported
+// here for backwards compatibility with any existing test imports.
 module.exports.isCausalBackendError = isCausalBackendError;
 module.exports.endpointReferencesCharger = endpointReferencesCharger;
 module.exports.CHARGE_ACTION_ROUTE = CHARGE_ACTION_ROUTE;
