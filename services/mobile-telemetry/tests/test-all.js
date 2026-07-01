@@ -14,6 +14,10 @@ const request = require('supertest');
 const zlib = require('zlib');
 const { promisify } = require('util');
 const gzip = promisify(zlib.gzip);
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const Database = require('better-sqlite3');
 
 // ─── Test harness ───────────────────────────────────────────────────────────────
 
@@ -717,6 +721,92 @@ test('POST /api/telemetry/user-logs — auto-purges entries older than 3 days', 
     // Old entry should be gone
     const after = db.prepare('SELECT * FROM user_log_dumps WHERE user_id = ?').get(oldUserId);
     assert.ok(!after, 'Old entry should be purged after POST');
+});
+
+// ─── 3. Unit Tests: DB resilience (busy_timeout + health-summary reconnect) ─────
+//
+// Regression coverage for the 2026-05-28 "database is locked" and 2026-06-05
+// "cannot open vercel.db: directory does not exist" incidents.
+
+test('lib/db — mobile.db connection sets a non-zero busy_timeout', () => {
+    // Without this, a competing writer/reader on mobile.db (e.g. alert-engine's
+    // 2-minute tick) can trip SQLITE_BUSY immediately instead of retrying.
+    const [{ timeout }] = db.pragma('busy_timeout');
+    assert.ok(timeout > 0, `Expected busy_timeout > 0, got ${timeout}`);
+});
+
+test('health-summary — createLazyConnection returns null (not throw) when the directory does not exist', () => {
+    const { createLazyConnection } = require('../routes/health-summary');
+    const missingPath = path.join(os.tmpdir(), `hs-test-missing-${Date.now()}`, 'vercel.db');
+    const getConnection = createLazyConnection(missingPath, { retryIntervalMs: 0 });
+
+    assert.strictEqual(getConnection(), null);
+});
+
+test('health-summary — createLazyConnection self-heals once the db becomes available', () => {
+    const { createLazyConnection } = require('../routes/health-summary');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hs-test-'));
+    const dbPath = path.join(dir, 'vercel.db');
+    const getConnection = createLazyConnection(dbPath, { retryIntervalMs: 0 });
+
+    // First attempt: file doesn't exist yet (simulates booting before
+    // vercel-drain has created it) — should fail gracefully, not throw.
+    assert.strictEqual(getConnection(), null);
+
+    // Simulate vercel-drain creating the db after this process booted.
+    const seed = new Database(dbPath);
+    seed.exec('CREATE TABLE vercel_requests (endpoint TEXT, method TEXT, status_code INTEGER, last_ts INTEGER)');
+    seed.close();
+
+    // Next call retries (retryIntervalMs: 0 here) and should now connect.
+    const conn = getConnection();
+    assert.ok(conn, 'Expected connection to succeed once the db file exists');
+    conn.close();
+
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('health-summary — createLazyConnection throttles retries to at most once per interval', () => {
+    const { createLazyConnection } = require('../routes/health-summary');
+    const dir = path.join(os.tmpdir(), `hs-test-throttle-${Date.now()}`);
+    const dbPath = path.join(dir, 'vercel.db');
+    const getConnection = createLazyConnection(dbPath, { retryIntervalMs: 60_000 });
+
+    assert.strictEqual(getConnection(), null);
+
+    // The db becomes available inside the retry window — the very next call
+    // must not attempt to reconnect yet, so it should still report null.
+    fs.mkdirSync(dir, { recursive: true });
+    const seed = new Database(dbPath);
+    seed.exec('CREATE TABLE vercel_requests (endpoint TEXT, method TEXT, status_code INTEGER, last_ts INTEGER)');
+    seed.close();
+
+    assert.strictEqual(getConnection(), null, 'Should not retry before retryIntervalMs elapses');
+
+    fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('GET /api/telemetry/health-summary without secret → 401', async () => {
+    const res = await request(app).get('/api/telemetry/health-summary');
+    assert.strictEqual(res.status, 401);
+});
+
+test('GET /api/telemetry/health-summary with secret → 200 or graceful 503, never a crash', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/health-summary')
+        .set('X-Monitor-Secret', SECRET);
+
+    // The real vercel.db may or may not be reachable in every environment this
+    // suite runs in — either a working summary or a graceful 503 is fine.
+    // A 500/crash is the regression this guards against.
+    assert.ok([200, 503].includes(res.status), `Unexpected status ${res.status}`);
+    if (res.status === 200) {
+        assert.ok('statusMix' in res.body);
+        assert.ok(Array.isArray(res.body.endpoints));
+        assert.strictEqual(typeof res.body.windowMinutes, 'number');
+    } else {
+        assert.strictEqual(res.body.error, 'vercel.db unavailable');
+    }
 });
 
 // ─── Cleanup + Run ──────────────────────────────────────────────────────────────

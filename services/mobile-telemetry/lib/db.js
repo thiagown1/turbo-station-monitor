@@ -19,6 +19,7 @@ let db;
 try {
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
   console.log(`${LOG_TAG} Database connected: ${DB_PATH}`);
 } catch (err) {
   console.error(`${LOG_TAG} Failed to connect to database:`, err.message);
