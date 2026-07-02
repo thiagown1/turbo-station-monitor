@@ -26,6 +26,10 @@ const DATA_URL = (process.env.NEXT_BLOG_DATA_URL || '').trim();
 const REVALIDATE_URL = (process.env.NEXT_REVALIDATE_URL || '').trim();
 const DRY = process.argv.includes('--dry');
 const FORCE = process.argv.includes('--force');
+// Operator-supplied theme (dashboard "Gerar post agora" with a custom topic)
+// bypasses the BACKLOG picker entirely — see topic discovery in main().
+const topicFlagIdx = process.argv.indexOf('--topic');
+const CUSTOM_TOPIC = topicFlagIdx !== -1 ? (process.argv[topicFlagIdx + 1] || '').trim() : '';
 
 const log = (...a) => console.log(new Date().toISOString(), '[blog-gen]', ...a);
 
@@ -422,11 +426,16 @@ async function main() {
     }
   }
 
-  // Topic discovery: skip already-covered topics.
-  const { topics: covered } = await api('GET', '/covered-topics');
-  const coveredKeys = new Set(covered.map((t) => t.topicKey));
-  const topic = BACKLOG.find((t) => !coveredKeys.has(slugify(t)));
-  if (!topic) { log('backlog exhausted; nothing new to write'); await recordRun('skipped', 'backlog_exhausted'); return; }
+  // Topic discovery: an operator-supplied --topic bypasses the BACKLOG
+  // picker entirely. Otherwise pick the next uncovered BACKLOG entry, skipping
+  // already-covered topics.
+  let topic = CUSTOM_TOPIC;
+  if (!topic) {
+    const { topics: covered } = await api('GET', '/covered-topics');
+    const coveredKeys = new Set(covered.map((t) => t.topicKey));
+    topic = BACKLOG.find((t) => !coveredKeys.has(slugify(t)));
+    if (!topic) { log('backlog exhausted; nothing new to write'); await recordRun('skipped', 'backlog_exhausted'); return; }
+  }
 
   const data = await fetchDataMoat();
   const related = await api('GET', '/posts').then((r) => (r.posts || []).map((p) => ({ slug: p.slug, title: p.title }))).catch(() => []);
