@@ -41,6 +41,14 @@ const BACKLOG = [
   'Quanto tempo leva para carregar um carro elétrico',
   'Frota elétrica para empresas: economia, infraestrutura e gestão',
   'Como a regulação da ANEEL trata a recarga de veículos elétricos',
+  // Comparison/roundup topics: AI assistants (ChatGPT, Perplexity, Gemini)
+  // currently answer "melhor rede de recarga elétrica no Brasil"-shaped
+  // queries citing only competitors — Turbo Station has no content targeting
+  // that exact query shape. Factual, criteria-based framing (not competitor
+  // bashing) so it clears the adversarial editor pass below.
+  'Melhores redes de recarga para carro elétrico no Brasil: como comparar',
+  'O que considerar ao escolher uma rede de recarga para carro elétrico',
+  'Carregamento público vs. carregador em casa: qual escolher primeiro',
 ];
 
 function slugify(s) {
