@@ -146,6 +146,25 @@ const stmts = {
   `),
 
   /**
+   * Get each device's most recent presence location within the given
+   * cutoff. Unlike `onlineUsers` (fixed at PRESENCE_WINDOW_MS = "online
+   * right now"), the caller supplies the window — but the route always
+   * caps it at RECENT_LOCATIONS_MAX_WINDOW_MS (90 days), so this is
+   * bounded lookback, not a permanent location history. The caller applies
+   * its own recency *direction* (recent vs. lapsed) over `last_seen`.
+   * Powers geographic push-notification targeting ("opened the app near
+   * here"), which needs historical reach, not just live presence.
+   */
+  recentLocations: db.prepare(`
+    SELECT device_id, user_id, data_json, MAX(event_timestamp) AS last_seen
+    FROM mobile_events
+    WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
+      AND event_timestamp > ?
+    GROUP BY device_id
+    ORDER BY last_seen DESC
+  `),
+
+  /**
    * Heatmap queries with and without time filter.
    *
    * Deduplicated per (device_id, 5-minute bucket) to avoid inflation from

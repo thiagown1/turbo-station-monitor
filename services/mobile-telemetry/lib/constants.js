@@ -41,6 +41,16 @@ const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
  */
 const PRESENCE_WINDOW_MS = 90_000;
 
+/**
+ * Hard ceiling on how far back /api/telemetry/recent-locations will look.
+ * This endpoint returns raw per-user lat/lng behind a single shared secret
+ * (no per-caller auth) — capping the lookback bounds what a leaked secret
+ * exposes to "recent activity" rather than a user's permanent location
+ * history. 90 days matches the longest day-preset already exposed on the
+ * turbo_station dashboard's notification composer.
+ */
+const RECENT_LOCATIONS_MAX_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
 // ─── Heatmap ────────────────────────────────────────────────────────────────────
 
 /** Supported heatmap time periods → milliseconds. */
@@ -62,6 +72,7 @@ module.exports = {
     DB_PATH,
     MAX_PAYLOAD_BYTES,
     PRESENCE_WINDOW_MS,
+    RECENT_LOCATIONS_MAX_WINDOW_MS,
     PERIOD_MS,
     LOG_TAG,
 };
