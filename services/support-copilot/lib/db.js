@@ -149,6 +149,10 @@ safeAddColumn('conversations', 'pending_validation_code', 'TEXT DEFAULT NULL');
 // prepared statements below, which reference this column).
 safeAddColumn('conversations', 'phone_aliases', 'TEXT DEFAULT NULL');
 
+// Conversation tags: comma-separated list, set via PATCH /:id/tags
+// (routes/conversations.js) and auto-tag [TAGS:...] parsing (lib/copilot.js).
+safeAddColumn('conversations', 'tags', 'TEXT DEFAULT NULL');
+
 // Copilot settings — per-brand configuration for the AI assistant
 try {
   db.exec(`
