@@ -30,7 +30,6 @@ const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b36
 const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '1700081a5b367b04b35758df55a42b72d3c9ba65';
 const DB_PATH = path.join(__dirname, '..', 'db', 'vercel.db');
-const BATCH_SIZE = 100; // Batch DB writes for performance
 const MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB max
 
 // Stats tracking
@@ -47,6 +46,10 @@ let db;
 try {
   db = new Database(DB_PATH);
   db.pragma('journal_mode = WAL'); // Better concurrency
+  // Wait out brief write-lock contention (the nightly cleanup-vercel cron)
+  // instead of instantly throwing SQLITE_BUSY and dropping the batch. Repo
+  // standard (see services/mobile-telemetry/lib/db.js).
+  db.pragma('busy_timeout = 5000');
   console.log(`[vercel-drain] Database connected: ${DB_PATH}`);
 } catch (err) {
   console.error('[vercel-drain] Failed to connect to database:', err.message);
@@ -278,8 +281,8 @@ function parseVercelLog(line) {
  * Batch insert logs into SQLite
  */
 function insertLogs(logs) {
-  if (logs.length === 0) return;
-  
+  if (logs.length === 0) return true;
+
   try {
     const insert = db.transaction((logBatch) => {
       for (const log of logBatch) {
@@ -306,9 +309,15 @@ function insertLogs(logs) {
     
     insert(logs);
     stats.saved += logs.length;
+    return true;
   } catch (err) {
+    // Do NOT swallow. The transaction rolled back cleanly (nothing written), so
+    // the caller must surface this to Vercel as a non-2xx and let the drain
+    // redeliver — returning 200 here is exactly how the nightly lock window
+    // silently lost logs.
     console.error('[vercel-drain] Batch insert failed:', err.message);
     stats.errors++;
+    return false;
   }
 }
 
@@ -394,13 +403,23 @@ function handleRequest(req, res) {
         }
       }
       
-      // Batch insert into database
+      // Insert the WHOLE payload in ONE transaction (insertLogs wraps it), so a
+      // failure rolls back cleanly and we can 503 below -> Vercel redelivers the
+      // identical payload. Re-delivery is idempotent: vercel_logs uses
+      // INSERT OR IGNORE on a unique event_id, and a rolled-back attempt counted
+      // nothing in vercel_requests. (The old per-100-row chunking could
+      // partially commit, which would make a redelivery double-count.)
+      let insertOk = true;
       if (parsedLogs.length > 0) {
-        // Process in batches for better performance
-        for (let i = 0; i < parsedLogs.length; i += BATCH_SIZE) {
-          const batch = parsedLogs.slice(i, i + BATCH_SIZE);
-          insertLogs(batch);
-        }
+        insertOk = insertLogs(parsedLogs);
+      }
+
+      if (!insertOk) {
+        // 503 (not 200): the DB was transiently locked. Telling Vercel "failed"
+        // makes it retry with backoff instead of dropping the logs on the floor.
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Database temporarily unavailable, please retry' }));
+        return;
       }
       
       // Log stats periodically
