@@ -181,6 +181,29 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
       env: { ...dotenv }
+    },
+    {
+      // Nightly vercel.db maintenance: prune rows older than 14 days.
+      // cron_restart fires it once at 03:00 UTC; autorestart:false so it runs
+      // to completion and exits rather than being kept alive. This entry was
+      // MISSING from ecosystem before — the job was pm2-started ad hoc (~2026-07-01)
+      // and only lived in the pm2 dump, so `pm2 start ecosystem.config.js` on a
+      // fresh box would silently drop it. Pairs with the no-VACUUM / chunked-delete
+      // rewrite of scripts/cleanup-vercel.js (fixes the ~18min nightly ingest stall).
+      name: 'cleanup-vercel-db',
+      script: './scripts/cleanup-vercel.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '0 3 * * *',
+      watch: false,
+      max_memory_restart: '150M',
+      error_file: './logs/cleanup-vercel-db-error.log',
+      out_file: './logs/cleanup-vercel-db-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: { ...dotenv }
     }
   ]
 };
