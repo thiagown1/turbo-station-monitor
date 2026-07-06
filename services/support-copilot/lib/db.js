@@ -144,6 +144,11 @@ safeAddColumn('session_context', 'compaction_summary', 'TEXT DEFAULT NULL');
 safeAddColumn('conversations', 'pending_validation_phone', 'TEXT DEFAULT NULL');
 safeAddColumn('conversations', 'pending_validation_code', 'TEXT DEFAULT NULL');
 
+// LID <-> phone dedup: comma-separated list of alternate identifiers for the
+// same customer (must exist before the findConvByAlias/findDuplicateConv
+// prepared statements below, which reference this column).
+safeAddColumn('conversations', 'phone_aliases', 'TEXT DEFAULT NULL');
+
 // Copilot settings — per-brand configuration for the AI assistant
 try {
   db.exec(`
