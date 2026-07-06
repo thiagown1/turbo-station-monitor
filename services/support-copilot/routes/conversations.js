@@ -21,6 +21,7 @@ const { LOG_TAG, EVOLUTION_API_KEY } = require('../lib/constants');
 const { sendText, sendMedia } = require('../lib/evolution-client');
 const { emitEvent } = require('../lib/sse');
 const { generateSuggestion, injectIntoSession, buildContextPreview, compactSession, extractLearnedRule, removeSuggestionFromSession, resetAgentSession } = require('../lib/copilot');
+const { formatSuggestOutcome } = require('../lib/suggest-outcome');
 
 const router = Router();
 
@@ -701,16 +702,13 @@ router.post('/:id/suggest', async (req, res) => {
     
     const result = await generateSuggestion(conv, messages, { userData, tags });
 
-    // If copilot says no suggestion is needed (operator sent last msg, waiting for client)
-    if (result.waiting) {
-      console.log(`${LOG_TAG} No suggestion needed for conv ${conv.id} — waiting for client`);
-      return res.status(200).json({
-        id: null,
-        suggestion: null,
-        model: 'waiting',
-        waiting: true,
-        message: 'Aguardando resposta do cliente',
-      });
+    // If copilot says there's nothing to send — either waiting for the client
+    // (operator sent the last msg) or the conversation is over ([NO_REPLY],
+    // which also closes it server-side in generateSuggestion) — skip the insert.
+    const outcome = formatSuggestOutcome(result);
+    if (!outcome.shouldPersist) {
+      console.log(`${LOG_TAG} No suggestion needed for conv ${conv.id} (${outcome.response.model})`);
+      return res.status(200).json(outcome.response);
     }
 
     const now = nowIso();
