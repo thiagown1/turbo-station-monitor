@@ -20,8 +20,8 @@ router.post('/', (req, res) => {
 
   const normalizedPhone = normalizePhone(phone);
 
-  // Upsert conversation
-  const existing = stmts.findConvByPhone.get(brand_id, normalizedPhone);
+  // Upsert conversation (phone lookup is brand-agnostic — see lib/db.js findConvByPhone)
+  const existing = stmts.findConvByPhone.get(normalizedPhone);
   const now = nowIso();
   let conversationId;
   let created = false;
