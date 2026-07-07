@@ -8,7 +8,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const DB_PATH = path.join(__dirname, 'db', 'logs.db');
+const DB_PATH = path.join(__dirname, '..', 'db', 'logs.db');
 
 console.log('🧪 Testing Alert Engine...\n');
 
@@ -132,7 +132,7 @@ if (correlations.length > 0) {
 
 // Test the actual AlertEngine
 console.log('\n5️⃣ Testing AlertEngine class...');
-const AlertEngine = require('./alert-engine');
+const AlertEngine = require('../services/alert-engine');
 const engine = new AlertEngine();
 
 console.log('\n   Running detection queries...');

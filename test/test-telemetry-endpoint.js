@@ -12,7 +12,7 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const http = require('http');
 
-const DB_PATH = path.join(__dirname, 'db', 'logs.db');
+const DB_PATH = path.join(__dirname, '..', 'db', 'logs.db');
 const LIVE = process.argv.includes('--live');
 const PORT = 3001;
 const BASE_URL = `http://localhost:${PORT}`;
