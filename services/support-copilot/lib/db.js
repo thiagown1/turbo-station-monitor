@@ -153,6 +153,10 @@ safeAddColumn('conversations', 'phone_aliases', 'TEXT DEFAULT NULL');
 // (routes/conversations.js) and auto-tag [TAGS:...] parsing (lib/copilot.js).
 safeAddColumn('conversations', 'tags', 'TEXT DEFAULT NULL');
 
+// Message delivery status: pending/sent/failed, written by every outbound-send
+// call site (routes/conversations.js, routes/ingest-evolution.js).
+safeAddColumn('messages', 'delivery_status', 'TEXT DEFAULT NULL');
+
 // Copilot settings — per-brand configuration for the AI assistant
 try {
   db.exec(`

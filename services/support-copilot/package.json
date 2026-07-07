@@ -7,7 +7,7 @@
     "lib": "lib"
   },
   "scripts": {
-    "test": "node __tests__/db-fresh-schema.test.js && node __tests__/auto-respond-gate.test.js && node __tests__/auto-merge.test.js && node __tests__/outcome-prompt.test.js && node __tests__/outcome-stats.test.js && node scripts/bot-eval.cjs --gate-only",
+    "test": "node __tests__/db-fresh-schema.test.js && node __tests__/ingest-route.test.js && node __tests__/auto-respond-gate.test.js && node __tests__/auto-merge.test.js && node __tests__/outcome-prompt.test.js && node __tests__/outcome-stats.test.js && node scripts/bot-eval.cjs --gate-only",
     "eval": "node scripts/bot-eval.cjs",
     "eval:gate": "node scripts/bot-eval.cjs --gate-only",
     "eval:judge": "node scripts/bot-eval.cjs --judge"
