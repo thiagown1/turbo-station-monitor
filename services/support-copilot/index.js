@@ -35,6 +35,7 @@ app.use('/api/support', requireSecret, sseRouter);
 app.use('/api/support/conversations', requireSecret, require('./routes/conversations'));
 app.use('/api/support/settings', requireSecret, require('./routes/settings'));
 app.use('/api/support/shadow', requireSecret, require('./routes/shadow'));
+app.use('/api/support/outcomes', requireSecret, require('./routes/outcomes'));
 app.use('/api/support/groups', requireSecret, require('./routes/groups'));
 app.use('/api/support/actions', requireSecret, require('./routes/actions'));
 app.use('/api/support/test-runner', requireSecret, require('./routes/test-runner'));

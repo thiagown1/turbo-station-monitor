@@ -285,6 +285,31 @@ try {
   console.warn(`${LOG_TAG} copilot_knowledge_docs migration:`, err.message);
 }
 
+// Conversation outcomes — one row per close event, classifying how the
+// conversation ended (resolved by bot/operator, escalated, unresolved,
+// abandoned, spam) plus a root-cause + suggested fix for the non-resolved
+// ones. Feeds the "Desfechos" support metrics tab.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_outcomes (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      closed_by TEXT NOT NULL,
+      root_cause TEXT,
+      analysis TEXT,
+      suggestion TEXT,
+      model_name TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outcome_conv ON conversation_outcomes(conversation_id);');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outcome_brand_created ON conversation_outcomes(brand_id, created_at DESC);');
+} catch (err) {
+  console.warn(`${LOG_TAG} conversation_outcomes migration:`, err.message);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function nowIso() { return new Date().toISOString(); }
@@ -385,6 +410,15 @@ const stmts = {
        context_hash = excluded.context_hash,
        last_sent_at = excluded.last_sent_at,
        full_context_sent = excluded.full_context_sent`
+  ),
+  // Conversation outcomes
+  insertOutcome: db.prepare(
+    `INSERT INTO conversation_outcomes
+       (id, conversation_id, brand_id, outcome, closed_by, root_cause, analysis, suggestion, model_name, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ),
+  latestOutcomeForConv: db.prepare(
+    `SELECT * FROM conversation_outcomes WHERE conversation_id = ? ORDER BY datetime(created_at) DESC LIMIT 1`
   ),
 };
 
