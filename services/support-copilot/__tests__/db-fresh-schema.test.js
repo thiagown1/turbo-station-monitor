@@ -2,7 +2,7 @@
 /**
  * Fresh-schema migration test — Support Copilot
  *
- * Regression test: `lib/db.js` prepared statements (findConvByAlias,
+ * Regression test #1: `lib/db.js` prepared statements (findConvByAlias,
  * findConvByPhoneOrAlias, findDuplicateConv) reference conversations.phone_aliases,
  * but no safeAddColumn() migration ever added that column. Against a brand-new,
  * empty sqlite file (fresh dev machine, fresh CI runner, fresh worktree — no
@@ -11,6 +11,15 @@
  * crashed anything that loads it, including `npm test` itself. Production was
  * unaffected only because its DB already had the column from before this
  * migration list existed.
+ *
+ * Regression test #2: same root cause, different column. `routes/conversations.js`
+ * (PATCH /:id/tags) and `lib/copilot.js` (auto-tag persist from `[TAGS:...]`
+ * suggestions) both run `UPDATE conversations SET tags = ...`, but no
+ * safeAddColumn() migration ever added a `tags` column either. Against a fresh
+ * DB this threw `SQLite Error: no such column: tags` on every suggestion
+ * generation and every tag PATCH — silently, since both call sites wrap the
+ * UPDATE in try/catch + console.warn. Production was unaffected only because
+ * its DB already had the column from an earlier ad-hoc path.
  *
  * Runs lib/db.js in a child process against a throwaway DB path so this test
  * doesn't share the singleton `db` connection with the other test files.
@@ -86,6 +95,72 @@ test('conversations.phone_aliases column exists after a fresh load', () => {
         const cols = check.prepare("PRAGMA table_info('conversations')").all().map(r => r.name);
         if (!cols.includes('phone_aliases')) {
           throw new Error('phone_aliases column missing after fresh load: ' + cols.join(','));
+        }
+        `,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath },
+        encoding: 'utf8',
+      }
+    );
+  } finally {
+    cleanup(dbPath);
+  }
+});
+
+test('conversations.tags column exists after a fresh load', () => {
+  const dbPath = freshDbPath('tags-cols');
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '-e',
+        `
+        require('./lib/db.js');
+        const Database = require('better-sqlite3');
+        const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
+        const cols = check.prepare("PRAGMA table_info('conversations')").all().map(r => r.name);
+        if (!cols.includes('tags')) {
+          throw new Error('tags column missing after fresh load: ' + cols.join(','));
+        }
+        `,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath },
+        encoding: 'utf8',
+      }
+    );
+  } finally {
+    cleanup(dbPath);
+  }
+});
+
+test('UPDATE conversations SET tags = ... does not throw against a fresh load', () => {
+  const dbPath = freshDbPath('tags-update');
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '-e',
+        `
+        const { db, randomId, nowIso } = require('./lib/db.js');
+        const id = randomId('conv');
+        const now = nowIso();
+        db.prepare(
+          \`INSERT INTO conversations (id, brand_id, channel, status, created_at, updated_at)
+           VALUES (?, ?, 'whatsapp', 'open', ?, ?)\`
+        ).run(id, 'test-brand', now, now);
+        // Mirrors the UPDATE in routes/conversations.js (PATCH /:id/tags)
+        // and lib/copilot.js (auto-tag persist) — must not throw.
+        db.prepare('UPDATE conversations SET tags = ?, updated_at = ? WHERE id = ?')
+          .run('vip,recharge', nowIso(), id);
+        const row = db.prepare('SELECT tags FROM conversations WHERE id = ?').get(id);
+        if (row.tags !== 'vip,recharge') {
+          throw new Error('tags UPDATE did not persist: ' + JSON.stringify(row));
         }
         `,
       ],
