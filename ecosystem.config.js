@@ -204,6 +204,27 @@ module.exports = {
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
       env: { ...dotenv }
+    },
+    {
+      // Daily "ainda com problema / resolvido" digest to the alerts group,
+      // instead of hourly real-time noise all day. cron_restart fires it once
+      // at 12:00 UTC (09:00 BRT — the VPS runs on Etc/UTC, see `timedatectl`);
+      // autorestart:false so it runs to completion and exits like
+      // cleanup-vercel-db above.
+      name: 'daily-digest',
+      script: './scripts/daily-digest.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: false,
+      cron_restart: '0 12 * * *',
+      watch: false,
+      max_memory_restart: '100M',
+      error_file: './logs/daily-digest-error.log',
+      out_file: './logs/daily-digest-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: { ...dotenv }
     }
   ]
 };
