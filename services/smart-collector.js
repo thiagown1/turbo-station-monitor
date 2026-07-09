@@ -17,6 +17,7 @@ const REST_POLL_LIMIT = 500;
 // Raw retention (TTL)
 // NOTE: ocpp_raw grows fast; keep it short and rely on ocpp_events for long-term.
 const OCPP_RAW_TTL_HOURS = parseInt(process.env.OCPP_RAW_TTL_HOURS || '48', 10);
+const OCPP_EVENTS_TTL_DAYS = parseInt(process.env.OCPP_EVENTS_TTL_DAYS || '7', 10);
 const OCPP_RAW_TTL_CLEAN_INTERVAL_MS = 10 * 60 * 1000; // every 10 min
 
 const EVENTS_FILE = path.join(__dirname, '..', 'history/events_buffer.json');
@@ -687,14 +688,15 @@ function analyzeMessage(log) {
         };
     }
 
-    // Errors and Critical
+    // Errors and Critical — only alert if we can attribute it to a charger
     if (level === 'ERROR' || level === 'CRITICAL') {
+        const hasCharger = !!extractChargerId({ message: msg, logger: '' });
         return { 
             important: true, 
             category: 'error', 
             severity: level.toLowerCase(),
-            alert: true,
-            alertMessage: msg
+            alert: hasCharger,  // Only queue alert if charger ID is known
+            alertMessage: hasCharger ? msg : undefined
         };
     }
 
@@ -922,7 +924,19 @@ function startPeriodicTasks() {
                 console.log(`🧹 TTL: deleted ${res.changes} ocpp_raw rows older than ${OCPP_RAW_TTL_HOURS}h`);
             }
         } catch (e) {
-            console.error('TTL cleanup error:', e.message);
+            console.error('TTL cleanup error (raw):', e.message);
+        }
+
+        // TTL cleanup for ocpp_events
+        try {
+            const eventsTtlMs = OCPP_EVENTS_TTL_DAYS * 24 * 60 * 60 * 1000;
+            const eventsCutoff = Date.now() - eventsTtlMs;
+            const res2 = db.prepare('DELETE FROM ocpp_events WHERE timestamp < ?').run(eventsCutoff);
+            if (res2.changes > 0) {
+                console.log(`🧹 TTL: deleted ${res2.changes} ocpp_events rows older than ${OCPP_EVENTS_TTL_DAYS}d`);
+            }
+        } catch (e) {
+            console.error('TTL cleanup error (events):', e.message);
         }
     }, OCPP_RAW_TTL_CLEAN_INTERVAL_MS);
 

@@ -51,3 +51,33 @@ Thumbs.db
 *.swp
 *.swo
 *~
+# ─── auto-rollback watchdog (shadow mode) runtime state + kill-switch flags ───
+deploy-rollback-state.json
+auto-rollback.enabled
+auto-rollback.disabled
+logs/auto-rollback-decisions.log
+
+# --- VPS runtime state / secrets / backups — never commit (reconciled 2026-07-09) ---
+services/whatsapp-gateway/auth/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env.bak*
+*.bak-*
+**/.bak-*/
+data/
+db/
+state/
+tmp/
+.deploy-monitor-state.json
+.deploy_monitor_state.json
+.vercel_deploy_monitor_state.json
+.vercel_drain_monitor_state.json
+.deploy-hook-last-prod-sha
+ci-pending-wakes.json
+deploy-autowatch.state
+deploy-monitor-state.json
+deploy-monitor-state.txt
+deploy_monitor_state.json
+.cbmignore
+services/turbo-parking/
