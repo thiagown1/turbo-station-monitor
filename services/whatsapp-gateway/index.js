@@ -309,7 +309,10 @@ function autoStartExisting() {
 // ─── Express API ───────────────────────────────────────────────────────────
 
 const app = express();
-app.use(express.json());
+// 25mb: the report-PDF media POST is ~150KB+ of base64; Express's default 100KB
+// limit rejected it with PayloadTooLargeError, so the closing-report PDF failed
+// to send (the tiny text send was unaffected). nginx already allows 20M here.
+app.use(express.json({ limit: '25mb' }));
 
 // ── Health ──────────────────────────────────────────────────────────────
 
