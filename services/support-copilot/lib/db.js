@@ -157,6 +157,12 @@ safeAddColumn('conversations', 'tags', 'TEXT DEFAULT NULL');
 // call site (routes/conversations.js, routes/ingest-evolution.js).
 safeAddColumn('messages', 'delivery_status', 'TEXT DEFAULT NULL');
 
+// Media reference ({media_type, mimetype, url, filename, caption}), written by
+// routes/ingest-evolution.js and routes/conversations.js since the media
+// pipeline shipped — but the column only ever existed in prod via an ad-hoc
+// ALTER; fresh DBs lacked it (same class of gap as phone_aliases/tags above).
+safeAddColumn('messages', 'media_json', 'TEXT DEFAULT NULL');
+
 // Copilot settings — per-brand configuration for the AI assistant
 try {
   db.exec(`
@@ -316,6 +322,29 @@ try {
   db.exec('CREATE INDEX IF NOT EXISTS idx_outcome_brand_created ON conversation_outcomes(brand_id, created_at DESC);');
 } catch (err) {
   console.warn(`${LOG_TAG} conversation_outcomes migration:`, err.message);
+}
+
+// PIX receipt extractions — one row per media message the receipts endpoint
+// (routes/groups.js GET /receipts) has vision-read, so each file is read at
+// most once (plus capped retries on transient errors). Stores ONLY the
+// financial validation fields (amount in cents + transaction ref) — never
+// payer/payee names or any other receipt content (LGPD).
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS receipt_extractions (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      amount_cents INTEGER,
+      receipt_ref TEXT,
+      model TEXT,
+      attempts INTEGER NOT NULL DEFAULT 1,
+      extracted_at TEXT NOT NULL
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_receipt_extractions_conv ON receipt_extractions(conversation_id);');
+} catch (err) {
+  console.warn(`${LOG_TAG} receipt_extractions migration:`, err.message);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -214,6 +214,35 @@ test('messages.delivery_status column exists after a fresh load', () => {
   }
 });
 
+test('messages.media_json column exists after a fresh load', () => {
+  const dbPath = freshDbPath('media-json-cols');
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '-e',
+        `
+        require('./lib/db.js');
+        const Database = require('better-sqlite3');
+        const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
+        const cols = check.prepare("PRAGMA table_info('messages')").all().map(r => r.name);
+        if (!cols.includes('media_json')) {
+          throw new Error('media_json column missing after fresh load: ' + cols.join(','));
+        }
+        `,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath },
+        encoding: 'utf8',
+      }
+    );
+  } finally {
+    cleanup(dbPath);
+  }
+});
+
 test('INSERT/UPDATE messages.delivery_status does not throw against a fresh load', () => {
   const dbPath = freshDbPath('delivery-status-update');
 
