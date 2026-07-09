@@ -23,6 +23,29 @@ const CWD = __dirname;
 module.exports = {
   apps: [
     {
+      // SSE sidecar that tails the mo_simulator stdout (pm2 `mosim` log file)
+      // and serves it to the OCPP Simulator dashboard panel via nginx /sim-logs.
+      name: 'mosim-logtail',
+      script: './services/mosim-logtail/index.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '80M',
+      error_file: './logs/mosim-logtail-error.log',
+      out_file: './logs/mosim-logtail-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: {
+        ...dotenv,
+        LOGTAIL_HOST: dotenv.LOGTAIL_HOST || '127.0.0.1',
+        LOGTAIL_PORT: dotenv.LOGTAIL_PORT || 8090,
+        // Optional defense-in-depth behind nginx; matches the /sim X-API-Key.
+        LOGTAIL_API_KEY: dotenv.SIMULATOR_API_KEY || dotenv.LOGTAIL_API_KEY || '',
+      }
+    },
+    {
       name: 'ocpp-collector',
       script: './services/smart-collector.js',
       cwd: CWD,

@@ -12,6 +12,7 @@
  * Routes:
  *   GET  /health | /ping                   → liveness probe
  *   GET  /api/telemetry/online-users       → currently active users
+ *   GET  /api/telemetry/recent-locations   → last known location per device, any age
  *   GET  /api/telemetry/heatmap-data       → aggregated demand density
  *   GET  /api/telemetry/events             → per-event query (deploy-monitor/funnel)
  *   POST /api/telemetry/mobile             → event ingestion
@@ -36,6 +37,7 @@ app.use('/', require('./routes/health'));
 
 // Dashboard-facing routes (require shared secret)
 app.use('/api/telemetry/online-users', requireSecret, require('./routes/online-users'));
+app.use('/api/telemetry/recent-locations', requireSecret, require('./routes/recent-locations'));
 app.use('/api/telemetry/heatmap-data', requireSecret, require('./routes/heatmap-data'));
 app.use('/api/telemetry/events', requireSecret, require('./routes/events'));
 app.use('/api/telemetry/funnel-counts', requireSecret, require('./routes/funnel-counts'));
@@ -70,6 +72,7 @@ if (require.main === module) {
         console.log(`${LOG_TAG}   GET  /health`);
         console.log(`${LOG_TAG}   GET  /ping`);
         console.log(`${LOG_TAG}   GET  /api/telemetry/online-users`);
+        console.log(`${LOG_TAG}   GET  /api/telemetry/recent-locations`);
         console.log(`${LOG_TAG}   GET  /api/telemetry/heatmap-data`);
         console.log(`${LOG_TAG}   GET  /api/telemetry/events`);
         console.log(`${LOG_TAG}   POST /api/telemetry/mobile`);

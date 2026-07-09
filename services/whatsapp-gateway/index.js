@@ -259,7 +259,14 @@ async function startInstance(name) {
         },
         pushName: msg.pushName || null,
         message: msg.message || {},
-        messageType: Object.keys(msg.message || {})[0] || 'unknown',
+        // First message from each sender in a NEW group is bundled with a
+        // senderKeyDistributionMessage wrapper key; classify by the real
+        // content key so the copilot ingest does not skip it as a key-dist msg.
+        messageType: (() => {
+          const WRAPPER_KEYS = ['senderKeyDistributionMessage', 'messageContextInfo'];
+          const keys = Object.keys(msg.message || {});
+          return keys.find(k => !WRAPPER_KEYS.includes(k)) || keys[0] || 'unknown';
+        })(),
         messageTimestamp: typeof msg.messageTimestamp === 'number'
           ? msg.messageTimestamp
           : parseInt(msg.messageTimestamp?.toString() || '0', 10),
@@ -309,7 +316,7 @@ function autoStartExisting() {
 // ─── Express API ───────────────────────────────────────────────────────────
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 
 // ── Health ──────────────────────────────────────────────────────────────
 

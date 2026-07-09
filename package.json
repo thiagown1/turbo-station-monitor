@@ -1,6 +1,6 @@
 {
   "name": "turbo-station-monitor",
-  "version": "1.0.6",
+  "version": "1.0.15",
   "description": "Observability stack for Turbo Station — OCPP collector, mobile telemetry, Vercel drain, GitHub CI webhook, alert engine, and Pagarme status webhook",
   "private": true,
   "scripts": {
@@ -21,6 +21,7 @@
     "better-sqlite3": "^12.6.2",
     "express": "^5.2.1",
     "node-fetch": "^2.7.0",
+    "sharp": "^0.35.2",
     "ws": "^8.19.0"
   },
   "engines": {

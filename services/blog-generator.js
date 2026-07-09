@@ -202,6 +202,14 @@ function stripDashes(s) {
   return (s || '').replace(/\s*[—–]\s*/g, ' - ');
 }
 
+function sanitizeInternalLinks(markdown, related) {
+  const validSlugs = new Set((related || []).map((p) => p.slug));
+  return markdown.replace(/\[([^\]]+)\]\(\/blog\/([^)\s]+)\)/g, (match, text, slug) => {
+    return validSlugs.has(slug) ? match : text;
+  });
+}
+
+
 function humanizePrompt(post) {
   return `Reescreva o CORPO do artigo abaixo para soar HUMANO e natural, NÃO como texto de IA. Mantenha EXATAMENTE o mesmo assunto, fatos, números, headings e os links internos em markdown. NÃO invente nada novo nem mude o tema.
 Regras:
@@ -431,6 +439,7 @@ async function main() {
     log(`writing (attempt ${attempt})...`);
     markdown = claude(writerPrompt(topic, data, cfg.guidelines, related));
     if (!markdown.startsWith('---')) { log('writer output missing frontmatter; retrying'); continue; }
+    markdown = sanitizeInternalLinks(markdown, related);
     log('editor reviewing...');
     verdict = extractJson(claude(editorPrompt(topic, markdown, cfg.guidelines)));
     if (verdict?.approved) break;

@@ -521,10 +521,15 @@ function handleWebhook(req, res) {
         }
       }
 
-      // ── PR Label-based agent wake ──────────────────────────────
-      // When a PR gets labeled with "needs:test-review" or "needs:sec-review",
-      // instantly wake the corresponding agent to perform the review.
-      if (event === 'pull_request' && webhookEvent.action === 'labeled' && !isShortTrader) {
+      // ── PR Label-based agent wake — MIGRATED TO GITHUB ACTIONS ─
+      // Replaced by .github/workflows/agent-test-review.yml,
+      // agent-sec-review.yml, agent-coder.yml in turbo_station repo.
+      // The check_run from those workflows shows up in the PR sidebar so
+      // it's visible whether the reviewer agent has responded or stalled —
+      // something this webhook dispatch couldn't surface.
+      // Re-enable by flipping the `if (false &&` below back to its original
+      // condition.
+      if (false && event === 'pull_request' && webhookEvent.action === 'labeled' && !isShortTrader) {
         const addedLabel = payload.label?.name;
         const prNumber = webhookEvent.pr_number;
         const prTitle = webhookEvent.pr_title || '';
@@ -977,13 +982,19 @@ function handleWebhook(req, res) {
           });
         }
 
-        if (!isShortTrader) {
-          // ── Debounced CI wake ──────────────────────────────────────
+        if (false && !isShortTrader) {
+          // ── Debounced CI wake — MIGRATED TO GITHUB ACTIONS ─────────
+          // Replaced by .github/workflows/agent-coder.yml fix-ci job
+          // (workflow_run trigger filtered on conclusion == 'failure').
+          // Concurrency `group: agent-coder-<branch>, cancel-in-progress:
+          // false` provides equivalent debouncing — multiple failing
+          // workflows on the same branch queue one fix-ci run after the
+          // current one. Re-enable by flipping `if (false &&` above.
+          //
+          // Original comment for reference:
           // Instead of waking the coder immediately for each failing
           // workflow, buffer failures per branch and dispatch a single
-          // batched wake after CI_DEBOUNCE_MS (default 60s). This way
-          // if 3 checks fail from the same push, the coder gets ONE
-          // wake with all 3 failures listed.
+          // batched wake after CI_DEBOUNCE_MS (default 60s).
           const pending = readJsonFileOrDefault(CI_PENDING_PATH, {});
           const branchKey = `${webhookEvent.repository}:${webhookEvent.head_branch}`;
 

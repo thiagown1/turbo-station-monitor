@@ -155,6 +155,181 @@ test('GET /api/telemetry/online-users with valid secret → 200', async () => {
     assert.ok(Array.isArray(res.body.users));
 });
 
+// ── Recent Locations ────────────────────────────────────────────────────────────
+
+test('GET /api/telemetry/recent-locations without secret → 401', async () => {
+    const res = await request(app).get('/api/telemetry/recent-locations');
+    assert.strictEqual(res.status, 401);
+});
+
+test('GET /api/telemetry/recent-locations with valid secret → 200', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/recent-locations')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 200);
+    assert.ok(typeof res.body.count === 'number');
+    assert.ok(Array.isArray(res.body.users));
+});
+
+test('GET /api/telemetry/recent-locations includes a device outside the online-users presence window', async () => {
+    // Regression: online-users is bounded to PRESENCE_WINDOW_MS (90s) —
+    // recent-locations must NOT apply that bound, since it backs a "opened
+    // the app near here in the last N days" lookback, not "online right now".
+    const tag = 'recentloc-' + Date.now();
+    const staleTimestamp = Date.now() - 10 * 24 * 60 * 60 * 1000; // 10 days ago
+    const staleLat = -15.6 - (Date.now() % 1000) / 1e6;
+
+    stmts.insertEvent.run({
+        raw_id: null,
+        received_at: staleTimestamp,
+        event_timestamp: staleTimestamp,
+        session_id: `${tag}-s`,
+        device_id: `${tag}-d`,
+        app_version: '2.0.0-test',
+        platform: 'android',
+        user_id: `${tag}-u`,
+        event_type: 'app_presence_heartbeat',
+        station_id: null,
+        brand_id: null,
+        severity: null,
+        message: null,
+        data_json: JSON.stringify({ lat: staleLat, lng: -47.9 }),
+    });
+
+    // Confirms the exclusion: a 10-day-old heartbeat is well outside the 90s window.
+    const online = await request(app)
+        .get('/api/telemetry/online-users')
+        .set('X-Monitor-Secret', SECRET);
+    assert.ok(
+        !online.body.users.some((u) => u.device_id === `${tag}-d`),
+        'sanity check: stale device must NOT appear in online-users',
+    );
+
+    const recent = await request(app)
+        .get('/api/telemetry/recent-locations')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(recent.status, 200);
+    const found = recent.body.users.find((u) => u.device_id === `${tag}-d`);
+    assert.ok(found, 'stale device MUST appear in recent-locations (no time bound)');
+    assert.strictEqual(found.user_id, `${tag}-u`);
+    assert.strictEqual(found.lat, staleLat);
+    assert.strictEqual(found.lng, -47.9);
+    assert.strictEqual(found.last_seen, staleTimestamp);
+
+    db.prepare("DELETE FROM mobile_events WHERE device_id = ?").run(`${tag}-d`);
+});
+
+test('GET /api/telemetry/recent-locations returns only the latest row per device', async () => {
+    const tag = 'recentlocdedup-' + Date.now();
+    const older = Date.now() - 60_000;
+    const newer = Date.now();
+
+    for (const [ts, lat] of [[older, -15.1], [newer, -15.2]]) {
+        stmts.insertEvent.run({
+            raw_id: null,
+            received_at: ts,
+            event_timestamp: ts,
+            session_id: `${tag}-s-${ts}`,
+            device_id: `${tag}-d`,
+            app_version: '2.0.0-test',
+            platform: 'android',
+            user_id: `${tag}-u`,
+            event_type: 'app_presence_heartbeat',
+            station_id: null,
+            brand_id: null,
+            severity: null,
+            message: null,
+            data_json: JSON.stringify({ lat, lng: -47.9 }),
+        });
+    }
+
+    const res = await request(app)
+        .get('/api/telemetry/recent-locations')
+        .set('X-Monitor-Secret', SECRET);
+    const matches = res.body.users.filter((u) => u.device_id === `${tag}-d`);
+    assert.strictEqual(matches.length, 1, 'expected exactly one row (deduped) per device');
+    assert.strictEqual(matches[0].last_seen, newer);
+    assert.strictEqual(matches[0].lat, -15.2, 'should carry the location from the LATEST event, not an arbitrary one');
+
+    db.prepare("DELETE FROM mobile_events WHERE device_id = ?").run(`${tag}-d`);
+});
+
+test('GET /api/telemetry/recent-locations excludes a device older than the 90-day cap by default', async () => {
+    const tag = 'recentlocold-' + Date.now();
+    const ancientTimestamp = Date.now() - 120 * 24 * 60 * 60 * 1000; // 120 days ago
+
+    stmts.insertEvent.run({
+        raw_id: null,
+        received_at: ancientTimestamp,
+        event_timestamp: ancientTimestamp,
+        session_id: `${tag}-s`,
+        device_id: `${tag}-d`,
+        app_version: '2.0.0-test',
+        platform: 'android',
+        user_id: `${tag}-u`,
+        event_type: 'app_presence_heartbeat',
+        station_id: null,
+        brand_id: null,
+        severity: null,
+        message: null,
+        data_json: JSON.stringify({ lat: -15.7, lng: -47.9 }),
+    });
+
+    const res = await request(app)
+        .get('/api/telemetry/recent-locations')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 200);
+    assert.ok(
+        !res.body.users.some((u) => u.device_id === `${tag}-d`),
+        'a 120-day-old device must be excluded — beyond the default 90-day cap',
+    );
+
+    db.prepare("DELETE FROM mobile_events WHERE device_id = ?").run(`${tag}-d`);
+});
+
+test('GET /api/telemetry/recent-locations respects a caller-supplied maxAgeMs narrower than the cap', async () => {
+    const tag = 'recentlocnarrow-' + Date.now();
+    const tenDaysAgo = Date.now() - 10 * 24 * 60 * 60 * 1000;
+
+    stmts.insertEvent.run({
+        raw_id: null,
+        received_at: tenDaysAgo,
+        event_timestamp: tenDaysAgo,
+        session_id: `${tag}-s`,
+        device_id: `${tag}-d`,
+        app_version: '2.0.0-test',
+        platform: 'android',
+        user_id: `${tag}-u`,
+        event_type: 'app_presence_heartbeat',
+        station_id: null,
+        brand_id: null,
+        severity: null,
+        message: null,
+        data_json: JSON.stringify({ lat: -15.7, lng: -47.9 }),
+    });
+
+    const wideEnough = await request(app)
+        .get('/api/telemetry/recent-locations?maxAgeMs=' + (15 * 24 * 60 * 60 * 1000))
+        .set('X-Monitor-Secret', SECRET);
+    assert.ok(wideEnough.body.users.some((u) => u.device_id === `${tag}-d`), '15-day window should include a 10-day-old device');
+
+    const tooNarrow = await request(app)
+        .get('/api/telemetry/recent-locations?maxAgeMs=' + (5 * 24 * 60 * 60 * 1000))
+        .set('X-Monitor-Secret', SECRET);
+    assert.ok(!tooNarrow.body.users.some((u) => u.device_id === `${tag}-d`), '5-day window should exclude a 10-day-old device');
+    assert.strictEqual(tooNarrow.body.windowMs, 5 * 24 * 60 * 60 * 1000);
+
+    db.prepare("DELETE FROM mobile_events WHERE device_id = ?").run(`${tag}-d`);
+});
+
+test('GET /api/telemetry/recent-locations clamps a caller-supplied maxAgeMs above the 90-day cap', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/recent-locations?maxAgeMs=' + (365 * 24 * 60 * 60 * 1000))
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 200);
+    assert.strictEqual(res.body.windowMs, 90 * 24 * 60 * 60 * 1000, 'a 1-year request must clamp down to the 90-day cap');
+});
+
 // ── Heatmap Data ────────────────────────────────────────────────────────────────
 
 test('GET /api/telemetry/heatmap-data?period=24h → 200', async () => {

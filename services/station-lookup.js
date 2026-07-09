@@ -6,8 +6,31 @@
 
 const fs = require('fs');
 const path = require('path');
+const { spawn } = require('child_process');
 
 const STATIONS_MAP_FILE = path.join(__dirname, '..', 'history', 'stations-map.json');
+const UPDATER_SCRIPT = path.join(__dirname, '..', 'scripts', 'update-stations-map.js');
+
+// In-process throttle so a burst of lookups triggers at most one refresh per hour.
+let lastRefreshAttemptMs = 0;
+const REFRESH_THROTTLE_MS = 60 * 60 * 1000;
+
+/**
+ * Dispara a atualização do mapa em background (fire-and-forget).
+ * Nunca bloqueia o caminho do alerta; erros são ignorados de propósito.
+ */
+function triggerBackgroundRefresh() {
+  const now = Date.now();
+  if (now - lastRefreshAttemptMs < REFRESH_THROTTLE_MS) return;
+  lastRefreshAttemptMs = now;
+  try {
+    const child = spawn('node', [UPDATER_SCRIPT], { detached: true, stdio: 'ignore' });
+    child.on('error', () => {}); // ignore: refresh é best-effort
+    child.unref();
+  } catch (_) {
+    // ignore
+  }
+}
 
 /**
  * Busca informações de uma estação pelo ID
@@ -17,11 +40,17 @@ const STATIONS_MAP_FILE = path.join(__dirname, '..', 'history', 'stations-map.js
 function lookupStation(chargerId) {
   try {
     if (!fs.existsSync(STATIONS_MAP_FILE)) {
+      triggerBackgroundRefresh(); // mapa ausente: tenta popular para a próxima vez
       return null;
     }
 
+    // Mantém o arquivo fresco sem cron: refresh em background se >48h.
+    if (isStale()) {
+      triggerBackgroundRefresh();
+    }
+
     const data = JSON.parse(fs.readFileSync(STATIONS_MAP_FILE, 'utf-8'));
-    
+
     if (!data.stations || !data.stations[chargerId]) {
       return null;
     }
