@@ -83,6 +83,29 @@ const INGEST_STALL_OCPP_MS = 10 * 60 * 1000;
 const INGEST_STALL_VERCEL_MS = 10 * 60 * 1000;
 const INGEST_STALL_MOBILE_MS = 2 * 60 * 60 * 1000;
 
+// --- Escalating backoff for chronic charger faults (added 2026-07-07) -----
+// The flat 1h debounce re-alerts a charger stuck on the SAME fault forever.
+// One charger alone produced 165 of 306 alerts sent to the group in 7 days,
+// firing on the dot every hour non-stop — that's what trains people to stop
+// reading the channel. Back off the re-alert cadence the longer the same
+// charger+error persists; a chronic fault becomes a daily heartbeat instead
+// of an hourly ping. `afterStreak` is the number of PRIOR alerts already
+// sent for this key before the tier applies.
+const CHARGER_FAULT_BACKOFF_TIERS = [
+    { afterStreak: 0, windowMs: 60 * 60 * 1000 },       // alerts 1-3: hourly
+    { afterStreak: 3, windowMs: 6 * 60 * 60 * 1000 },   // alerts 4-8: every 6h
+    { afterStreak: 8, windowMs: 24 * 60 * 60 * 1000 },  // alerts 9+: daily
+];
+const CHARGER_FAULT_BACKOFF_FILE = path.join(__dirname, '..', 'history', 'charger_fault_backoff.json');
+
+function windowForStreak(streak) {
+    let win = CHARGER_FAULT_BACKOFF_TIERS[0].windowMs;
+    for (const tier of CHARGER_FAULT_BACKOFF_TIERS) {
+        if (streak >= tier.afterStreak) win = tier.windowMs;
+    }
+    return win;
+}
+
 class AlertEngine {
     constructor() {
         // Data DBs
@@ -106,6 +129,7 @@ class AlertEngine {
         this.initAlertsSchema();
 
         this.debounceCache = this.loadDebounceCache();
+        this.chargerFaultBackoff = this.loadChargerFaultBackoff();
 
         // NOTE: Startup replay disabled.
         // This process is meant to be long-running (interval loop). Replaying on restart caused
@@ -181,6 +205,78 @@ class AlertEngine {
         this.debounceCache[key] = now;
         this.saveDebounceCache();
         return true;
+    }
+
+    loadChargerFaultBackoff() {
+        try {
+            if (fs.existsSync(CHARGER_FAULT_BACKOFF_FILE)) {
+                return JSON.parse(fs.readFileSync(CHARGER_FAULT_BACKOFF_FILE, 'utf8'));
+            }
+        } catch (e) {
+            console.error('⚠️ Error loading charger fault backoff cache:', e.message);
+        }
+        return {};
+    }
+
+    saveChargerFaultBackoff() {
+        try {
+            fs.writeFileSync(CHARGER_FAULT_BACKOFF_FILE, JSON.stringify(this.chargerFaultBackoff, null, 2));
+        } catch (e) {
+            console.error('⚠️ Error saving charger fault backoff cache:', e.message);
+        }
+    }
+
+    /**
+     * Escalating debounce for repeat charger+error faults (see
+     * CHARGER_FAULT_BACKOFF_TIERS). Returns `false` to skip, or
+     * `{ streak, windowMs }` when the alert should send.
+     *
+     * A gap since the last alert bigger than 2x the window last used resets
+     * the streak — the charger likely recovered in between, so the next
+     * fault is treated as a fresh incident rather than the same chronic one.
+     */
+    shouldSendChargerFaultAlert(dedupeKey) {
+        const now = Date.now();
+        const state = this.chargerFaultBackoff[dedupeKey] || { lastSent: 0, streak: 0, lastWindow: 0 };
+
+        if (state.lastSent) {
+            const sinceLast = now - state.lastSent;
+            if (sinceLast < state.lastWindow) {
+                console.log(`🔇 Debounced (backoff): ${dedupeKey} (${Math.round(sinceLast / 60000)}m of ${Math.round(state.lastWindow / 60000)}m window)`);
+                return false;
+            }
+            if (sinceLast > 2 * state.lastWindow) {
+                console.log(`♻️ Backoff reset for ${dedupeKey} (${Math.round(sinceLast / 60000)}m gap — treating as a fresh incident)`);
+                state.streak = 0;
+            }
+        }
+
+        const windowMs = windowForStreak(state.streak);
+        const streak = state.streak + 1;
+        this.chargerFaultBackoff[dedupeKey] = { lastSent: now, streak, lastWindow: windowMs };
+        this.saveChargerFaultBackoff();
+        return { streak, windowMs };
+    }
+
+    /**
+     * Drop backoff entries untouched for >7 days (charger long recovered).
+     */
+    cleanupChargerFaultBackoff() {
+        const now = Date.now();
+        const weekMs = 7 * 24 * 60 * 60 * 1000;
+        let cleaned = 0;
+
+        Object.keys(this.chargerFaultBackoff).forEach(key => {
+            if (now - this.chargerFaultBackoff[key].lastSent > weekMs) {
+                delete this.chargerFaultBackoff[key];
+                cleaned++;
+            }
+        });
+
+        if (cleaned > 0) {
+            this.saveChargerFaultBackoff();
+            console.log(`🧹 Cleaned ${cleaned} old charger-fault backoff entries`);
+        }
     }
 
     /**
@@ -609,14 +705,16 @@ class AlertEngine {
             const parsed = parseStatusNotif(ev.message);
             if (isEmergencyStopFault(parsed, ev.message)) continue;
 
-            // One alert per charger+errorCode per run; shouldSendAlert adds the
-            // 1h debounce so a flapping charger doesn't spam.
+            // One alert per charger+errorCode per run; shouldSendChargerFaultAlert
+            // debounces with an escalating backoff so a chronic flapper doesn't
+            // spam hourly forever (see CHARGER_FAULT_BACKOFF_TIERS).
             const errKey = parsed.error || ev.event_type || 'fault';
             const dedupeKey = `${ev.charger_id}::${errKey}`;
             if (seen.has(dedupeKey)) continue;
             seen.add(dedupeKey);
 
-            if (!this.shouldSendAlert('charger_fault', dedupeKey)) continue;
+            const backoff = this.shouldSendChargerFaultAlert(dedupeKey);
+            if (!backoff) continue;
 
             // Evidence shaped like the correlation alert so formatAlertMessage's
             // OCPP-details block renders (it parses ocpp.event.message). No
@@ -656,6 +754,10 @@ class AlertEngine {
                 // Pre-parsed fault fields forwarded to partner-fault-notifier to
                 // avoid re-parsing the StatusNotification message a second time.
                 parsed_fault: parsed,
+                // Backoff bookkeeping surfaced in the message so it's clear WHY
+                // the cadence changed once it escalates past the first tier.
+                backoff_streak: backoff.streak,
+                backoff_window_ms: backoff.windowMs,
             });
         }
 
@@ -851,6 +953,12 @@ class AlertEngine {
                 break;
             case 'charger_fault':
                 msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
+                // Once the backoff has escalated past the first tier, say so —
+                // otherwise a 6h/24h-spaced alert reads like a brand new incident.
+                if (alert.backoff_streak > 3) {
+                    const hours = Math.round(alert.backoff_window_ms / (60 * 60 * 1000));
+                    msg += `\\n🔁 Falha persistente (alerta #${alert.backoff_streak} para este erro; próximos a cada ${hours}h enquanto não resolver)`;
+                }
                 break;
         }
 
@@ -1140,6 +1248,7 @@ async function main() {
         try {
             await engine.runDetection();
             engine.cleanupDebounceCache();
+            engine.cleanupChargerFaultBackoff();
         } catch (e) {
             console.error('❌ Fatal error in tick:', e && e.stack ? e.stack : e);
         }
@@ -1177,3 +1286,5 @@ module.exports.endpointReferencesCharger = endpointReferencesCharger;
 module.exports.CHARGE_ACTION_ROUTE = CHARGE_ACTION_ROUTE;
 module.exports.parseStatusNotif = parseStatusNotif;
 module.exports.isEmergencyStopFault = isEmergencyStopFault;
+module.exports.windowForStreak = windowForStreak;
+module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;

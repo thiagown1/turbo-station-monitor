@@ -21,6 +21,7 @@ const { LOG_TAG, EVOLUTION_API_KEY } = require('../lib/constants');
 const { sendText, sendMedia } = require('../lib/evolution-client');
 const { emitEvent } = require('../lib/sse');
 const { generateSuggestion, injectIntoSession, buildContextPreview, compactSession, extractLearnedRule, removeSuggestionFromSession, resetAgentSession } = require('../lib/copilot');
+const { classifyConversationOutcome } = require('../lib/outcome-classifier');
 
 const router = Router();
 
@@ -396,6 +397,25 @@ router.post('/:id/close', (req, res) => {
   compactSession(conv.id, conv.brand_id).catch(err => {
     console.error(`${LOG_TAG} compactSession error (non-blocking):`, err.message);
   });
+
+  // Fire-and-forget: classify how this conversation ended for support metrics.
+  // Skip staff/internal conversations — outcome tracking is for real customer support.
+  if (!conv.is_staff) {
+    const messages = stmts.listMessages.all(conv.id);
+    const tags = conv.tags ? conv.tags.split(',').filter(Boolean) : [];
+    if (messages.length > 0) {
+      // Respect the brand's configured (cheap) suggestion backend — same lookup
+      // generateSuggestion() does — so this doesn't fall back to the slow 'agent' default.
+      let customSettings = null;
+      try {
+        customSettings = db.prepare('SELECT suggestion_backend FROM copilot_settings WHERE brand_id = ?').get(conv.brand_id);
+      } catch (err) {
+        console.warn(`${LOG_TAG} Could not fetch copilot settings for outcome classification:`, err.message);
+      }
+      classifyConversationOutcome(conv, messages, { closedBy: 'operator', tags, customSettings })
+        .catch(err => console.warn(`${LOG_TAG} classifyConversationOutcome error (non-blocking):`, err.message));
+    }
+  }
 
   res.json({ ok: true });
 });

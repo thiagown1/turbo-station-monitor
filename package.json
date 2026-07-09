@@ -9,13 +9,16 @@
     "restart": "pm2 restart ecosystem.config.js",
     "status": "pm2 list",
     "logs": "pm2 logs",
-    "test": "node test-telemetry-endpoint.js && node test-alert-engine.js",
-    "test:telemetry": "node test-telemetry-endpoint.js",
-    "test:telemetry:live": "node test-telemetry-endpoint.js --live",
-    "test:alerts": "node test-alert-engine.js",
-    "db:create": "node create-db.js",
-    "db:backup": "node db-backup.js",
-    "maintenance": "node daily-maintenance.js"
+    "test": "node test/test-causal-correlation.js && node test/test-charger-fault-backoff.js",
+    "test:telemetry": "node test/test-telemetry-endpoint.js",
+    "test:telemetry:live": "node test/test-telemetry-endpoint.js --live",
+    "test:alerts": "node test/test-alert-engine.js",
+    "test:causal": "node test/test-causal-correlation.js",
+    "test:backoff": "node test/test-charger-fault-backoff.js",
+    "check:requires": "node scripts/ci/check-requires.js",
+    "db:create": "node scripts/create-db.js",
+    "db:backup": "node scripts/db-backup.js",
+    "maintenance": "node scripts/daily-maintenance.js"
   },
   "dependencies": {
     "better-sqlite3": "^12.6.2",

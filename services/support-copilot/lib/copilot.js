@@ -18,6 +18,7 @@ const path = require('path');
 const { LOG_TAG, DB_PATH } = require('./constants');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
+const { classifyConversationOutcome } = require('./outcome-classifier');
 
 // Cap message body length to avoid token waste on giant messages
 const MAX_MSG_BODY = 500;
@@ -971,6 +972,9 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
       } catch (err) {
         console.warn(`${LOG_TAG} Failed to close conversation:`, err.message);
       }
+      // Fire-and-forget: classify how this conversation ended for support metrics.
+      classifyConversationOutcome(conversation, messages, { closedBy: 'bot', tags: autoTags, customSettings })
+        .catch(err => console.warn(`${LOG_TAG} classifyConversationOutcome error (non-blocking):`, err.message));
       return { text: null, model: 'no_reply', noReply: true, tags: autoTags };
     }
 

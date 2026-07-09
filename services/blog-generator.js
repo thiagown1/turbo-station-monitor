@@ -26,6 +26,10 @@ const DATA_URL = (process.env.NEXT_BLOG_DATA_URL || '').trim();
 const REVALIDATE_URL = (process.env.NEXT_REVALIDATE_URL || '').trim();
 const DRY = process.argv.includes('--dry');
 const FORCE = process.argv.includes('--force');
+// Operator-supplied theme (dashboard "Gerar post agora" with a custom topic)
+// bypasses the BACKLOG picker entirely — see topic discovery in main().
+const topicFlagIdx = process.argv.indexOf('--topic');
+const CUSTOM_TOPIC = topicFlagIdx !== -1 ? (process.argv[topicFlagIdx + 1] || '').trim() : '';
 
 const log = (...a) => console.log(new Date().toISOString(), '[blog-gen]', ...a);
 
@@ -42,6 +46,14 @@ const BACKLOG = [
   'Quanto tempo leva para carregar um carro elétrico',
   'Frota elétrica para empresas: economia, infraestrutura e gestão',
   'Como a regulação da ANEEL trata a recarga de veículos elétricos',
+  // Comparison/roundup topics: AI assistants (ChatGPT, Perplexity, Gemini)
+  // currently answer "melhor rede de recarga elétrica no Brasil"-shaped
+  // queries citing only competitors — Turbo Station has no content targeting
+  // that exact query shape. Factual, criteria-based framing (not competitor
+  // bashing) so it clears the adversarial editor pass below.
+  'Melhores redes de recarga para carro elétrico no Brasil: como comparar',
+  'O que considerar ao escolher uma rede de recarga para carro elétrico',
+  'Carregamento público vs. carregador em casa: qual escolher primeiro',
 ];
 
 function slugify(s) {
@@ -422,11 +434,16 @@ async function main() {
     }
   }
 
-  // Topic discovery: skip already-covered topics.
-  const { topics: covered } = await api('GET', '/covered-topics');
-  const coveredKeys = new Set(covered.map((t) => t.topicKey));
-  const topic = BACKLOG.find((t) => !coveredKeys.has(slugify(t)));
-  if (!topic) { log('backlog exhausted; nothing new to write'); await recordRun('skipped', 'backlog_exhausted'); return; }
+  // Topic discovery: an operator-supplied --topic bypasses the BACKLOG
+  // picker entirely. Otherwise pick the next uncovered BACKLOG entry, skipping
+  // already-covered topics.
+  let topic = CUSTOM_TOPIC;
+  if (!topic) {
+    const { topics: covered } = await api('GET', '/covered-topics');
+    const coveredKeys = new Set(covered.map((t) => t.topicKey));
+    topic = BACKLOG.find((t) => !coveredKeys.has(slugify(t)));
+    if (!topic) { log('backlog exhausted; nothing new to write'); await recordRun('skipped', 'backlog_exhausted'); return; }
+  }
 
   const data = await fetchDataMoat();
   const related = await api('GET', '/posts').then((r) => (r.posts || []).map((p) => ({ slug: p.slug, title: p.title }))).catch(() => []);
