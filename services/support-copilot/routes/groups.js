@@ -11,10 +11,23 @@
  * @module routes/groups
  */
 const { Router } = require('express');
+const path = require('path');
 const { db, nowIso } = require('../lib/db');
+const { extractReceipt, MEDIA_DIR } = require('../lib/receipt-extractor');
 
 const router = Router();
 const LOG_TAG = '[support-copilot]';
+
+// GET /receipts tuning. The Next.js client (partner-receipts.ts) aborts at 30s,
+// so a single request extracts at most RECEIPTS_MAX_EXTRACTIONS new files inside
+// a hard time budget; anything left over is picked up by the next call (the
+// confirm cron runs daily and the dashboard button can be clicked again).
+const RECEIPTS_DEFAULT_SINCE_HOURS = 24 * 7;
+const RECEIPTS_MAX_SINCE_HOURS = 24 * 30;
+const RECEIPTS_MAX_CANDIDATES = 60;
+const RECEIPTS_MAX_EXTRACTIONS = 12;
+const RECEIPTS_TIME_BUDGET_MS = 20_000;
+const RECEIPTS_MAX_ERROR_ATTEMPTS = 3;
 
 /** Resolve a conversation id → its group conversation row (or null). */
 function groupConv(convId, req) {
@@ -67,6 +80,116 @@ router.get('/by-partner', (req, res) => {
     : db.prepare('SELECT conversation_id, enabled FROM group_partner_links WHERE partner_id = ? ORDER BY updated_at DESC LIMIT 1').get(partnerId);
   if (!row) return res.status(404).json({ error: 'no linked group for partner' });
   res.json({ conversationId: row.conversation_id, enabled: !!row.enabled });
+});
+
+// GET recent PIX receipts posted in the partner's linked group(s). Consumed by
+// the Next.js confirm-partner-payments cron / dashboard button via
+// next/lib/services/partner-receipts.ts. Vision extraction runs HERE (the file
+// and any payer/payee names never leave this box — LGPD); the response carries
+// ONLY { amountCents, receiptRef, sourceMessageId, at }. Registered BEFORE the
+// /:convId routes so "receipts" is not swallowed by the convId param.
+router.get('/receipts', async (req, res) => {
+  try {
+    const { partnerId, brandId } = req.query || {};
+    if (!partnerId) return res.status(400).json({ error: 'partnerId is required' });
+    let sinceHours = parseInt(req.query.sinceHours, 10);
+    if (!Number.isFinite(sinceHours) || sinceHours <= 0) sinceHours = RECEIPTS_DEFAULT_SINCE_HOURS;
+    sinceHours = Math.min(sinceHours, RECEIPTS_MAX_SINCE_HOURS);
+
+    let links = brandId
+      ? db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND brand_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId, brandId)
+      : db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId);
+    // Tenant guard (same convention as groupConv): the dashboard proxy forwards
+    // x-brand-id; cross-brand access reads as 404 (no existence leak).
+    const reqBrand = req.headers['x-brand-id'] || '';
+    if (reqBrand) links = links.filter((l) => !l.brand_id || l.brand_id === reqBrand);
+    if (!links.length) return res.status(404).json({ error: 'no linked group for partner' });
+
+    const sinceIso = new Date(Date.now() - sinceHours * 3600 * 1000).toISOString();
+    const convIds = [...new Set(links.map((l) => l.conversation_id).filter(Boolean))];
+
+    // Inbound only: partners/operators post the comprovante from their own
+    // numbers; our outbound PDFs (closing reports) are not receipts.
+    const candidates = [];
+    for (const convId of convIds) {
+      const rows = db.prepare(
+        `SELECT id, conversation_id, external_message_id, media_json, created_at FROM messages
+         WHERE conversation_id = ? AND direction = 'inbound' AND media_json IS NOT NULL
+           AND datetime(created_at) > datetime(?)
+         ORDER BY datetime(created_at) DESC LIMIT ?`
+      ).all(convId, sinceIso, RECEIPTS_MAX_CANDIDATES);
+      for (const row of rows) {
+        let media = null;
+        try { media = JSON.parse(row.media_json); } catch { continue; }
+        if (!media || typeof media.url !== 'string') continue;
+        if (media.media_type !== 'image' && media.media_type !== 'document') continue;
+        candidates.push({ row, media });
+      }
+    }
+
+    const getCached = db.prepare('SELECT * FROM receipt_extractions WHERE message_id = ?');
+    const upsertCache = db.prepare(`
+      INSERT INTO receipt_extractions
+        (message_id, conversation_id, status, amount_cents, receipt_ref, model, attempts, extracted_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET
+        status = excluded.status,
+        amount_cents = excluded.amount_cents,
+        receipt_ref = excluded.receipt_ref,
+        model = excluded.model,
+        attempts = excluded.attempts,
+        extracted_at = excluded.extracted_at
+    `);
+
+    const started = Date.now();
+    let extractedNow = 0;
+    let pendingExtraction = 0;
+    const receipts = [];
+    for (const { row, media } of candidates) {
+      let cached = getCached.get(row.id);
+      const retriable = cached && cached.status === 'error' && cached.attempts < RECEIPTS_MAX_ERROR_ATTEMPTS;
+      if (!cached || retriable) {
+        if (extractedNow >= RECEIPTS_MAX_EXTRACTIONS || Date.now() - started > RECEIPTS_TIME_BUDGET_MS) {
+          pendingExtraction++;
+          continue;
+        }
+        // basename() so a hostile media_json url can't traverse out of MEDIA_DIR.
+        const filePath = path.join(MEDIA_DIR, path.basename(media.url));
+        const result = await extractReceipt(filePath, media.media_type, media.mimetype || '');
+        extractedNow++;
+        if (result.reason === 'no_api_key') {
+          // Misconfig, not a per-file failure — don't burn retry attempts on it.
+          pendingExtraction++;
+          continue;
+        }
+        upsertCache.run(
+          row.id, row.conversation_id, result.status,
+          result.amountCents ?? null, result.receiptRef ?? null, result.model ?? null,
+          (cached ? cached.attempts : 0) + 1, nowIso(),
+        );
+        cached = getCached.get(row.id);
+      }
+      if (cached && cached.status === 'ok' && Number.isFinite(cached.amount_cents)) {
+        receipts.push({
+          amountCents: cached.amount_cents,
+          receiptRef: cached.receipt_ref || undefined,
+          // The WhatsApp message id when we have it (stable across reingest);
+          // this is the confirm idempotency anchor on the Next.js side.
+          sourceMessageId: row.external_message_id || row.id,
+          at: row.created_at,
+        });
+      }
+    }
+
+    console.log(
+      `${LOG_TAG} receipts partner=${partnerId} groups=${convIds.length} scanned=${candidates.length} ` +
+      `receipts=${receipts.length} extractedNow=${extractedNow} pending=${pendingExtraction}`,
+    );
+    res.json({ receipts, scanned: candidates.length, extractedNow, pendingExtraction });
+  } catch (err) {
+    console.error(`${LOG_TAG} receipts endpoint failed:`, err.message);
+    res.status(500).json({ error: 'receipts lookup failed' });
+  }
 });
 
 // GET participants captured for a group
