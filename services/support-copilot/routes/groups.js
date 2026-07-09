@@ -157,8 +157,10 @@ router.get('/receipts', async (req, res) => {
         const filePath = path.join(MEDIA_DIR, path.basename(media.url));
         const result = await extractReceipt(filePath, media.media_type, media.mimetype || '');
         extractedNow++;
-        if (result.reason === 'no_api_key') {
-          // Misconfig, not a per-file failure — don't burn retry attempts on it.
+        if (result.environmental) {
+          // Missing key / key over limit / rate limit — an environment problem,
+          // not a per-file failure. Don't burn the file's retry attempts on it,
+          // so receipts posted during an outage are still picked up afterwards.
           pendingExtraction++;
           continue;
         }

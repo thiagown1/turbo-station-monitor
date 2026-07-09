@@ -107,17 +107,19 @@ function imageMime(absPath, mimetype) {
  * @param {string} mediaType - media_json.media_type ('image' | 'document')
  * @param {string} [mimetype] - media_json.mimetype
  * @returns {Promise<{status: 'ok'|'no_receipt'|'error', amountCents?: number,
- *   receiptRef?: string, model?: string, reason?: string}>}
+ *   receiptRef?: string, model?: string, reason?: string, environmental?: boolean}>}
  *   'ok' = it is a receipt and the amount was read; 'no_receipt' = the file is
  *   readable but not a transfer receipt (terminal); 'error' = transient/parse
- *   failure (callers may retry; reason 'no_api_key' means misconfig — do not
- *   cache it as an attempt).
+ *   failure (callers may retry). `environmental: true` marks failures that are
+ *   about the environment, not the file — missing key, key over its spend
+ *   limit (401/403), rate limit (429) — callers must NOT count these against
+ *   the file's retry budget, or an outage would permanently skip receipts.
  */
 async function extractReceipt(absPath, mediaType, mimetype = '') {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) {
     console.error(`${LOG_TAG} [receipts] OPENROUTER_API_KEY not configured`);
-    return { status: 'error', reason: 'no_api_key' };
+    return { status: 'error', reason: 'no_api_key', environmental: true };
   }
 
   let stat;
@@ -182,7 +184,10 @@ async function extractReceipt(absPath, mediaType, mimetype = '') {
     if (!res.ok) {
       const detail = await res.text().catch(() => '');
       console.error(`${LOG_TAG} [receipts] extraction failed (${res.status}): ${detail.slice(0, 200)}`);
-      return { status: 'error', reason: `http_${res.status}` };
+      // 401/403 = bad key or key over its spend limit; 429 = rate limited.
+      // None of these say anything about THIS file.
+      const environmental = res.status === 401 || res.status === 403 || res.status === 429;
+      return { status: 'error', reason: `http_${res.status}`, environmental };
     }
     data = await res.json().catch(() => null);
   } catch (err) {
