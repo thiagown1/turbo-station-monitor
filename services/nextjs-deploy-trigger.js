@@ -61,9 +61,15 @@ async function main() {
     return;
   }
   if (sha === last) { log(`no change (sha=${sha})`); return; }
-  fs.writeFileSync(STATE, sha);
   const ok = await fire(sha);
-  log(ok ? `fired for new deploy ${last} -> ${sha}` : `fire FAILED for ${sha} (state already advanced)`);
+  if (ok) {
+    // Persist only on success — a failed fire leaves state at `last` so the
+    // next poll retries this sha instead of silently skipping the deploy.
+    fs.writeFileSync(STATE, sha);
+    log(`fired for new deploy ${last} -> ${sha}`);
+  } else {
+    log(`fire FAILED for ${sha} (state not advanced, will retry next run)`);
+  }
 }
 
 main().catch((e) => { log('error', e && e.message); process.exit(1); });

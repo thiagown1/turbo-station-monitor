@@ -52,12 +52,12 @@ report_agent(){
     SELECT 'ERROS/WARN por categoria/severity:';
     SELECT '  '||COALESCE(category,'?')||' / '||COALESCE(severity,'?')||': '||COUNT(*)
       FROM ocpp_events
-      WHERE timestamp>=$winstart AND severity IN ('ERROR','WARNING','CRITICAL')
+      WHERE timestamp>=$winstart AND severity IN ('error','warning','critical')
       GROUP BY category,severity ORDER BY COUNT(*) DESC LIMIT 12;
     SELECT 'Amostra de erros:';
     SELECT '  '||substr(replace(message,char(10),' '),1,160)
       FROM ocpp_events
-      WHERE timestamp>=$winstart AND severity IN ('ERROR','CRITICAL')
+      WHERE timestamp>=$winstart AND severity IN ('error','critical')
       ORDER BY timestamp DESC LIMIT 8;
     SELECT 'Chargers ativos agora: '||COUNT(DISTINCT charger_id)
       FROM ocpp_events WHERE timestamp>=$(now_ms)-300000 AND charger_id!='';
