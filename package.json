@@ -9,7 +9,7 @@
     "restart": "pm2 restart ecosystem.config.js",
     "status": "pm2 list",
     "logs": "pm2 logs",
-    "test": "node test/test-causal-correlation.js && node test/test-charger-fault-backoff.js",
+    "test": "node test/test-causal-correlation.js && node test/test-charger-fault-backoff.js && node test/test-cable-theft-alert.js",
     "test:telemetry": "node test/test-telemetry-endpoint.js",
     "test:telemetry:live": "node test/test-telemetry-endpoint.js --live",
     "test:alerts": "node test/test-alert-engine.js",

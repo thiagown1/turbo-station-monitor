@@ -14,7 +14,7 @@ const fs = require('fs');
 const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
-const { parseStatusNotif, isEmergencyStopFault } = require('./ocpp-utils');
+const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
 
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -37,6 +37,12 @@ const WHATSAPP_CONV = process.env.ALERT_WHATSAPP_CONV !== undefined
     ? process.env.ALERT_WHATSAPP_CONV
     : 'conv_jiuijxjtmnet23i9';
 const WHATSAPP_BRAND = process.env.ALERT_WHATSAPP_BRAND || 'turbo_station';
+// Urgent alerts (cable-theft suspects) additionally go to the dedicated
+// "Turbo Station + URGENTE" WhatsApp group. Same support-copilot transport as
+// the normal group. Set ALERT_URGENT_WHATSAPP_CONV='' to disable.
+const URGENT_WHATSAPP_CONV = process.env.ALERT_URGENT_WHATSAPP_CONV !== undefined
+    ? process.env.ALERT_URGENT_WHATSAPP_CONV
+    : 'conv_i7ljlrvrmrl33ohs';
 const SUPPORT_API_BASE = (process.env.SUPPORT_API_URL || 'https://logs.turbostation.com.br').replace(/\/+$/, '');
 const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
 
@@ -740,10 +746,17 @@ class AlertEngine {
                 parsed.info ? `info=${parsed.info}` : null,
             ].filter(Boolean).join(', ');
 
+            // Temperature faults are the cable-theft signature (see
+            // isCableTheftSuspectFault) — escalate and copy the urgent group.
+            const cableTheftSuspect = isCableTheftSuspectFault(parsed, ev.message);
+
             alerts.push({
                 type: 'charger_fault',
-                severity: 'warning',
-                title: `Carregador em falha`,
+                severity: cableTheftSuspect ? 'critical' : 'warning',
+                urgent: cableTheftSuspect,
+                title: cableTheftSuspect
+                    ? `Falha de temperatura — possível roubo de cabo`
+                    : `Carregador em falha`,
                 description: `Carregador reportou falha${detailBits ? ` (${detailBits})` : ` (${ev.event_type})`}`,
                 charger_id: ev.charger_id,
                 event_type: ev.event_type,
@@ -952,7 +965,11 @@ class AlertEngine {
                 msg += `\\n⚡ Ação: Problema no backend afetou carregador - prioridade!`;
                 break;
             case 'charger_fault':
-                msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
+                if (alert.urgent) {
+                    msg += `\\n⚡ Ação: Possível roubo de cabo (assinatura de temperatura) - verificar câmeras/local AGORA. Aviso enviado ao grupo URGENTE.`;
+                } else {
+                    msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
+                }
                 // Once the backoff has escalated past the first tier, say so —
                 // otherwise a 6h/24h-spaced alert reads like a brand new incident.
                 if (alert.backoff_streak > 3) {
@@ -992,13 +1009,13 @@ class AlertEngine {
      * Send alert to the WhatsApp alerts group ("Notificações Turbo Station").
      * Uses the same `openclaw message send` transport as alert-processor.
      */
-    async sendWhatsappAlert(message) {
-        if (!WHATSAPP_CONV || !SUPPORT_API_SECRET) return false;
+    async sendWhatsappAlert(message, conversationId = WHATSAPP_CONV) {
+        if (!conversationId || !SUPPORT_API_SECRET) return false;
         // formatAlertMessage emits literal "\n" (for the Telegram CLI); convert to
         // real newlines for the JSON/Evolution path.
         const text = message.replace(/\\n/g, '\n');
         try {
-            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(WHATSAPP_CONV)}/messages?brandId=${encodeURIComponent(WHATSAPP_BRAND)}`;
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?brandId=${encodeURIComponent(WHATSAPP_BRAND)}`;
             const res = await fetch(url, {
                 method: 'POST',
                 headers: {
@@ -1030,6 +1047,50 @@ class AlertEngine {
             this.sendWhatsappAlert(message),
         ]);
         return results.some((r) => r.status === 'fulfilled' && r.value === true);
+    }
+
+    /**
+     * Copy an urgent alert (cable-theft suspect) to the "Turbo Station +
+     * URGENTE" WhatsApp group. Best-effort: failure here never blocks the
+     * normal alert path, and the alert is marked sent based on the regular
+     * channels only.
+     */
+    async sendUrgentWhatsappAlert(message) {
+        if (!URGENT_WHATSAPP_CONV) return false;
+        return this.sendWhatsappAlert(message, URGENT_WHATSAPP_CONV);
+    }
+
+    /**
+     * Message for the urgent group: short, explicit about the suspicion, and
+     * self-contained (that group doesn't follow the technical alert stream).
+     */
+    formatUrgentCableTheftMessage(alert) {
+        const parsed = alert.parsed_fault || {};
+        const station = alert.charger_id ? lookupStation(alert.charger_id) : null;
+
+        const dt = new Date(typeof alert.event_ts === 'number' ? alert.event_ts : Date.now());
+        const timeBrt = dt.toLocaleString('pt-BR', {
+            day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+            hour12: false, timeZone: 'America/Sao_Paulo',
+        });
+
+        let msg = `🚨 *URGENTE — possível roubo de cabo* 🚨\\n\\n`;
+        if (station) {
+            msg += `🏢 *${station.name}*\\n`;
+            if (station.location) msg += `📍 ${station.location}\\n`;
+            msg += `🆔 ${alert.charger_id}\\n`;
+        } else if (alert.charger_id) {
+            msg += `🔌 *Carregador ${alert.charger_id}*\\n`;
+        }
+        if (parsed.connectorId != null) msg += `🔌 Conector ${parsed.connectorId}\\n`;
+        msg += `\\n📋 O carregador reportou falha de temperatura`;
+        const errBits = [parsed.error, parsed.info].filter(Boolean).join(' / ');
+        if (errBits) msg += ` (${errBits})`;
+        msg += ` — mesma assinatura de quando o cabo do Metrópole 1 foi roubado.\\n`;
+        msg += `🕐 ${timeBrt} (horário de Brasília)\\n`;
+        msg += `\\n⚡ Verificar câmeras e acionar alguém no local AGORA.`;
+        return msg;
     }
 
     /**
@@ -1192,6 +1253,16 @@ class AlertEngine {
                     this.markAlertSent(alertId);
                 }
 
+                // Cable-theft suspects also go to the URGENTE group with a
+                // dedicated message. Best-effort — never blocks the loop.
+                if (alert.urgent) {
+                    try {
+                        await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert));
+                    } catch (e) {
+                        console.error('❌ Error sending urgent alert:', e && e.message);
+                    }
+                }
+
                 // Partner-facing notification for charger faults (fire-and-forget;
                 // failure here never blocks the internal alert path above).
                 if (alert.type === 'charger_fault') {
@@ -1286,5 +1357,6 @@ module.exports.endpointReferencesCharger = endpointReferencesCharger;
 module.exports.CHARGE_ACTION_ROUTE = CHARGE_ACTION_ROUTE;
 module.exports.parseStatusNotif = parseStatusNotif;
 module.exports.isEmergencyStopFault = isEmergencyStopFault;
+module.exports.isCableTheftSuspectFault = isCableTheftSuspectFault;
 module.exports.windowForStreak = windowForStreak;
 module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
