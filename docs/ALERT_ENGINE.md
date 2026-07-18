@@ -49,7 +49,8 @@ CREATE TABLE alerts (
   ocpp_log_ids TEXT,      -- JSON array of related OCPP log IDs
   vercel_log_ids TEXT,    -- JSON array of related Vercel log IDs
   sent BOOLEAN DEFAULT 0,
-  sent_at INTEGER
+  sent_at INTEGER,
+  wa_message_id TEXT      -- upstream WhatsApp message id (for late delivery confirmation)
 );
 ```
 
@@ -73,6 +74,25 @@ Alerts are sent to the OCPP Alerts WhatsApp group using the existing alert forma
 
 ⚡ Ação: Verificar logs Vercel e backend
 ```
+
+### Delivery confirmation + retry (added 2026-07-18)
+
+A 2xx from the support API only means the message was **queued** — Evolution
+fires async and the message's `delivery_status` can still flip to `failed`
+(e.g. WhatsApp instance disconnected). The engine therefore:
+
+1. POSTs the message, keeps the returned message id (`wa_message_id`).
+2. Polls `GET .../conversations/{conv}/messages?limit=50` for that id's
+   `delivery_status` with a short backoff (default `500/1000/2000/3000` ms,
+   tunable via `WHATSAPP_DELIVERY_POLL_MS`).
+3. Marks the alert `sent=1` only on a confirmed `sent`.
+4. Unconfirmed/failed alerts stay `sent=0`; each detection tick retries
+   alerts younger than 30 min (max 5 per tick). A retried alert with a
+   recorded `wa_message_id` is late-confirmed first, so a slow-but-successful
+   delivery never produces a duplicate message in the group.
+
+This mirrors `confirmDelivery` in the Next.js `whatsapp-notifier` and closes
+the silent-loss window found in the 2026-07-16 cable-theft investigation.
 
 ## Performance
 
