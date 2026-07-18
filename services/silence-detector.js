@@ -29,11 +29,16 @@
  * 5 minutes, so the 10-minute threshold means "missed two consecutive
  * keep-alive cycles", not "one late packet".
  *
- * Transaction-active comes from the state-tracker's history/transactions.json
- * (the same source its own restart logic trusts): an entry in `active` for the
- * charger whose lastUpdate is close to the moment of silence. A power cut
- * mid-session leaves the entry active (no StopTransaction ever arrives),
- * which is exactly the signal we want.
+ * Transaction-active is derived from the EVENT STREAM itself (primary): a
+ * charging session shows ENERGY/DEDUCTED rows every ~30s (dashboard-logger
+ * chargers) or throttled meter_values rows (<=5 min apart), so session rows
+ * shortly before the last event, with no STOP_TX/StopTransaction after them,
+ * mean a session was active when the charger went mute. A power cut
+ * mid-session never logs a stop, which is exactly the signal we want.
+ * The state-tracker's history/transactions.json `active` map is only a
+ * SECONDARY corroborator: validated against prod on 2026-07-18, it showed 0
+ * active entries while a session was demonstrably live (ENERGY/DEDUCTED
+ * flowing), so it must never be the only source.
  *
  * Pure module: everything (db handle, clock, debounce, tx source) is
  * injectable so the whole decision table is unit-testable. alert-engine.js
@@ -49,7 +54,8 @@ const TX_FILE = path.join(__dirname, '..', 'history', 'transactions.json');
 
 const SILENCE_THRESHOLD_MS = 10 * 60 * 1000;  // silent = no event for 10 min
 const ALIVE_WINDOW_MS = 60 * 60 * 1000;       // "was alive" = had events in the last hour
-const ACTIVE_TX_RECENT_MS = 15 * 60 * 1000;   // tx counts as active if updated near the silence moment
+const ACTIVE_TX_RECENT_MS = 15 * 60 * 1000;   // tx-file entry counts as active if updated near the silence moment
+const SESSION_LOOKBACK_MS = 10 * 60 * 1000;   // session rows this close to the last event = charging at silence
 const MIN_EVENTS_ALIVE = 2;                   // one lone row is a blip, not an alive charger
 const AGGREGATE_THRESHOLD = 4;                // >= this many silent at once -> one mass alert
 
@@ -80,9 +86,10 @@ function readActiveTransactionsFromDisk() {
 }
 
 /**
- * Find a transaction that was active on this charger at the moment of its
- * last event. lastUpdate is bumped on every MeterValues, so an active session
- * tracks the event stream to within the collector's 5-min throttle.
+ * SECONDARY signal: a transactions.json `active` entry for this charger whose
+ * lastUpdate is close to the moment of silence. Never trusted alone (prod
+ * showed the file empty during a live session), but when present it carries
+ * the tx id for the alert text.
  */
 function findActiveTxAtSilence(activeTxs, chargerId, lastTs) {
     for (const tx of activeTxs || []) {
@@ -92,6 +99,58 @@ function findActiveTxAtSilence(activeTxs, chargerId, lastTs) {
         if (updated >= lastTs - ACTIVE_TX_RECENT_MS) return tx;
     }
     return null;
+}
+
+// Rows that only exist while a session is delivering energy. Real prod shapes
+// (2026-07-18 validation against ocpp.db): "ENERGY | consumed=..." and
+// "DEDUCTED | amount=..." every ~30s (event_type='other'), plus the throttled
+// meter_values path and transaction_start for other charger models.
+const SESSION_ROW_SQL = `
+    (
+        (
+            message LIKE 'ENERGY %' OR message LIKE 'ENERGY|%'
+            OR message LIKE 'DEDUCTED %' OR message LIKE 'DEDUCTED|%'
+            OR message LIKE '%MeterValues%'
+            OR message LIKE 'START_TX%'
+            OR event_type LIKE '%transaction_start%'
+        )
+        -- failure rows are not proof of charging: prod carries e.g.
+        -- "MeterValues processing failed for transaction None" on IDLE
+        -- chargers (found in the 2026-07-18 live validation, VTLZ2605210001).
+        -- Same exclusion list the collector uses for its meter_values path.
+        AND message NOT LIKE '%fail%'
+        AND message NOT LIKE '%error%'
+        AND message NOT LIKE '%timeout%'
+    )
+`;
+const STOP_ROW_SQL = `
+    (
+        message LIKE 'STOP_TX%'
+        OR message LIKE '%StopTransaction%'
+        OR event_type LIKE '%transaction_stop%'
+    )
+`;
+
+/**
+ * PRIMARY signal: was a session delivering energy right up to the charger's
+ * last event? True when the newest session row sits within
+ * SESSION_LOOKBACK_MS of the last event AND no stop row follows it (a clean
+ * session end logs STOP_TX/StopTransaction; a power cut never does).
+ */
+function sessionActiveAtSilence(ocppDb, chargerId, lastTs) {
+    const lastSession = ocppDb.prepare(`
+        SELECT MAX(timestamp) AS ts FROM ocpp_events
+        WHERE charger_id = ? AND timestamp BETWEEN ? AND ? AND ${SESSION_ROW_SQL}
+    `).get(chargerId, lastTs - ALIVE_WINDOW_MS, lastTs);
+    const sessionTs = lastSession && Number(lastSession.ts);
+    if (!Number.isFinite(sessionTs) || sessionTs < lastTs - SESSION_LOOKBACK_MS) return false;
+
+    const lastStop = ocppDb.prepare(`
+        SELECT MAX(timestamp) AS ts FROM ocpp_events
+        WHERE charger_id = ? AND timestamp BETWEEN ? AND ? AND ${STOP_ROW_SQL}
+    `).get(chargerId, sessionTs, lastTs);
+    const stopTs = lastStop && Number(lastStop.ts);
+    return !(Number.isFinite(stopTs) && stopTs > sessionTs);
 }
 
 function buildEvidence(kind, candidate) {
@@ -115,24 +174,26 @@ function buildEvidence(kind, candidate) {
     };
 }
 
-function buildSilenceAlert(candidate, tx, now) {
+function buildSilenceAlert(candidate, now) {
     const silentMin = Math.round((now - candidate.last_ts) / 60000);
     const lastSeen = timeBRT(candidate.last_ts);
+    const tx = candidate.tx;
 
-    if (tx) {
+    if (candidate.tx_active) {
+        const txLabel = tx && tx.id != null ? ` (tx ${tx.id})` : '';
         return {
             type: 'charger_silent',
             severity: 'critical',
             title: 'Carregador mudo com sessao ativa',
             description:
-                `Sem comunicacao ha ${silentMin} min e havia transacao ativa (tx ${tx.id}) no momento do silencio: ` +
+                `Sem comunicacao ha ${silentMin} min e havia transacao ativa${txLabel} no momento do silencio: ` +
                 `possivel corte de energia/furto de cabo. Ultima mensagem: ${lastSeen} (BRT). ` +
                 `Acao: verificar local/cameras imediatamente.`,
             charger_id: candidate.charger_id,
             silent_since_ts: candidate.last_ts,
             silent_minutes: silentMin,
             tx_active: true,
-            tx_id: tx.id,
+            ...(tx && tx.id != null ? { tx_id: tx.id } : {}),
             ocpp_log_ids: candidate.last_event_id != null ? JSON.stringify([candidate.last_event_id]) : null,
             evidence_json: JSON.stringify(buildEvidence('charger_silent', candidate)),
             // Empty parsed_fault forces partner-fault-notifier's classifyFault
@@ -166,7 +227,7 @@ function buildSilenceAlert(candidate, tx, now) {
 }
 
 function buildMassAlert(candidates, now) {
-    const withTx = candidates.filter(c => c.tx);
+    const withTx = candidates.filter(c => c.tx_active);
     const anyTx = withTx.length > 0;
     const listed = candidates.slice(0, 10)
         .map(c => `${c.charger_id} (${Math.round((now - c.last_ts) / 60000)} min)`)
@@ -193,7 +254,7 @@ function buildMassAlert(candidates, now) {
             chargers: candidates.map(c => ({
                 charger_id: c.charger_id,
                 last_ts: c.last_ts,
-                tx_active: !!c.tx,
+                tx_active: !!c.tx_active,
                 tx_id: c.tx ? c.tx.id : null,
             })),
         }),
@@ -266,12 +327,22 @@ function detectSilentChargers({
         if (row.event_count < MIN_EVENTS_ALIVE) continue;         // lone blip, not "was alive"
 
         const lastEvent = lastEventStmt.get(chargerId) || {};
+        const fileTx = findActiveTxAtSilence(activeTxs, chargerId, lastTs);
+        // Event-stream signal is PRIMARY (prod's transactions.json proved
+        // unreliable: empty during a live session, 2026-07-18 validation).
+        let sessionActive = false;
+        try {
+            sessionActive = sessionActiveAtSilence(ocppDb, chargerId, lastTs);
+        } catch (e) {
+            console.error(`[silence] session-activity query failed for ${chargerId}:`, e && e.message);
+        }
         candidates.push({
             charger_id: chargerId,
             last_ts: lastTs,
             last_event_id: lastEvent.id ?? null,
             last_event_type: lastEvent.event_type || null,
-            tx: findActiveTxAtSilence(activeTxs, chargerId, lastTs),
+            tx: fileTx,
+            tx_active: sessionActive || !!fileTx,
         });
     }
 
@@ -289,7 +360,7 @@ function detectSilentChargers({
     const alerts = [];
     for (const c of candidates) {
         if (!shouldAlert(c.charger_id)) continue;
-        alerts.push(buildSilenceAlert(c, c.tx, now));
+        alerts.push(buildSilenceAlert(c, now));
     }
     return alerts;
 }
@@ -339,11 +410,13 @@ module.exports = {
     notifySilencePush,
     readActiveTransactionsFromDisk,
     findActiveTxAtSilence,
+    sessionActiveAtSilence,
     buildSilenceAlert,
     buildMassAlert,
     SILENCE_THRESHOLD_MS,
     ALIVE_WINDOW_MS,
     ACTIVE_TX_RECENT_MS,
+    SESSION_LOOKBACK_MS,
     MIN_EVENTS_ALIVE,
     AGGREGATE_THRESHOLD,
 };

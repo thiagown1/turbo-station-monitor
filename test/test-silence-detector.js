@@ -18,6 +18,7 @@ const Database = require('better-sqlite3');
 const {
     detectSilentChargers,
     findActiveTxAtSilence,
+    sessionActiveAtSilence,
     SILENCE_THRESHOLD_MS,
     ALIVE_WINDOW_MS,
     AGGREGATE_THRESHOLD,
@@ -112,31 +113,80 @@ check('silence with active tx -> critical + "possivel corte de energia/furto"', 
     assert.ok(/possivel corte de energia\/furto/i.test(a.description), 'critical wording present');
 });
 
-check('incident replay: 314030001957 timeline fires critical', () => {
-    // Remote tx 1784344621 started 00:16:49 BRT, events every 30s, last event
-    // 00:24:49 BRT, then total silence. Detector runs 12 min after the last
-    // event (collector rows are 5-min throttled; we seed the throttled shape).
+check('incident replay: 314030001957 real prod row shapes fire critical with EMPTY tx file', () => {
+    // Exactly what prod ocpp.db showed on 2026-07-18: REMOTE_START + START_TX
+    // rows (event_type 'other'), then "ENERGY | ..." / "DEDUCTED | ..." rows
+    // every 30s, then total silence after the cut. Crucially,
+    // history/transactions.json had ZERO active entries during the live
+    // session, so the events-based signal alone must classify critical.
     const db = freshDb();
     const lastEvent = NOW - 12 * MIN;
     const txStart = lastEvent - 8 * MIN;
-    seed(db, '314030001957', txStart, 'transaction_start', 'StartTransaction Accepted');
-    seed(db, '314030001957', txStart + 5 * MIN, 'meter_values', 'MeterValues Active power: 56000');
-    seed(db, '314030001957', lastEvent, 'meter_values', 'MeterValues Active power: 56120');
+    seed(db, '314030001957', txStart, 'other', 'REMOTE_START | connector=1, user=u0CN4Iwq, hashed=f350a839, status=Accepted');
+    seed(db, '314030001957', txStart + 20000, 'other', 'START_TX INIT | connector=1, user=f350a839, meter_start=48380408');
+    seed(db, '314030001957', txStart + 21000, 'transaction_start', 'TIME VALIDATION: Checking if StartTransaction is within valid time window');
+    for (let ts = txStart + 30000; ts <= lastEvent; ts += 30000) {
+        seed(db, '314030001957', ts, 'other', 'ENERGY | consumed=211.0Wh, previous=48401118.0, current=48401329.0');
+        seed(db, '314030001957', ts + 40, 'other', 'DEDUCTED | amount=0.293290, user=u0CN4Iwq, remaining=27.27');
+    }
     seedAlive(db, 'CP-OTHER-SITE', NOW - 2 * MIN);
-    const txs = () => [{
-        id: 1784344621,
-        chargerId: '314030001957',
-        startTime: new Date(txStart).toISOString(),
-        lastUpdate: new Date(lastEvent).toISOString(),
-    }];
-    const alerts = detectSilentChargers({ ocppDb: db, shouldAlert: alwaysAlert, getActiveTransactions: txs, now: NOW });
+    const alerts = detectSilentChargers({ ocppDb: db, shouldAlert: alwaysAlert, getActiveTransactions: noTx, now: NOW });
     assert.strictEqual(alerts.length, 1);
     assert.strictEqual(alerts[0].severity, 'critical');
     assert.strictEqual(alerts[0].charger_id, '314030001957');
+    assert.strictEqual(alerts[0].tx_active, true);
     assert.ok(/furto/i.test(alerts[0].description));
     // Partner leg: evidence raw message must classify as STATION_OFFLINE
     const ev = JSON.parse(alerts[0].evidence_json);
     assert.ok(/disconnected/i.test(ev.ocpp.event.message));
+});
+
+check('session ended cleanly (STOP_TX) before silence -> warning, not critical', () => {
+    const db = freshDb();
+    const lastEvent = NOW - 12 * MIN;
+    for (let ts = lastEvent - 9 * MIN; ts <= lastEvent - 5 * MIN; ts += 30000) {
+        seed(db, 'CP-DONE', ts, 'other', 'ENERGY | consumed=200.0Wh, previous=1.0, current=201.0');
+    }
+    seed(db, 'CP-DONE', lastEvent - 4 * MIN, 'other', 'STOP_TX | connector=1, reason=Remote');
+    seed(db, 'CP-DONE', lastEvent - 3 * MIN, 'transaction_stop', 'StopTransaction received');
+    seed(db, 'CP-DONE', lastEvent, 'heartbeat', 'Heartbeat');
+    seedAlive(db, 'CP-OK', NOW - 1 * MIN);
+    const alerts = detectSilentChargers({ ocppDb: db, shouldAlert: alwaysAlert, getActiveTransactions: noTx, now: NOW });
+    assert.strictEqual(alerts.length, 1);
+    assert.strictEqual(alerts[0].severity, 'warning');
+    assert.strictEqual(alerts[0].tx_active, false);
+});
+
+check('throttled meter_values chargers (5-min cadence) also classify critical', () => {
+    const db = freshDb();
+    const lastEvent = NOW - 15 * MIN;
+    seed(db, 'CP-WEG', lastEvent - 10 * MIN, 'meter_values', 'MeterValues Active power: 56000');
+    seed(db, 'CP-WEG', lastEvent - 5 * MIN, 'meter_values', 'MeterValues Active power: 56100');
+    seed(db, 'CP-WEG', lastEvent, 'meter_values', 'MeterValues Active power: 56120');
+    seedAlive(db, 'CP-OK', NOW - 1 * MIN);
+    const alerts = detectSilentChargers({ ocppDb: db, shouldAlert: alwaysAlert, getActiveTransactions: noTx, now: NOW });
+    assert.strictEqual(alerts.length, 1);
+    assert.strictEqual(alerts[0].severity, 'critical');
+});
+
+check('MeterValues FAILURE rows on an idle charger do not fake a session (VTLZ prod case)', () => {
+    const db = freshDb();
+    const lastEvent = NOW - 12 * MIN;
+    seed(db, 'CP-VTLZ', lastEvent - 2 * MIN, 'other', 'MeterValues processing failed for transaction None - this may indicate cache corruption');
+    seed(db, 'CP-VTLZ', lastEvent, 'heartbeat', 'Heartbeat');
+    seedAlive(db, 'CP-OK', NOW - 1 * MIN);
+    const alerts = detectSilentChargers({ ocppDb: db, shouldAlert: alwaysAlert, getActiveTransactions: noTx, now: NOW });
+    assert.strictEqual(alerts.length, 1);
+    assert.strictEqual(alerts[0].severity, 'warning');
+    assert.strictEqual(alerts[0].tx_active, false);
+});
+
+check('sessionActiveAtSilence: energy long before silence does not count', () => {
+    const db = freshDb();
+    const lastEvent = NOW - 12 * MIN;
+    seed(db, 'CP-X', lastEvent - 30 * MIN, 'other', 'ENERGY | consumed=200.0Wh, previous=1.0, current=201.0');
+    seed(db, 'CP-X', lastEvent, 'heartbeat', 'Heartbeat');
+    assert.strictEqual(sessionActiveAtSilence(db, 'CP-X', lastEvent), false);
 });
 
 check('healthy charger (2 min ago) -> no alert', () => {
