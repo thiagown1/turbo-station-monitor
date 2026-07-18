@@ -46,6 +46,26 @@ const URGENT_WHATSAPP_CONV = process.env.ALERT_URGENT_WHATSAPP_CONV !== undefine
 const SUPPORT_API_BASE = (process.env.SUPPORT_API_URL || 'https://logs.turbostation.com.br').replace(/\/+$/, '');
 const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
 
+// A 2xx from the support API only means the message was QUEUED — Evolution
+// fires async and delivery_status can still flip to 'failed' (instance
+// disconnected being the classic). After the POST we poll the conversation for
+// the message's terminal delivery_status with this backoff (comma-separated ms,
+// tunable without a deploy). Mirrors confirmDelivery in the Next.js
+// whatsapp-notifier (next/lib/services/whatsapp-notifier.ts).
+function deliveryPollScheduleMs() {
+    const raw = process.env.WHATSAPP_DELIVERY_POLL_MS;
+    if (raw) {
+        const parsed = raw.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 0);
+        if (parsed.length) return parsed;
+    }
+    return [500, 1000, 2000, 3000];
+}
+
+// Unsent alerts younger than this are retried on every detection tick (the
+// engine never retried WhatsApp before — an alert that failed to deliver was
+// silently lost, the gap behind the 2026-07-16 cable-theft investigation).
+const UNSENT_RETRY_WINDOW_MS = 30 * 60 * 1000;
+
 // Freshness guard
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send alerts older than 10 minutes
 
@@ -156,18 +176,23 @@ class AlertEngine {
                 vercel_log_ids TEXT,
                 evidence_json TEXT,
                 sent BOOLEAN DEFAULT 0,
-                sent_at INTEGER
+                sent_at INTEGER,
+                wa_message_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_alerts_sent ON alerts(sent);
         `);
 
-        // Backfill/migrate older DBs that predate evidence_json
+        // Backfill/migrate older DBs that predate evidence_json / wa_message_id
         try {
             const cols = this.alertsDb.prepare(`PRAGMA table_info(alerts)`).all().map(r => r.name);
             if (!cols.includes('evidence_json')) {
                 this.alertsDb.exec('ALTER TABLE alerts ADD COLUMN evidence_json TEXT');
                 console.log('🧱 Migrated alerts DB: added evidence_json column');
+            }
+            if (!cols.includes('wa_message_id')) {
+                this.alertsDb.exec('ALTER TABLE alerts ADD COLUMN wa_message_id TEXT');
+                console.log('🧱 Migrated alerts DB: added wa_message_id column');
             }
         } catch (e) {
             console.error('⚠️ Failed to migrate alerts schema:', e.message);
@@ -1007,10 +1032,14 @@ class AlertEngine {
 
     /**
      * Send alert to the WhatsApp alerts group ("Notificações Turbo Station").
-     * Uses the same `openclaw message send` transport as alert-processor.
+     * A 2xx from the support API only means the message was QUEUED — so after
+     * the POST we confirm the message's delivery_status and only report
+     * delivered=true on a confirmed 'sent'. Returns { delivered, messageId }:
+     * messageId is the upstream id whenever the POST was accepted, so callers
+     * can late-confirm an unconfirmed send without re-posting.
      */
     async sendWhatsappAlert(message, conversationId = WHATSAPP_CONV) {
-        if (!conversationId || !SUPPORT_API_SECRET) return false;
+        if (!conversationId || !SUPPORT_API_SECRET) return { delivered: false, messageId: null };
         // formatAlertMessage emits literal "\n" (for the Telegram CLI); convert to
         // real newlines for the JSON/Evolution path.
         const text = message.replace(/\\n/g, '\n');
@@ -1027,26 +1056,81 @@ class AlertEngine {
             });
             if (!res.ok) {
                 console.error(`❌ Error sending WhatsApp: support API ${res.status}`);
-                return false;
+                return { delivered: false, messageId: null };
             }
-            console.log('✅ Alert sent to WhatsApp');
-            return true;
+            const json = await res.json().catch(() => null);
+            const messageId = json && typeof json.id === 'string' ? json.id : null;
+            if (!messageId) {
+                // Accepted but nothing to confirm against — don't trust the 2xx;
+                // leave the alert unsent so the retry pass picks it up.
+                console.error('⚠️ WhatsApp POST accepted but returned no message id; treating as unconfirmed');
+                return { delivered: false, messageId: null };
+            }
+            const status = await this.confirmWhatsappDelivery(conversationId, messageId);
+            if (status === 'sent') {
+                console.log('✅ Alert sent to WhatsApp (delivery confirmed)');
+                return { delivered: true, messageId };
+            }
+            console.error(`❌ WhatsApp delivery not confirmed (status=${status}) conv=${conversationId} msg=${messageId}`);
+            return { delivered: false, messageId };
         } catch (e) {
             console.error(`❌ Error sending WhatsApp: ${e && e.message}`);
-            return false;
+            return { delivered: false, messageId: null };
         }
     }
 
     /**
-     * Dispatch an alert message to every configured channel. Returns true if at
-     * least one channel accepted it (so the alert is marked sent).
+     * One GET of the conversation's recent messages; returns the message's
+     * delivery_status ('sent' | 'failed' | 'pending'), or null when the inbox
+     * is unreachable or the message isn't visible yet. Never throws.
+     */
+    async fetchWhatsappDeliveryStatus(conversationId, messageId) {
+        try {
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?limit=50`;
+            const res = await fetch(url, { headers: { 'x-api-secret': SUPPORT_API_SECRET } });
+            if (!res.ok) return null;
+            const json = await res.json().catch(() => null);
+            const messages = json && Array.isArray(json.messages) ? json.messages : [];
+            const msg = messages.find((m) => m && m.id === messageId);
+            return msg ? (msg.delivery_status || 'pending') : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Poll for the terminal delivery_status of a just-posted message with a
+     * short backoff (deliveryPollScheduleMs). Returns 'sent' / 'failed' once
+     * upstream resolves the Evolution send, or 'unconfirmed' if it's still
+     * pending (or the inbox is unreachable) after the whole window.
+     */
+    async confirmWhatsappDelivery(conversationId, messageId) {
+        for (const waitMs of deliveryPollScheduleMs()) {
+            await new Promise((r) => setTimeout(r, waitMs));
+            const status = await this.fetchWhatsappDeliveryStatus(conversationId, messageId);
+            if (status === 'sent' || status === 'failed') return status;
+            // unreachable / not visible yet / still pending → keep polling
+        }
+        return 'unconfirmed';
+    }
+
+    /**
+     * Dispatch an alert message to every configured channel. Returns
+     * { sent, waMessageId }: sent=true only when at least one channel CONFIRMED
+     * the message (WhatsApp requires a confirmed delivery, not just a 2xx);
+     * waMessageId is the upstream WhatsApp message id whenever the POST was
+     * accepted, so an unconfirmed send can be late-confirmed before any retry.
      */
     async dispatchAlert(message) {
-        const results = await Promise.allSettled([
+        const [telegram, whatsapp] = await Promise.allSettled([
             this.sendTelegramAlert(message),
             this.sendWhatsappAlert(message),
         ]);
-        return results.some((r) => r.status === 'fulfilled' && r.value === true);
+        const telegramOk = telegram.status === 'fulfilled' && telegram.value === true;
+        const wa = whatsapp.status === 'fulfilled' && whatsapp.value
+            ? whatsapp.value
+            : { delivered: false, messageId: null };
+        return { sent: telegramOk || wa.delivered === true, waMessageId: wa.messageId || null };
     }
 
     /**
@@ -1057,7 +1141,8 @@ class AlertEngine {
      */
     async sendUrgentWhatsappAlert(message) {
         if (!URGENT_WHATSAPP_CONV) return false;
-        return this.sendWhatsappAlert(message, URGENT_WHATSAPP_CONV);
+        const { delivered } = await this.sendWhatsappAlert(message, URGENT_WHATSAPP_CONV);
+        return delivered;
     }
 
     /**
@@ -1146,6 +1231,88 @@ class AlertEngine {
     }
 
     /**
+     * Record the upstream WhatsApp message id for an alert whose POST was
+     * accepted, so a later retry can late-confirm instead of re-sending.
+     */
+    recordWaMessageId(alertId, waMessageId) {
+        if (!waMessageId) return;
+        try {
+            this.alertsDb.prepare('UPDATE alerts SET wa_message_id = ? WHERE id = ?').run(waMessageId, alertId);
+        } catch (e) {
+            console.error(`❌ Error recording wa_message_id for alert ${alertId}:`, e.message);
+        }
+    }
+
+    /**
+     * Retry pass for alerts that were saved but never confirmed on any channel
+     * (support API down, Evolution instance disconnected, engine restart
+     * between save and send). Runs every detection tick. An alert with a
+     * recorded wa_message_id is re-checked first — if the earlier send actually
+     * delivered late, it's just marked sent (no duplicate message in the
+     * group). Only alerts younger than UNSENT_RETRY_WINDOW_MS are retried;
+     * anything older stays unsent by design (stale alerts are noise).
+     */
+    async retryUnsentAlerts() {
+        const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
+        if (!TELEGRAM_GROUP && !whatsappConfigured) return;
+
+        let rows;
+        try {
+            rows = this.alertsDb
+                .prepare(
+                    `SELECT id, created_at, charger_id, severity, title, description, ocpp_log_ids, vercel_log_ids, evidence_json, wa_message_id
+                     FROM alerts
+                     WHERE created_at >= ?
+                       AND (sent = 0 OR sent IS NULL)
+                     ORDER BY created_at ASC
+                     LIMIT 5`
+                )
+                .all(Date.now() - UNSENT_RETRY_WINDOW_MS);
+        } catch (e) {
+            console.error('⚠️ Error querying unsent alerts for retry:', e.message);
+            return;
+        }
+        if (!rows.length) return;
+
+        console.log(`🔁 Retrying ${rows.length} unsent alert(s)`);
+        for (const row of rows) {
+            try {
+                // The previous POST may have been accepted and delivered after the
+                // confirmation window closed — check before re-sending.
+                if (row.wa_message_id && whatsappConfigured) {
+                    const status = await this.fetchWhatsappDeliveryStatus(WHATSAPP_CONV, row.wa_message_id);
+                    if (status === 'sent') {
+                        console.log(`✅ Alert ${row.id} late-confirmed (msg=${row.wa_message_id})`);
+                        this.markAlertSent(row.id);
+                        continue;
+                    }
+                }
+
+                const message = this.formatAlertMessage({
+                    type: 'db_recent',
+                    event_ts: row.created_at,
+                    timestamp: row.created_at,
+                    charger_id: row.charger_id,
+                    severity: row.severity,
+                    title: row.title,
+                    description: row.description,
+                    ocpp_log_ids: row.ocpp_log_ids,
+                    vercel_log_ids: row.vercel_log_ids,
+                    evidence_json: row.evidence_json,
+                });
+                const { sent, waMessageId } = await this.dispatchAlert(message);
+                if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
+                if (sent) this.markAlertSent(row.id);
+
+                // Rate limit: 2 seconds between messages
+                await new Promise((r) => setTimeout(r, 2000));
+            } catch (e) {
+                console.error(`⚠️ Error retrying alert ${row.id}:`, e.message);
+            }
+        }
+    }
+
+    /**
      * Mark alert as sent in database
      */
     markAlertSent(alertId) {
@@ -1168,6 +1335,15 @@ class AlertEngine {
      */
     async runDetection() {
         console.log(`\n🔍 Running alert detection at ${new Date().toISOString()}`);
+
+        // Flush recent unsent alerts first, so a transient support-API/Evolution
+        // outage delays an alert instead of silently losing it. Runs before the
+        // detectors (and regardless of whether they find anything new).
+        try {
+            await this.retryUnsentAlerts();
+        } catch (e) {
+            console.error('⚠️ Error in retryUnsentAlerts:', e && e.message);
+        }
 
         const runDetector = (name, fn) => {
             try {
@@ -1246,11 +1422,15 @@ class AlertEngine {
 
                 // Format and send to every configured channel (Telegram + WhatsApp)
                 const message = this.formatAlertMessage(alert);
-                const sent = await this.dispatchAlert(message);
+                const { sent, waMessageId } = await this.dispatchAlert(message);
+                if (waMessageId) this.recordWaMessageId(alertId, waMessageId);
 
-                // Mark as sent only if actually sent
+                // Mark as sent only on a CONFIRMED delivery; otherwise the
+                // retry pass re-attempts it for up to UNSENT_RETRY_WINDOW_MS.
                 if (sent) {
                     this.markAlertSent(alertId);
+                } else {
+                    console.log(`🔁 Alert ${alertId} not confirmed on any channel; will retry next tick`);
                 }
 
                 // Cable-theft suspects also go to the URGENTE group with a
@@ -1360,3 +1540,5 @@ module.exports.isEmergencyStopFault = isEmergencyStopFault;
 module.exports.isCableTheftSuspectFault = isCableTheftSuspectFault;
 module.exports.windowForStreak = windowForStreak;
 module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
+module.exports.deliveryPollScheduleMs = deliveryPollScheduleMs;
+module.exports.UNSENT_RETRY_WINDOW_MS = UNSENT_RETRY_WINDOW_MS;
