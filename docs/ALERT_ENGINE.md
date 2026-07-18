@@ -28,6 +28,26 @@ The Alert Engine is a proactive monitoring system that queries the unified SQLit
    - Helps identify backend-caused charger failures
    - Severity: **critical**
 
+5. **Charger Faults** (`charger_fault`)
+   - Standalone charger-side fault stream (e-stop presses excluded)
+   - Severity: **warning**, with two escalations to **critical**:
+     - *Cable-theft temperature signature* (`isCableTheftSuspectFault`) — also
+       copies the "Turbo Station + URGENTE" WhatsApp group
+     - *Night-watch* (`isOvernightFirstFault`) — the FIRST fault of a backoff
+       streak landing 22:00-06:00 America/Sao_Paulo becomes 🔴 "Falha noturna -
+       possível furto/vandalismo" with a check-the-cameras action line
+       (2026-07-16 Cond Tiê Mirante 2 theft started 01:43 BRT and paged as a
+       routine warning). Repeats keep the normal warning severity and the
+       escalating backoff cadence; night-watch first-faults additionally call
+       the Next.js `/api/internal/partner-fault-alert` route with
+       `nightWatch: true` (`services/night-fault-push.js`) so the Next side can
+       fire a critical FCM push to station owners/admins
+       (feature-flagged there, default OFF; disable the caller with
+       `NEXT_API_URL=''`)
+   - Repeat cadence: escalating backoff per charger+error
+     (1h → 6h → daily; `history/charger_fault_backoff.json`), streak resets
+     after a silence > 2x the last window
+
 ## Debounce Logic
 
 - **Problem alerts:** 1 hour debounce window

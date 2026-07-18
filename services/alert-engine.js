@@ -14,6 +14,7 @@ const fs = require('fs');
 const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
+const { notifyNightFaultPush } = require('./night-fault-push');
 const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
 
 // NOTE: Data is split across dedicated DBs
@@ -110,6 +111,47 @@ function windowForStreak(streak) {
         if (streak >= tier.afterStreak) win = tier.windowMs;
     }
     return win;
+}
+
+// --- Night-watch escalation (added 2026-07-18) ----------------------------
+// During the 2026-07-16 cable theft at Cond Tiê Mirante 2 (DF260112002) the
+// charger reported "Hardware failure" from 01:43 BRT and paged as a routine
+// 🟠 warning every hour — visually identical to the ~15 daytime fault
+// warnings the fleet emits per day, so nobody reacted until morning. A
+// charger's FIRST fault of a streak landing in the dead of night is a much
+// stronger theft/vandalism signal than the same fault at 14:00: nobody is
+// legitimately servicing equipment at 03:00. Escalate only the first alert
+// of a streak (streak === 1) — repeats stay on the existing backoff cadence
+// and severity, so a chronic flapper never becomes a nightly siren. The
+// cable-theft temperature signature (isCableTheftSuspectFault) takes
+// precedence when both match: it is more specific and additionally pages
+// the URGENTE group.
+const NIGHT_WATCH_TZ = 'America/Sao_Paulo';
+const NIGHT_WATCH_START_HOUR = 22; // >= 22:00 local (inclusive)
+const NIGHT_WATCH_END_HOUR = 6;    // < 06:00 local (exclusive)
+
+function hourInTimeZone(ts, timeZone = NIGHT_WATCH_TZ) {
+    // hourCycle h23 so midnight is "0", never "24".
+    return Number(new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        hour: 'numeric',
+        hourCycle: 'h23',
+    }).format(new Date(ts)));
+}
+
+function isNightWatchHour(ts, timeZone = NIGHT_WATCH_TZ) {
+    const hour = hourInTimeZone(ts, timeZone);
+    return hour >= NIGHT_WATCH_START_HOUR || hour < NIGHT_WATCH_END_HOUR;
+}
+
+/**
+ * True when this alert is the FIRST of a backoff streak (streak === 1 covers
+ * both a brand-new dedupe key and a post-recovery reset in
+ * shouldSendChargerFaultAlert) AND the fault event happened between 22:00
+ * and 06:00 America/Sao_Paulo.
+ */
+function isOvernightFirstFault(streak, ts, timeZone = NIGHT_WATCH_TZ) {
+    return streak === 1 && isNightWatchHour(ts, timeZone);
 }
 
 class AlertEngine {
@@ -750,13 +792,23 @@ class AlertEngine {
             // isCableTheftSuspectFault) — escalate and copy the urgent group.
             const cableTheftSuspect = isCableTheftSuspectFault(parsed, ev.message);
 
+            // First fault of a streak landing 22:00-06:00 BRT: theft/vandalism
+            // window (the 2026-07-16 theft opened with an 01:43 "Hardware
+            // failure" that paged as a routine warning). Uses the EVENT time,
+            // not send time — what matters is when the charger faulted.
+            const nightWatch = !cableTheftSuspect
+                && isOvernightFirstFault(backoff.streak, ev.timestamp);
+
             alerts.push({
                 type: 'charger_fault',
-                severity: cableTheftSuspect ? 'critical' : 'warning',
+                severity: (cableTheftSuspect || nightWatch) ? 'critical' : 'warning',
                 urgent: cableTheftSuspect,
+                night_watch: nightWatch,
                 title: cableTheftSuspect
                     ? `Falha de temperatura — possível roubo de cabo`
-                    : `Carregador em falha`,
+                    : nightWatch
+                        ? `Falha noturna - possível furto/vandalismo`
+                        : `Carregador em falha`,
                 description: `Carregador reportou falha${detailBits ? ` (${detailBits})` : ` (${ev.event_type})`}`,
                 charger_id: ev.charger_id,
                 event_type: ev.event_type,
@@ -967,6 +1019,8 @@ class AlertEngine {
             case 'charger_fault':
                 if (alert.urgent) {
                     msg += `\\n⚡ Ação: Possível roubo de cabo (assinatura de temperatura) - verificar câmeras/local AGORA. Aviso enviado ao grupo URGENTE.`;
+                } else if (alert.night_watch) {
+                    msg += `\\n⚡ Ação: Fora do horário comercial - considere verificar câmeras/local`;
                 } else {
                     msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
                 }
@@ -1271,6 +1325,15 @@ class AlertEngine {
                     );
                 }
 
+                // Overnight first-faults additionally fire a critical FCM push
+                // to the station's owners/admins via the Next internal route
+                // (feature-flagged on the Next side; fire-and-forget here).
+                if (alert.type === 'charger_fault' && alert.night_watch) {
+                    notifyNightFaultPush(alert).catch(e =>
+                        console.error('[night-push] error:', e && e.message)
+                    );
+                }
+
                 // Rate limit: 2 seconds between messages
                 await new Promise(resolve => setTimeout(resolve, 2000));
 
@@ -1360,3 +1423,6 @@ module.exports.isEmergencyStopFault = isEmergencyStopFault;
 module.exports.isCableTheftSuspectFault = isCableTheftSuspectFault;
 module.exports.windowForStreak = windowForStreak;
 module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
+module.exports.hourInTimeZone = hourInTimeZone;
+module.exports.isNightWatchHour = isNightWatchHour;
+module.exports.isOvernightFirstFault = isOvernightFirstFault;

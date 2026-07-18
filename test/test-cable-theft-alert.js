@@ -74,7 +74,10 @@ function detectWith(rows) {
 function faultRow(message, id = 1) {
     return {
         id,
-        timestamp: Date.now() - 60 * 1000,
+        // Pinned to 14:00 BRT: the night-watch escalation (22:00-06:00
+        // first-fault → critical) would otherwise flip the "ordinary fault
+        // stays warning" assertion whenever the suite runs overnight.
+        timestamp: Date.UTC(2026, 6, 16, 17, 0, 0),
         charger_id: '124030001957',
         event_type: 'charger_faulted',
         meta: null,
