@@ -60,13 +60,17 @@ check('does NOT flag ordinary faults (SECC CAN Offline / e-stop / CP state)', ()
     }
 });
 
-// detectChargerFaults() only touches this.ocppDb + shouldSendChargerFaultAlert,
-// so exercise the real prototype method against a fake engine (same pattern as
+// detectChargerFaults() only touches this.ocppDb + shouldSendChargerFaultAlert
+// (+ shouldAlertCableTheft for temperature faults), so exercise the real
+// prototype method against a fake engine (same pattern as
 // test-charger-fault-backoff.js — avoids opening the live sqlite DBs).
 function detectWith(rows) {
     const fake = {
         ocppDb: { prepare: () => ({ all: () => rows }) },
         shouldSendChargerFaultAlert: () => ({ streak: 1, windowMs: 60 * 60 * 1000 }),
+        // Cable-theft faults now gate on the burst-then-silence incident check
+        // instead of the escalating backoff; default to "fresh incident".
+        shouldAlertCableTheft: () => true,
     };
     return AlertEngine.prototype.detectChargerFaults.call(fake);
 }
@@ -82,11 +86,12 @@ function faultRow(message, id = 1) {
     };
 }
 
-check('detectChargerFaults escalates the theft signature to critical + urgent', () => {
+check('detectChargerFaults escalates the theft signature to critical + urgent + burst', () => {
     const alerts = detectWith([faultRow(THEFT_MSG)]);
     assert.strictEqual(alerts.length, 1);
     assert.strictEqual(alerts[0].severity, 'critical');
     assert.strictEqual(alerts[0].urgent, true);
+    assert.strictEqual(alerts[0].cableTheftBurst, true, 'flagged for the URGENTE burst');
     assert.ok(/roubo de cabo/i.test(alerts[0].title), 'title names the suspicion');
 });
 
