@@ -124,6 +124,27 @@ const CHARGER_FAULT_BACKOFF_TIERS = [
 ];
 const CHARGER_FAULT_BACKOFF_FILE = path.join(__dirname, '..', 'history', 'charger_fault_backoff.json');
 
+// --- Cable-theft (HighTemperature) burst-then-silence (added 2026-07-18) ------
+// A cut DC cable severs the connector's temperature sensor → HighTemperature
+// fault, which the charger re-reports every ~5 min for as long as it stays
+// broken (Metrópole 3: 03:53 → 18:51 BRT, 15h straight). The escalating backoff
+// above kept re-paging the URGENTE group across that whole span — but once the
+// team knows the cable is stolen, further pings are pure noise ("we already
+// know"). Instead: on a FRESH incident fire a short BURST (grab attention
+// immediately), then stay SILENT for that charger+connector until it actually
+// RECOVERS (reports an operational status again). A later theft on the same
+// connector, after a recovery, is a fresh incident and bursts again.
+const CABLE_THEFT_BURST_COUNT = Number(process.env.ALERT_CABLE_THEFT_BURST_COUNT) || 5;
+const CABLE_THEFT_BURST_INTERVAL_MS = Number(process.env.ALERT_CABLE_THEFT_BURST_INTERVAL_MS) || 10 * 1000;
+const CABLE_THEFT_STATE_FILE = path.join(__dirname, '..', 'history', 'cable_theft_incidents.json');
+// OCPP statuses that mean the connector is genuinely usable again (mirrors the
+// Next.js OPERATIONAL_STATUSES set). Anything else (Faulted/Unavailable) keeps
+// the incident OPEN, so a stuck or self-disabled connector never reads as
+// recovered and re-bursts.
+const OPERATIONAL_OCPP_STATUSES = new Set([
+    'available', 'preparing', 'charging', 'suspendedev', 'suspendedevse', 'finishing', 'reserved',
+]);
+
 function windowForStreak(streak) {
     let win = CHARGER_FAULT_BACKOFF_TIERS[0].windowMs;
     for (const tier of CHARGER_FAULT_BACKOFF_TIERS) {
@@ -156,6 +177,7 @@ class AlertEngine {
 
         this.debounceCache = this.loadDebounceCache();
         this.chargerFaultBackoff = this.loadChargerFaultBackoff();
+        this.cableTheftState = this.loadCableTheftState();
 
         // NOTE: Startup replay disabled.
         // This process is meant to be long-running (interval loop). Replaying on restart caused
@@ -307,6 +329,103 @@ class AlertEngine {
         if (cleaned > 0) {
             this.saveChargerFaultBackoff();
             console.log(`🧹 Cleaned ${cleaned} old charger-fault backoff entries`);
+        }
+    }
+
+    loadCableTheftState() {
+        try {
+            if (fs.existsSync(CABLE_THEFT_STATE_FILE)) {
+                return JSON.parse(fs.readFileSync(CABLE_THEFT_STATE_FILE, 'utf8'));
+            }
+        } catch (e) {
+            console.error('⚠️ Error loading cable-theft incident state:', e.message);
+        }
+        return {};
+    }
+
+    saveCableTheftState() {
+        try {
+            fs.writeFileSync(CABLE_THEFT_STATE_FILE, JSON.stringify(this.cableTheftState, null, 2));
+        } catch (e) {
+            console.error('⚠️ Error saving cable-theft incident state:', e.message);
+        }
+    }
+
+    /** True when an OCPP status string means the connector is usable again. */
+    isOperationalOcppStatus(status) {
+        return OPERATIONAL_OCPP_STATUSES.has(String(status || '').trim().toLowerCase());
+    }
+
+    /**
+     * True when the given connector reported an OPERATIONAL status after
+     * `sinceMs` — i.e. the cable-theft incident was resolved (repaired) and any
+     * new fault is a fresh incident. Checked PER-CONNECTOR so a healthy
+     * connector 1 charging normally never masks a stolen cable on connector 2
+     * (the exact Metrópole 3 shape: conn 1 charging, conn 2 Faulted). Reuses the
+     * detection parser so the status format can't drift. On a query error,
+     * returns false (assume still-open) — under-notifying beats re-spamming.
+     */
+    hasConnectorRecoveredSince(chargerId, connectorId, sinceMs) {
+        try {
+            const rows = this.ocppDb.prepare(`
+                SELECT message FROM ocpp_events
+                WHERE charger_id = ? AND timestamp > ? AND message LIKE '%status=%'
+                ORDER BY timestamp DESC LIMIT 500
+            `).all(chargerId, sinceMs);
+            for (const r of rows) {
+                const p = parseStatusNotif(r.message);
+                // When both connector ids are known, require a match; a null on
+                // either side falls back to "any operational status counts".
+                if (connectorId != null && p.connectorId != null && p.connectorId !== connectorId) continue;
+                if (this.isOperationalOcppStatus(p.status)) return true;
+            }
+            return false;
+        } catch (e) {
+            console.error('⚠️ cable-theft recovery check failed:', e.message);
+            return false;
+        }
+    }
+
+    /**
+     * Burst-then-silence gate for a cable-theft suspect. Returns true (and
+     * records the incident) only for a FRESH incident: no prior record for this
+     * charger+connector, or the connector has RECOVERED since the last alert.
+     * An ongoing incident (still faulted, no recovery) returns false — no
+     * re-burst, no re-ping. This replaces the escalating backoff for
+     * cable-theft faults only.
+     */
+    shouldAlertCableTheft(chargerId, connectorId) {
+        const key = `${chargerId}::${connectorId != null ? connectorId : 'x'}`;
+        const prev = this.cableTheftState[key];
+        if (prev && prev.alertedAt) {
+            if (!this.hasConnectorRecoveredSince(chargerId, connectorId, prev.alertedAt)) {
+                console.log(`🔇 Cable-theft still open (no recovery since last burst): ${key}`);
+                return false;
+            }
+            console.log(`♻️ Cable-theft new incident after recovery: ${key}`);
+        }
+        this.cableTheftState[key] = {
+            alertedAt: Date.now(),
+            connectorId: connectorId != null ? connectorId : null,
+        };
+        this.saveCableTheftState();
+        return true;
+    }
+
+    /** Drop cable-theft incident records untouched for >30 days. */
+    cleanupCableTheftState() {
+        const now = Date.now();
+        const monthMs = 30 * 24 * 60 * 60 * 1000;
+        let cleaned = 0;
+        Object.keys(this.cableTheftState).forEach(key => {
+            if (now - (this.cableTheftState[key].alertedAt || 0) > monthMs) {
+                delete this.cableTheftState[key];
+                cleaned++;
+            }
+        });
+        if (cleaned > 0) {
+            this.saveCableTheftState();
+            console.log(`🧹 Cleaned ${cleaned} old cable-theft incident entries`);
         }
     }
 
@@ -744,8 +863,19 @@ class AlertEngine {
             if (seen.has(dedupeKey)) continue;
             seen.add(dedupeKey);
 
-            const backoff = this.shouldSendChargerFaultAlert(dedupeKey);
-            if (!backoff) continue;
+            // Cable-theft (HighTemperature) faults follow BURST-THEN-SILENCE
+            // (shouldAlertCableTheft): one burst per incident, then silence until
+            // the connector recovers — instead of the escalating backoff that
+            // re-pinged the URGENTE group for 15h straight. Every other fault
+            // keeps the escalating backoff.
+            const cableTheftSuspect = isCableTheftSuspectFault(parsed, ev.message);
+            let backoff = null;
+            if (cableTheftSuspect) {
+                if (!this.shouldAlertCableTheft(ev.charger_id, parsed.connectorId)) continue;
+            } else {
+                backoff = this.shouldSendChargerFaultAlert(dedupeKey);
+                if (!backoff) continue;
+            }
 
             // Evidence shaped like the correlation alert so formatAlertMessage's
             // OCPP-details block renders (it parses ocpp.event.message). No
@@ -771,14 +901,13 @@ class AlertEngine {
                 parsed.info ? `info=${parsed.info}` : null,
             ].filter(Boolean).join(', ');
 
-            // Temperature faults are the cable-theft signature (see
-            // isCableTheftSuspectFault) — escalate and copy the urgent group.
-            const cableTheftSuspect = isCableTheftSuspectFault(parsed, ev.message);
-
             alerts.push({
                 type: 'charger_fault',
                 severity: cableTheftSuspect ? 'critical' : 'warning',
                 urgent: cableTheftSuspect,
+                // Signals the dispatch loop to send the URGENTE burst (5x/10s)
+                // instead of a single urgent message.
+                cableTheftBurst: cableTheftSuspect,
                 title: cableTheftSuspect
                     ? `Falha de temperatura — possível roubo de cabo`
                     : `Carregador em falha`,
@@ -792,10 +921,10 @@ class AlertEngine {
                 // Pre-parsed fault fields forwarded to partner-fault-notifier to
                 // avoid re-parsing the StatusNotification message a second time.
                 parsed_fault: parsed,
-                // Backoff bookkeeping surfaced in the message so it's clear WHY
-                // the cadence changed once it escalates past the first tier.
-                backoff_streak: backoff.streak,
-                backoff_window_ms: backoff.windowMs,
+                // Backoff bookkeeping (non-cable-theft only; cable-theft uses the
+                // burst-then-silence incident gate, no backoff streak).
+                backoff_streak: backoff ? backoff.streak : undefined,
+                backoff_window_ms: backoff ? backoff.windowMs : undefined,
             });
         }
 
@@ -1146,10 +1275,37 @@ class AlertEngine {
     }
 
     /**
+     * Fire the URGENTE cable-theft BURST: CABLE_THEFT_BURST_COUNT messages,
+     * CABLE_THEFT_BURST_INTERVAL_MS apart, best-effort. Fire-and-forget — the
+     * spacing must NOT block the detection tick. Each message is numbered and
+     * the last one states no further alerts fire until the station normalizes,
+     * so the team reads the burst as intentional (not a loop bug) and knows the
+     * silence that follows is by design.
+     */
+    sendUrgentCableTheftBurst(alert) {
+        const total = CABLE_THEFT_BURST_COUNT;
+        void (async () => {
+            for (let i = 1; i <= total; i++) {
+                try {
+                    await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert, i, total));
+                } catch (e) {
+                    console.error('❌ Error sending cable-theft burst message:', e && e.message);
+                }
+                if (i < total) {
+                    await new Promise((r) => setTimeout(r, CABLE_THEFT_BURST_INTERVAL_MS));
+                }
+            }
+            console.log(`🚨 Cable-theft burst sent (${total}x) for ${alert.charger_id}`);
+        })();
+    }
+
+    /**
      * Message for the urgent group: short, explicit about the suspicion, and
      * self-contained (that group doesn't follow the technical alert stream).
+     * When `burstIndex`/`burstTotal` are given, appends a "N/M" footer so the
+     * burst reads as intentional and the final message announces the silence.
      */
-    formatUrgentCableTheftMessage(alert) {
+    formatUrgentCableTheftMessage(alert, burstIndex, burstTotal) {
         const parsed = alert.parsed_fault || {};
         const station = alert.charger_id ? lookupStation(alert.charger_id) : null;
 
@@ -1175,6 +1331,12 @@ class AlertEngine {
         msg += ` — mesma assinatura de quando o cabo do Metrópole 1 foi roubado.\\n`;
         msg += `🕐 ${timeBrt} (horário de Brasília)\\n`;
         msg += `\\n⚡ Verificar câmeras e acionar alguém no local AGORA.`;
+        if (burstIndex && burstTotal) {
+            msg += `\\n\\n🔁 Aviso ${burstIndex}/${burstTotal}`;
+            if (burstIndex === burstTotal) {
+                msg += ` — não haverá novos avisos para esta estação até ela normalizar.`;
+            }
+        }
         return msg;
     }
 
@@ -1433,9 +1595,14 @@ class AlertEngine {
                     console.log(`🔁 Alert ${alertId} not confirmed on any channel; will retry next tick`);
                 }
 
-                // Cable-theft suspects also go to the URGENTE group with a
-                // dedicated message. Best-effort — never blocks the loop.
-                if (alert.urgent) {
+                // Cable-theft suspects: BURST to the URGENTE group (5x, 10s
+                // apart) on a fresh incident, then this charger+connector stays
+                // silent until it recovers (gated in detectChargerFaults via
+                // shouldAlertCableTheft). Fire-and-forget so the 10s spacing
+                // never blocks the detection tick.
+                if (alert.cableTheftBurst) {
+                    this.sendUrgentCableTheftBurst(alert);
+                } else if (alert.urgent) {
                     try {
                         await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert));
                     } catch (e) {
@@ -1500,6 +1667,7 @@ async function main() {
             await engine.runDetection();
             engine.cleanupDebounceCache();
             engine.cleanupChargerFaultBackoff();
+            engine.cleanupCableTheftState();
         } catch (e) {
             console.error('❌ Fatal error in tick:', e && e.stack ? e.stack : e);
         }

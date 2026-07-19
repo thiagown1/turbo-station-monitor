@@ -94,6 +94,41 @@ fires async and the message's `delivery_status` can still flip to `failed`
 This mirrors `confirmDelivery` in the Next.js `whatsapp-notifier` and closes
 the silent-loss window found in the 2026-07-16 cable-theft investigation.
 
+### Cable-theft alert: burst-then-silence (added 2026-07-18)
+
+A cut DC cable severs the connector's temperature sensor, so the charger
+reports `Faulted / HighTemperature / DC OverTemp Connector` (recognized by
+`isCableTheftSuspectFault`) and **keeps re-reporting it every ~5 min for as
+long as it stays broken** — Metrópole Shopping 3 did so from 03:53 to 18:51 BRT
+(15h). Under the normal escalating backoff that re-paged the "Turbo Station +
+URGENTE" group hourly, then every 6h. Once the team knows the cable is stolen,
+those repeats are pure noise.
+
+Cable-theft faults are therefore taken **off the escalating backoff** and gated
+by `shouldAlertCableTheft(chargerId, connectorId)` instead:
+
+1. **Fresh incident** (no prior record, OR the connector has recovered since the
+   last alert) → send a **burst** of `CABLE_THEFT_BURST_COUNT` messages
+   (default 5) `CABLE_THEFT_BURST_INTERVAL_MS` apart (default 10s) to the
+   URGENTE group. Each is numbered (`Aviso N/5`); the last states no further
+   alerts fire until the station normalizes. The burst is fire-and-forget so
+   its spacing never blocks the detection tick.
+2. **Ongoing incident** (still faulted, no recovery) → **silent**. No re-burst,
+   no re-ping.
+3. **Recovery** = the connector reports an OPERATIONAL status again
+   (`hasConnectorRecoveredSince`, per-connector so a healthy connector 1 never
+   masks a stolen connector 2). A later theft after a recovery is a fresh
+   incident and bursts again.
+
+Incident state persists in `history/cable_theft_incidents.json` (survives
+restarts; pruned after 30 days). Env overrides:
+`ALERT_CABLE_THEFT_BURST_COUNT`, `ALERT_CABLE_THEFT_BURST_INTERVAL_MS`.
+
+The critical **FCM push** for the same fault is a separate, independent path in
+the Next.js repo (`high-temp-critical-push.ts`) — the VPS cannot send FCM. The
+two detect the same signal via independent pipelines on purpose (see the
+drift-warning comments on `isCableTheftSuspectFault` / `isHighTempFault`).
+
 ## Performance
 
 - **Query window:** Last 5 minutes (300,000ms)
