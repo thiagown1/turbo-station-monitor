@@ -56,7 +56,7 @@ process.env.MONITOR_API_SECRET = 'test-secret-12345';
 
 const app = require('../index');
 const { db, stmts } = require('../lib/db');
-const { parseLocation, deriveSeverity } = require('../lib/utils');
+const { parseLocation, deriveSeverity, buildBrandFilter, DEFAULT_BRAND_ID } = require('../lib/utils');
 
 const SECRET = 'test-secret-12345';
 
@@ -99,6 +99,51 @@ test('deriveSeverity — info for everything else', () => {
     assert.strictEqual(deriveSeverity('screen_open'), 'info');
     assert.strictEqual(deriveSeverity('start_charge_tap'), 'info');
     assert.strictEqual(deriveSeverity('unknown'), 'info');
+});
+
+test('buildBrandFilter — no brand means no filter (cross-brand view)', () => {
+    const f = buildBrandFilter(null);
+    assert.strictEqual(f.clause, '');
+    assert.strictEqual(f.usesBrandParams, false);
+    assert.strictEqual(buildBrandFilter(undefined).clause, '');
+    assert.strictEqual(buildBrandFilter('').clause, '');
+});
+
+test('buildBrandFilter — default brand absorbs tenant-less legacy rows', () => {
+    const f = buildBrandFilter(DEFAULT_BRAND_ID);
+    assert.ok(f.clause.includes('brand_id IS NULL'));
+    assert.ok(f.clause.includes('brand_id = ?'));
+    assert.strictEqual(f.usesBrandParams, true);
+});
+
+test('buildBrandFilter — a non-default brand must NOT see tenant-less rows', () => {
+    // Regression guard: including NULL rows here leaked turbo_station's ~470k
+    // legacy events into ZEV/PluGreen slices and made per-brand adoption
+    // unreadable.
+    const f = buildBrandFilter('zev');
+    assert.ok(!f.clause.includes('IS NULL'), 'must not include tenant-less rows');
+    assert.ok(f.clause.includes('brand_id = ?'));
+    assert.strictEqual(f.usesBrandParams, true);
+});
+
+test('buildBrandFilter — both brand shapes take exactly two params', () => {
+    // The caller passes [brandId, brandId]; a mismatch would shift every
+    // positional placeholder in the query.
+    for (const brand of [DEFAULT_BRAND_ID, 'zev']) {
+        const { clause } = buildBrandFilter(brand);
+        assert.strictEqual((clause.match(/\?/g) || []).length, 2, `two params for ${brand}`);
+    }
+});
+
+test('buildBrandFilter — cache key distinguishes default from scoped', () => {
+    // Same cacheKeyPart for both would let the prepared statement built for
+    // turbo_station be reused for zev, silently restoring the leak.
+    const a = buildBrandFilter(DEFAULT_BRAND_ID).cacheKeyPart;
+    const b = buildBrandFilter('zev').cacheKeyPart;
+    const c = buildBrandFilter(null).cacheKeyPart;
+    assert.notStrictEqual(a, b);
+    assert.notStrictEqual(a, c);
+    assert.notStrictEqual(b, c);
 });
 
 // ─── 2. Integration Tests: Routes ───────────────────────────────────────────────
