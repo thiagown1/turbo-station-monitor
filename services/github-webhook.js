@@ -15,8 +15,9 @@
 const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
+const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 
-const PORT = parseInt(process.env.PORT || '3002', 10);
+const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b367b04b35758df55a42b72d3c9ba65';
 
 const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
@@ -291,7 +292,9 @@ function dispatchBatchedCIWake(branchKey) {
 
 function handleHealth(req, res) {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/ping')) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    // X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+    // Body stays 'OK\n' — several probes match on it.
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Service': 'github-webhook' });
     res.end('OK\n');
     return true;
   }
@@ -1070,7 +1073,7 @@ function requestHandler(req, res) {
   res.end(JSON.stringify({ error: 'Not found' }));
 }
 
-http.createServer(requestHandler).listen(PORT, () => {
-  console.log(`[github-webhook] Server listening on port ${PORT}`);
+http.createServer(requestHandler).listen(PORT, BIND_HOST, () => {
+  console.log(`[github-webhook] Server listening on ${BIND_HOST}:${PORT}`);
   console.log(`[github-webhook] Endpoint: http://localhost:${PORT}/api/github/webhook`);
 });

@@ -10,8 +10,9 @@
 
 const http = require('http');
 const { exec } = require('child_process');
+const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 
-const PORT = parseInt(process.env.PORT || '3004', 10);
+const PORT = resolveServicePort('PAGARME_WEBHOOK_PORT', 3004, '[pagarme-status-webhook]');
 const TELEGRAM_TARGET = process.env.PAGARME_STATUS_TELEGRAM_TARGET || 'telegram:-5250194812';
 
 // Security model: only allow this exact URL path; no token required.
@@ -66,7 +67,8 @@ function summarize(payload) {
 
 function handler(req, res) {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/ping')) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    // X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Service': 'pagarme-status-webhook' });
     res.end('OK\n');
     return;
   }
@@ -112,6 +114,6 @@ function handler(req, res) {
   });
 }
 
-http.createServer(handler).listen(PORT, () => {
-  console.log(`[pagarme-status] listening on ${PORT}`);
+http.createServer(handler).listen(PORT, BIND_HOST, () => {
+  console.log(`[pagarme-status] listening on ${BIND_HOST}:${PORT}`);
 });

@@ -14,7 +14,7 @@
  */
 
 const express = require('express');
-const { PORT, LOG_TAG, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
+const { PORT, BIND_HOST, LOG_TAG, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
 require('./lib/db'); // ensure DB is initialised before routes
 
 const app = express();
@@ -24,7 +24,10 @@ const { requireSecret } = require('./middleware/auth');
 app.use(express.json({ limit: MAX_PAYLOAD_BYTES }));
 
 // ─── Health ──────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'support-copilot' }));
+// X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+app.get('/health', (_req, res) =>
+    res.set('X-Service', 'support-copilot').json({ ok: true, service: 'support-copilot' })
+);
 app.get('/ping', (_req, res) => res.send('pong'));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -59,8 +62,8 @@ const path = require('path');
 app.use('/api/support/media', require('express').static(path.join(__dirname, '..', '..', 'db', 'media')));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`${LOG_TAG} Listening on port ${PORT}`);
+app.listen(PORT, BIND_HOST, () => {
+  console.log(`${LOG_TAG} Listening on ${BIND_HOST}:${PORT}`);
 
   // Start auto-close worker (closes stale conversations + compacts sessions)
   const { startAutoClose } = require('./lib/auto-close');

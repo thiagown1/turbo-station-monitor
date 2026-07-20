@@ -65,9 +65,16 @@ function waitForHealth(deadline) {
 }
 
 (async () => {
+  // SUPPORT_COPILOT_PORT, not PORT: services deliberately ignore the generic
+  // PORT (see services/lib/service-port.js). PORT is deleted rather than
+  // overwritten so the smoke run does not trip the drift warning if the
+  // runner's own environment happens to carry one.
+  const childEnv = { ...process.env, SUPPORT_COPILOT_PORT: String(PORT), SUPPORT_COPILOT_DB_PATH: DB_PATH };
+  delete childEnv.PORT;
+
   const child = spawn(process.execPath, ['index.js'], {
     cwd: SERVICE_DIR,
-    env: { ...process.env, PORT: String(PORT), SUPPORT_COPILOT_DB_PATH: DB_PATH },
+    env: childEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

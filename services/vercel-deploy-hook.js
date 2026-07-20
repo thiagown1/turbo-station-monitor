@@ -75,7 +75,9 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 
 // ─── Config ──────────────────────────────────────────────────────────
-const PORT = Number(process.env.VERCEL_DEPLOY_HOOK_PORT || process.env.PORT || 3010);
+const { resolveServicePort } = require('./lib/service-port');
+
+const PORT = resolveServicePort('VERCEL_DEPLOY_HOOK_PORT', 3010, '[vercel-deploy-hook]');
 const WEBHOOK_SECRET = process.env.VERCEL_WEBHOOK_SECRET || '';
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB — webhook payloads are tiny
 
@@ -452,7 +454,8 @@ async function relay(e) {
 function handle(req, res) {
   // Health check.
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/vercel-deploy-hook/health')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+    res.writeHead(200, { 'Content-Type': 'application/json', 'X-Service': 'vercel-deploy-hook' });
     res.end(JSON.stringify({ ok: true, service: 'vercel-deploy-hook', secretConfigured: !!WEBHOOK_SECRET }));
     return;
   }
