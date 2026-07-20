@@ -18,8 +18,9 @@
  * needs no per-service knowledge and keeps working as services are added.
  *
  * Usage:
- *   node scripts/check-ports.js              # all three checks
- *   node scripts/check-ports.js --no-nginx   # skip the vhost read (no sudo)
+ *   node scripts/check-ports.js                        # all three checks
+ *   node scripts/check-ports.js --no-nginx             # skip the vhost read (no sudo)
+ *   node scripts/check-ports.js --only vercel-drain    # one service, e.g. after a restart
  *
  * Exits 0 when clean, 1 on any failure — safe to wire into cron or the
  * alert-engine.
@@ -173,20 +174,38 @@ async function checkIdentity(services) {
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
+/** `--only a,b` limits the live probe; config/nginx always cover the full map. */
+function parseOnly() {
+    const i = process.argv.indexOf('--only');
+    if (i === -1) return null;
+    const names = (process.argv[i + 1] || '').split(',').map(s => s.trim()).filter(Boolean);
+    const known = new Set(SERVICES.map(s => s.name));
+    const unknown = names.filter(n => !known.has(n));
+    if (names.length === 0 || unknown.length > 0) {
+        console.error(`[check-ports] --only: unknown service(s) ${unknown.join(', ') || '(none given)'}`);
+        console.error(`[check-ports] known: ${[...known].join(', ')}`);
+        process.exit(2);
+    }
+    return new Set(names);
+}
+
 async function main() {
     const services = resolvePorts();
+    const only = parseOnly();
     const byPort = checkConfig(services);
     if (!process.argv.includes('--no-nginx')) checkNginx(byPort);
-    await checkIdentity(services);
+
+    const probed = only ? services.filter(s => only.has(s.name)) : services;
+    await checkIdentity(probed);
 
     for (const n of notes) console.log(`[check-ports] NOTE  ${n}`);
 
     if (failures.length === 0) {
         console.log(
-            `[check-ports] OK — ${services.length} services, distinct ports, ` +
+            `[check-ports] OK — ${probed.length} service(s) probed, distinct ports, ` +
             `each socket owned by exactly one process`
         );
-        for (const s of services) console.log(`[check-ports]   ${s.name} -> :${s.port}`);
+        for (const s of probed) console.log(`[check-ports]   ${s.name} -> :${s.port}`);
         process.exit(0);
     }
 
