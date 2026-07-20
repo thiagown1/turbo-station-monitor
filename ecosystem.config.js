@@ -82,11 +82,16 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '100M',
+      // Stop after 10 rapid restarts instead of looping forever: a port
+      // collision (EADDRINUSE) must surface as `errored` in `pm2 ls`, not hide
+      // behind a five-figure restart counter. See services/lib/service-port.js.
+      max_restarts: 10,
+      min_uptime: '30s',
       error_file: './logs/vercel-drain-error.log',
       out_file: './logs/vercel-drain-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv, PORT: dotenv.VERCEL_DRAIN_PORT || 3001 }
+      env: { ...dotenv, VERCEL_DRAIN_PORT: dotenv.VERCEL_DRAIN_PORT || 3001 }
     },
     {
       name: 'github-webhook',
@@ -96,11 +101,13 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '100M',
+      max_restarts: 10,
+      min_uptime: '30s',
       error_file: './logs/github-webhook-error.log',
       out_file: './logs/github-webhook-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv, PORT: dotenv.GITHUB_WEBHOOK_PORT || 3002 }
+      env: { ...dotenv, GITHUB_WEBHOOK_PORT: dotenv.GITHUB_WEBHOOK_PORT || 3002 }
     },
     {
       name: 'mobile-telemetry',
@@ -111,11 +118,13 @@ module.exports = {
       autorestart: true,
       watch: false,
       max_memory_restart: '150M',
+      max_restarts: 10,
+      min_uptime: '30s',
       error_file: './logs/mobile-telemetry-error.log',
       out_file: './logs/mobile-telemetry-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv, PORT: dotenv.MOBILE_TELEMETRY_PORT || 3003 }
+      env: { ...dotenv, MOBILE_TELEMETRY_PORT: dotenv.MOBILE_TELEMETRY_PORT || 3003 }
     },
     {
       name: 'pagarme-status-webhook',
@@ -129,7 +138,7 @@ module.exports = {
       out_file: './logs/pagarme-status-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv, PORT: dotenv.PAGARME_WEBHOOK_PORT || 3004 }
+      env: { ...dotenv, PAGARME_WEBHOOK_PORT: dotenv.PAGARME_WEBHOOK_PORT || 3004 }
     },
     {
       name: 'alert-engine',
@@ -161,7 +170,7 @@ module.exports = {
       merge_logs: true,
       env: {
         ...dotenv,
-        PORT: dotenv.SUPPORT_COPILOT_PORT || 3005,
+        SUPPORT_COPILOT_PORT: dotenv.SUPPORT_COPILOT_PORT || 3005,
         EVOLUTION_API_URL: `http://localhost:${dotenv.GATEWAY_PORT || 3006}`,
         EVOLUTION_API_KEY: dotenv.EVOLUTION_API_KEY || '',
         EVOLUTION_WEBHOOK_SECRET: dotenv.EVOLUTION_WEBHOOK_SECRET || '',

@@ -11,8 +11,10 @@ const path = require('path');
 
 // ─── Server ─────────────────────────────────────────────────────────────────────
 
-/** HTTP port for the service. */
-const PORT = parseInt(process.env.PORT || '3003', 10);
+/** HTTP port for the service. Never reads the generic PORT — see service-port.js. */
+const { resolveServicePort, BIND_HOST } = require('../../lib/service-port');
+
+const PORT = resolveServicePort('MOBILE_TELEMETRY_PORT', 3003, '[mobile-telemetry]');
 
 // ─── Authentication ─────────────────────────────────────────────────────────────
 
@@ -67,6 +69,7 @@ const LOG_TAG = '[mobile-telemetry]';
 
 module.exports = {
     PORT,
+    BIND_HOST,
     TELEMETRY_API_KEY,
     MONITOR_API_SECRET,
     DB_PATH,

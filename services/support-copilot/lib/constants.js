@@ -5,7 +5,9 @@
 
 const path = require('path');
 
-const PORT = parseInt(process.env.PORT || '3005', 10);
+const { resolveServicePort, BIND_HOST } = require('../../lib/service-port');
+
+const PORT = resolveServicePort('SUPPORT_COPILOT_PORT', 3005, '[support-copilot]');
 
 /** Shared secret for dashboard → support API. Falls back to MONITOR_API_SECRET for compat. */
 const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
@@ -49,6 +51,7 @@ const EVOLUTION_INSTANCE_BRAND_MAP = (process.env.EVOLUTION_INSTANCE_MAP || '')
 
 module.exports = {
   PORT,
+  BIND_HOST,
   SUPPORT_API_SECRET,
   DB_PATH,
   MAX_PAYLOAD_BYTES,

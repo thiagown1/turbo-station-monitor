@@ -19,7 +19,7 @@
  */
 
 const express = require('express');
-const { PORT, LOG_TAG } = require('./lib/constants');
+const { PORT, BIND_HOST, LOG_TAG } = require('./lib/constants');
 const { db } = require('./lib/db'); // ensure DB is initialised before routes
 
 // ─── App Setup ──────────────────────────────────────────────────────────────────
@@ -66,8 +66,8 @@ app.use((err, _req, res, _next) => {
 // ─── Server (only when run directly, not when imported by tests) ────────────
 
 if (require.main === module) {
-    const server = app.listen(PORT, () => {
-        console.log(`${LOG_TAG} Server listening on port ${PORT}`);
+    const server = app.listen(PORT, BIND_HOST, () => {
+        console.log(`${LOG_TAG} Server listening on ${BIND_HOST}:${PORT}`);
         console.log(`${LOG_TAG} Routes:`);
         console.log(`${LOG_TAG}   GET  /health`);
         console.log(`${LOG_TAG}   GET  /ping`);

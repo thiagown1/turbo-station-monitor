@@ -6,7 +6,7 @@
  * filters out noise, and writes relevant logs to SQLite.
  * 
  * Usage:
- *   PORT=3001 DRAIN_SECRET=your-secret node vercel-drain.js
+ *   VERCEL_DRAIN_PORT=3001 DRAIN_SECRET=your-secret node vercel-drain.js
  * 
  * Vercel Dashboard Configuration:
  *   1. Go to: https://vercel.com/[team]/settings/log-drains
@@ -21,9 +21,10 @@ const http = require('http');
 const Database = require('better-sqlite3');
 const path = require('path');
 const crypto = require('crypto');
+const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 
 // Configuration
-const PORT = process.env.PORT || 3001;
+const PORT = resolveServicePort('VERCEL_DRAIN_PORT', 3001, '[vercel-drain]');
 const DRAIN_SECRET = process.env.DRAIN_SECRET || '';
 const TELEMETRY_API_KEY = process.env.TELEMETRY_API_KEY || 'f593c26c80894c8aef64a4c977f280d8ae687387b049f454';
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b367b04b35758df55a42b72d3c9ba65';
@@ -472,7 +473,8 @@ function handleRequest(req, res) {
  */
 function handleHealthCheck(req, res) {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/ping')) {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    // X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+    res.writeHead(200, { 'Content-Type': 'application/json', 'X-Service': 'vercel-drain' });
     res.end(JSON.stringify({
       status: 'ok',
       uptime: process.uptime(),
@@ -533,8 +535,8 @@ process.on('SIGINT', () => {
 });
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`[vercel-drain] Server listening on port ${PORT}`);
+server.listen(PORT, BIND_HOST, () => {
+  console.log(`[vercel-drain] Server listening on ${BIND_HOST}:${PORT}`);
   console.log(`[vercel-drain] Endpoint: http://localhost:${PORT}/vercel-drain`);
   console.log(`[vercel-drain] Health check: http://localhost:${PORT}/health`);
   console.log(`[vercel-drain] Signature verification: ${DRAIN_SECRET ? 'ENABLED' : 'DISABLED'}`);

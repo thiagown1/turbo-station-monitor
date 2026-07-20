@@ -11,7 +11,11 @@ const { Router } = require('express');
 
 const router = Router();
 
-router.get('/health', (_req, res) => res.send('OK\n'));
-router.get('/ping', (_req, res) => res.send('OK\n'));
+// X-Service lets scripts/check-ports.js tell WHICH process owns this socket —
+// github-webhook answers 'OK\n' too, so the body alone cannot identify us.
+const ok = (_req, res) => res.set('X-Service', 'mobile-telemetry').send('OK\n');
+
+router.get('/health', ok);
+router.get('/ping', ok);
 
 module.exports = router;
