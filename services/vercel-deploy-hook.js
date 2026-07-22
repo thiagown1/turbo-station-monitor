@@ -92,6 +92,10 @@ const ALERTS_BRAND = process.env.DEPLOY_WATCH_ALERTS_BRAND || 'turbo_station';
 const ALERTS_CONVERSATION_ID = process.env.DEPLOY_HOOK_ALERTS_CONV || 'conv_jiuijxjtmnet23i9';
 const MESSAGE_SOURCE = 'vercel-deploy-hook';
 
+// Next.js prod base + kill switch for the deploy-watch trigger (see startDeployWatch).
+const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://www.turbostation.com.br').replace(/\/+$/, '');
+const ENABLE_WATCH_START = process.env.DEPLOY_HOOK_START_WATCH !== '0';
+
 // Telegram — mirror auto-rollback-watchdog.js sendTelegram (openclaw CLI).
 const DEPLOY_TELEGRAM_GROUP =
   process.env.DEPLOY_TELEGRAM_GROUP || process.env.ALERT_TELEGRAM_GROUP || 'telegram:-5102620169';
@@ -200,9 +204,24 @@ const RELEVANT_TYPES = new Set([
   'deployment.succeeded',
 ]);
 
+/**
+ * "This deployment is now serving production."
+ *
+ * Vercel OMITS `target` on `deployment.promoted` — observed null on 7/7 real
+ * promotions between 2026-06-22 and 2026-07-11 — so a `target === 'production'`
+ * test is never true for it. Two things were silently broken by that: the smoke
+ * checklist never ran once, and every real production promotion was announced to
+ * the team as "Deploy em preview".
+ *
+ * Preview deployments are never "promoted", so accept a missing target and only
+ * reject an explicit preview (defensive, in case Vercel starts sending one).
+ */
+const isProductionPromotion = (e) =>
+  e.type === 'deployment.promoted' && e.target !== 'preview';
+
 // ─── Message formatting ──────────────────────────────────────────────
 function formatMessage(e) {
-  const isProd = e.target === 'production';
+  const isProd = e.target === 'production' || isProductionPromotion(e);
   const scope = isProd ? 'produção' : (e.target ? `preview (${e.target})` : 'preview');
   const lines = [];
   if (e.type === 'deployment.error') {
@@ -433,13 +452,69 @@ async function sendWhatsApp(text) {
   }
 }
 
+// ─── Deploy-watch trigger (event-driven; no sha inference) ──
+
+/**
+ * Open the post-deploy watch window (T+0 announcement, +15min/+1h/+2h digests,
+ * failure-spike alerts) for this deployment.
+ *
+ * Until now the ONLY caller of this endpoint was the polling trigger
+ * (nextjs-deploy-trigger.js), which INFERS a deploy from a change in the sha
+ * reported by /api/version. That inference is what opened a phantom 2h watch on
+ * 2026-07-21 when /api/version blipped. Firing here instead means the window is
+ * opened by the real Vercel event, carrying the real git sha from the payload.
+ *
+ * Fires on `deployment.promoted`, NOT on `deployment.succeeded`: succeeded only
+ * means the build finished, and while production is pinned by an instant
+ * rollback a new build can succeed WITHOUT ever being promoted. Promotion is the
+ * moment production traffic actually moves — which is what the polling trigger
+ * was approximating by watching the live /api/version.
+ *
+ * The endpoint is idempotent on the sha, so the polling trigger's later POST for
+ * the same sha answers duplicate:true and does NOT re-announce — it stays a
+ * harmless backstop for when this box misses a delivery. Best-effort: never
+ * throws, runs after the 200.
+ */
+async function startDeployWatch(e) {
+  if (!ENABLE_WATCH_START) return;
+  if (!MONITOR_API_SECRET) {
+    log('deploy-watch start skipped: MONITOR_API_SECRET unset');
+    return;
+  }
+  // Same shape guard the endpoint's own trigger uses — never post a non-sha as a
+  // watch id, which is exactly what the phantom watch was.
+  if (!SHA_RE.test(String(e.sha || ''))) {
+    log(`deploy-watch start skipped: payload sha not usable (${e.sha7})`);
+    return;
+  }
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 10000);
+  try {
+    const r = await fetch(`${DASHBOARD_URL}/api/deploy-watch/start`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-api-secret': MONITOR_API_SECRET },
+      body: JSON.stringify({
+        sha: e.sha,
+        deployedAt: new Date().toISOString(),
+        environment: 'production',
+      }),
+      signal: ctrl.signal,
+    });
+    const txt = await r.text().catch(() => '');
+    log(`deploy-watch start sha=${e.sha7} -> ${r.status} ${elide(txt, 160)}`);
+  } catch (err) {
+    log('deploy-watch start failed:', err && err.message);
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 // ─── Relay both channels (after the 200, never blocks the response) ──
 async function relay(e) {
   let text = formatMessage(e);
   // On a PRODUCTION promotion, append a diff-derived manual smoke checklist.
   // Never blocks the 200 (relay runs in setImmediate) and never throws into it.
-  if (ENABLE_SMOKE && e.type === 'deployment.promoted' && e.target === 'production'
-      && SHA_RE.test(String(e.sha || ''))) {
+  if (ENABLE_SMOKE && isProductionPromotion(e) && SHA_RE.test(String(e.sha || ''))) {
     try {
       const block = await buildSmokeChecklist(e.sha);
       if (block) text += '\n' + block;
@@ -529,7 +604,15 @@ function handle(req, res) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, type: e.type, sha: e.sha7, target: e.target }));
 
-    setImmediate(() => { relay(e).catch(err => log('relay error:', err && err.message)); });
+    setImmediate(() => {
+      // Open the watch window on the real promotion event (see startDeployWatch).
+      // Independent of the relay: a WhatsApp hiccup must not cost us the watch,
+      // and a failed watch must not cost us the notification.
+      if (isProductionPromotion(e)) {
+        startDeployWatch(e).catch(err => log('deploy-watch start threw:', err && err.message));
+      }
+      relay(e).catch(err => log('relay error:', err && err.message));
+    });
   });
 
   req.on('error', (err) => log('request error:', err.message));
