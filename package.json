@@ -9,7 +9,7 @@
     "restart": "pm2 restart ecosystem.config.js",
     "status": "pm2 list",
     "logs": "pm2 logs",
-    "test": "node test/test-causal-correlation.js && node test/test-charger-fault-backoff.js && node test/test-cable-theft-alert.js && node test/test-cable-theft-burst.js && node test/test-whatsapp-delivery-confirm.js && node --test test/test-service-port.js",
+    "test": "node test/test-causal-correlation.js && node test/test-charger-fault-backoff.js && node test/test-cable-theft-alert.js && node test/test-cable-theft-burst.js && node test/test-whatsapp-delivery-confirm.js && node --test test/test-service-port.js && node test/test-deploy-hook-watch.js",
     "test:ports": "node --test test/test-service-port.js",
     "check:ports": "node scripts/check-ports.js",
     "test:telemetry": "node test/test-telemetry-endpoint.js",
