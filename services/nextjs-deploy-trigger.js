@@ -18,23 +18,34 @@ const STATE = path.join(__dirname, '..', 'db', 'nextjs-deploy-trigger.state');
 
 function log(...a) { console.log(new Date().toISOString(), '[nextjs-deploy-trigger]', ...a); }
 
+/** A real build sha as reported by /api/version: 7-40 hex chars. */
+const GIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
+
+/**
+ * The production build's git sha, or null when it cannot be determined.
+ *
+ * ONLY /api/version is trusted, and only when it answers something shaped like a
+ * git sha. There used to be an `x-vercel-id` fallback here — that header carries
+ * a per-REQUEST id (`<pop>-<timestamp>-<hash>`), NOT a deployment id, so it is
+ * different on every single poll. One transient failure of /api/version was
+ * therefore enough to look like a brand-new deploy: that is exactly what fired a
+ * phantom 2h deploy-watch at 08:25Z on 2026-07-21 with sha
+ * `7ncz8-1784622352485-f2df2ef2f245` (no Vercel deployment existed).
+ *
+ * Returning null just skips this tick. We poll every 60s and only fire on a
+ * change, so a real deploy is still caught on the next poll — there is nothing
+ * to gain from guessing.
+ */
 async function currentSha() {
   try {
     const r = await fetch(`${BASE}/api/version`, { method: 'GET', redirect: 'manual' });
     if (r.ok) {
       const j = await r.json().catch(() => null);
       const sha = j && (j.sha || j.commit || j.gitCommitSha);
-      if (sha && String(sha).length >= 4 && String(sha) !== 'unknown') return String(sha);
+      // GIT_SHA_RE also rejects the route's 'unknown' sentinel (non-hex chars).
+      if (sha && GIT_SHA_RE.test(String(sha))) return String(sha);
     }
   } catch { /* fall through */ }
-  try {
-    const r = await fetch(`${BASE}/`, { method: 'HEAD', redirect: 'manual' });
-    const id = r.headers.get('x-vercel-id') || r.headers.get('x-vercel-deployment-url');
-    if (id) {
-      const slug = String(id).split('::').pop().replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 64);
-      if (slug.length >= 4) return slug;
-    }
-  } catch { /* ignore */ }
   return null;
 }
 
