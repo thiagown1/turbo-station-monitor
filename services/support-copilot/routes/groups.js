@@ -82,31 +82,45 @@ router.get('/by-partner', (req, res) => {
   res.json({ conversationId: row.conversation_id, enabled: !!row.enabled });
 });
 
-// GET recent PIX receipts posted in the partner's linked group(s). Consumed by
-// the Next.js confirm-partner-payments cron / dashboard button via
-// next/lib/services/partner-receipts.ts. Vision extraction runs HERE (the file
-// and any payer/payee names never leave this box — LGPD); the response carries
-// ONLY { amountCents, receiptRef, sourceMessageId, at }. Registered BEFORE the
-// /:convId routes so "receipts" is not swallowed by the convId param.
+// GET recent PIX receipts posted in the partner's linked group(s), OR — via
+// ?convId= — in an arbitrary group conversation (the internal "Contas" bills
+// group, which has no partner link; consumed by the Next.js accounting
+// bill-receipts route). Consumed by the Next.js confirm-partner-payments cron /
+// dashboard button via next/lib/services/partner-receipts.ts. Vision extraction
+// runs HERE (the file and any payer/payee names never leave this box — LGPD);
+// the response carries ONLY { amountCents, receiptRef, sourceMessageId, at }.
+// Registered BEFORE the /:convId routes so "receipts" is not swallowed by the
+// convId param.
 router.get('/receipts', async (req, res) => {
   try {
-    const { partnerId, brandId } = req.query || {};
-    if (!partnerId) return res.status(400).json({ error: 'partnerId is required' });
+    const { partnerId, convId: convIdParam, brandId } = req.query || {};
+    if (!partnerId && !convIdParam) return res.status(400).json({ error: 'partnerId or convId is required' });
     let sinceHours = parseInt(req.query.sinceHours, 10);
     if (!Number.isFinite(sinceHours) || sinceHours <= 0) sinceHours = RECEIPTS_DEFAULT_SINCE_HOURS;
     sinceHours = Math.min(sinceHours, RECEIPTS_MAX_SINCE_HOURS);
 
-    let links = brandId
-      ? db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND brand_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId, brandId)
-      : db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId);
     // Tenant guard (same convention as groupConv): the dashboard proxy forwards
     // x-brand-id; cross-brand access reads as 404 (no existence leak).
     const reqBrand = req.headers['x-brand-id'] || '';
-    if (reqBrand) links = links.filter((l) => !l.brand_id || l.brand_id === reqBrand);
-    if (!links.length) return res.status(404).json({ error: 'no linked group for partner' });
+
+    let convIds;
+    if (partnerId) {
+      let links = brandId
+        ? db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND brand_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId, brandId)
+        : db.prepare('SELECT * FROM group_partner_links WHERE partner_id = ? AND enabled = 1 ORDER BY updated_at DESC').all(partnerId);
+      if (reqBrand) links = links.filter((l) => !l.brand_id || l.brand_id === reqBrand);
+      if (!links.length) return res.status(404).json({ error: 'no linked group for partner' });
+      convIds = [...new Set(links.map((l) => l.conversation_id).filter(Boolean))];
+    } else {
+      // Direct conversation target — must exist and match the caller's brand.
+      const conv = db.prepare('SELECT id, brand_id FROM conversations WHERE id = ?').get(String(convIdParam));
+      if (!conv || (reqBrand && conv.brand_id && conv.brand_id !== reqBrand)) {
+        return res.status(404).json({ error: 'conversation not found' });
+      }
+      convIds = [conv.id];
+    }
 
     const sinceIso = new Date(Date.now() - sinceHours * 3600 * 1000).toISOString();
-    const convIds = [...new Set(links.map((l) => l.conversation_id).filter(Boolean))];
 
     // Inbound only: partners/operators post the comprovante from their own
     // numbers; our outbound PDFs (closing reports) are not receipts.

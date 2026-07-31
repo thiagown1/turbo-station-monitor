@@ -183,6 +183,21 @@ test('resolves the partner group, applies filters, and returns cached receipts i
             throw new Error('widened window expected both receipts, got ' + JSON.stringify(wide.body.receipts));
           }
 
+          // convId variant (no partner link needed — the internal bills group)
+          const byConv = await supertest(app).get('/receipts?convId=conv1&brandId=turbo_station').set('x-brand-id', 'turbo_station');
+          if (byConv.status !== 200) throw new Error('expected 200 by convId, got ' + byConv.status + ': ' + JSON.stringify(byConv.body));
+          if (!Array.isArray(byConv.body.receipts) || byConv.body.receipts.length !== 1 || byConv.body.receipts[0].sourceMessageId !== 'WA1') {
+            throw new Error('convId variant expected the same m1 receipt, got ' + JSON.stringify(byConv.body));
+          }
+
+          // convId of an unknown conversation → 404
+          const badConv = await supertest(app).get('/receipts?convId=conv_nope');
+          if (badConv.status !== 404) throw new Error('expected 404 for unknown convId, got ' + badConv.status);
+
+          // convId cross-brand → 404 (tenant guard, no existence leak)
+          const crossConv = await supertest(app).get('/receipts?convId=conv1').set('x-brand-id', 'other_brand');
+          if (crossConv.status !== 404) throw new Error('expected 404 for cross-brand convId, got ' + crossConv.status);
+
           console.log('receipts-route-ok');
         })().catch((err) => { console.error(err.message); process.exit(1); });
         `,
