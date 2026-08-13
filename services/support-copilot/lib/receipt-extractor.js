@@ -21,10 +21,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { LOG_TAG } = require('./constants');
-
-/** Same directory routes/ingest-evolution.js saves inbound media to. */
-const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
+const { LOG_TAG, MEDIA_DIR } = require('./constants');
 
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 /** Cheap vision-capable model; override with RECEIPT_VISION_MODEL. */

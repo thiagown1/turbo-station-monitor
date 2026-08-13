@@ -17,7 +17,7 @@
 
 const { Router } = require('express');
 const { db, stmts, nowIso, randomId, mergeConversations } = require('../lib/db');
-const { LOG_TAG, EVOLUTION_API_KEY } = require('../lib/constants');
+const { LOG_TAG, MEDIA_DIR, EVOLUTION_API_KEY } = require('../lib/constants');
 const { sendText, sendMedia } = require('../lib/evolution-client');
 const { emitEvent } = require('../lib/sse');
 const { generateSuggestion, injectIntoSession, buildContextPreview, compactSession, extractLearnedRule, removeSuggestionFromSession, resetAgentSession } = require('../lib/copilot');
@@ -268,7 +268,7 @@ router.post('/:id/media', async (req, res) => {
   const ext = mimetype.split('/')[1]?.split(';')[0] || 'bin';
   const mediaId = randomId('media').replace(/^media_/, '');
   const localFileName = `${mediaId}.${ext}`;
-  const mediaDir = path.join(path.dirname(require('../lib/constants').DB_PATH), 'media');
+  const mediaDir = MEDIA_DIR;
   fs.mkdirSync(mediaDir, { recursive: true });
   const filePath = path.join(mediaDir, localFileName);
   fs.writeFileSync(filePath, Buffer.from(base64, 'base64'));
@@ -836,7 +836,6 @@ router.post('/:id/messages/:msgId/process-media', (req, res) => {
 
   // Process in background
   const path = require('path');
-  const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
   const { processMedia } = require('../lib/media-processor');
   const mediaFilePath = path.join(MEDIA_DIR, path.basename(media.url || ''));
 
@@ -887,7 +886,6 @@ router.post('/nuke', async (req, res) => {
 
   const fs = require('fs');
   const path = require('path');
-  const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
   const counts = {};
 
   // 1. Wipe DB tables

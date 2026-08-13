@@ -29,7 +29,7 @@ const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
-const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
+const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const { enqueueContadorMessage } = require('../lib/contador-runtime');
@@ -37,7 +37,6 @@ const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 
 const router = Router();
-const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
 // Ensure media directory exists
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 

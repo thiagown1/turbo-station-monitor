@@ -62,6 +62,7 @@ queried on demand, never read from memory files.
 | `CONTADOR_OPENCLAW_MODEL` | no | default `claude-cli/claude-opus-4-8` |
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
+| `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
 
 Provision the dedicated OpenClaw agent with a workspace based on
 `contador-workspace/`. Its identity and long-term notes live there; the SQLite

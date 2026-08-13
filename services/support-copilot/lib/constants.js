@@ -16,6 +16,10 @@ const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR
 const DB_PATH = process.env.SUPPORT_COPILOT_DB_PATH ||
   path.join(__dirname, '..', '..', '..', 'db', 'support-copilot.sqlite');
 
+/** Shared inbound-media directory. Independent from DB_PATH in production. */
+const MEDIA_DIR = path.resolve(process.env.SUPPORT_COPILOT_MEDIA_DIR ||
+  path.join(__dirname, '..', '..', '..', 'db', 'media'));
+
 const MAX_PAYLOAD_BYTES = 20 * 1024 * 1024; // 20 MB (for base64 media uploads)
 
 const LOG_TAG = '[support-copilot]';
@@ -66,6 +70,7 @@ module.exports = {
   BIND_HOST,
   SUPPORT_API_SECRET,
   DB_PATH,
+  MEDIA_DIR,
   MAX_PAYLOAD_BYTES,
   LOG_TAG,
   EVOLUTION_API_URL,
