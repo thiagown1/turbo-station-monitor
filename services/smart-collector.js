@@ -124,7 +124,9 @@ let restPollInterval = null; // interval handle for REST polling
 let lastRestCursorIso = null; // ISO timestamp of last ingested REST entry
 
 // === WS HEALTH TRACKING ===
-let lastWsMessageAt = 0; // timestamp (ms) of last WS message received
+// Only actual log payloads prove that the OCPP stream is healthy. Status and
+// keepalive frames may continue while charger logs are stalled.
+let lastWsMessageAt = 0; // timestamp (ms) of last WS log entry/batch received
 const WS_SILENCE_THRESHOLD_MS = 30_000; // activate REST fallback after 30s of WS silence
 let wsHealthCheckInterval = null;
 
@@ -234,6 +236,18 @@ function stopRestPolling() {
     console.log('🌐 REST fallback PAUSED (WS recovered)');
 }
 
+function hasWsLogs(message) {
+    return Boolean(
+        (message?.type === 'log_entry' && message.data) ||
+        (message?.type === 'log_batch' && Array.isArray(message.data?.entries) && message.data.entries.length > 0)
+    );
+}
+
+function markWsLogsHealthy() {
+    lastWsMessageAt = Date.now();
+    if (restPollStarted) stopRestPolling();
+}
+
 // Periodically check if WS went silent and toggle REST polling
 function startWsHealthCheck() {
     if (wsHealthCheckInterval) return;
@@ -251,13 +265,9 @@ function connect() {
 
     ws.on('open', () => {
         console.log('✅ Smart Collector Connected (Enhanced)');
-        lastWsMessageAt = Date.now();
 
         // Start health check — REST polling will activate only if WS goes silent
         startWsHealthCheck();
-
-        // If REST was running (e.g. reconnect), pause it now that WS is back
-        stopRestPolling();
 
         ws.send(JSON.stringify({
             type: 'filter_update',
@@ -269,15 +279,11 @@ function connect() {
     });
 
     ws.on('message', (data) => {
-        lastWsMessageAt = Date.now();
-
-        // WS is alive — if REST fallback was active, pause it
-        if (restPollStarted) stopRestPolling();
-
         try {
             const msg = JSON.parse(data);
 
             if (msg.type === 'log_entry' && msg.data) {
+                markWsLogsHealthy();
                 // Register in dedup set so REST won't re-process
                 isDuplicate(msg.data.timestamp, msg.data.message);
                 processEntry(msg.data);
@@ -285,6 +291,7 @@ function connect() {
             }
 
             if (msg.type === 'log_batch' && msg.data?.entries) {
+                if (msg.data.entries.length > 0) markWsLogsHealthy();
                 for (const e of msg.data.entries) {
                     isDuplicate(e.timestamp, e.message);
                     processEntry(e);
@@ -986,7 +993,8 @@ module.exports = {
     normalizeLogger,
     extractChargerId,
     isValidChargerId,
-    simpleCategoryForDb
+    simpleCategoryForDb,
+    hasWsLogs
 };
 
 if (require.main === module) {

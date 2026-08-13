@@ -64,6 +64,7 @@ services/whatsapp-gateway/auth/
 *.sqlite-wal
 .env.bak*
 *.bak-*
+*.pre-security-audit-*
 **/.bak-*/
 data/
 db/

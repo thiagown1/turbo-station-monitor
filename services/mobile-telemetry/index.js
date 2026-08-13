@@ -28,7 +28,7 @@ const app = express();
 
 // ─── Middleware ──────────────────────────────────────────────────────────────────
 
-const { requireSecret } = require('./middleware/auth');
+const { requireSecret, requireTelemetryKey } = require('./middleware/auth');
 
 // ─── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -42,8 +42,9 @@ app.use('/api/telemetry/heatmap-data', requireSecret, require('./routes/heatmap-
 app.use('/api/telemetry/events', requireSecret, require('./routes/events'));
 app.use('/api/telemetry/funnel-counts', requireSecret, require('./routes/funnel-counts'));
 
-// Mobile app ingestion (auth temporarily disabled — see routes/ingest.js)
-app.use('/api/telemetry/mobile', require('./routes/ingest'));
+// Mobile ingestion uses a dedicated build-time key. MONITOR_API_SECRET remains
+// an operational fallback for controlled backfills and diagnostics.
+app.use('/api/telemetry/mobile', requireTelemetryKey, require('./routes/ingest'));
 
 // User log dumps: POST is public (mobile submits), GET requires secret (admin queries)
 app.use('/api/telemetry/user-logs', require('./routes/user-logs'));
@@ -66,6 +67,8 @@ app.use((err, _req, res, _next) => {
 // ─── Server (only when run directly, not when imported by tests) ────────────
 
 if (require.main === module) {
+    require('./lib/retention').startRetentionSweeps();
+
     const server = app.listen(PORT, BIND_HOST, () => {
         console.log(`${LOG_TAG} Server listening on ${BIND_HOST}:${PORT}`);
         console.log(`${LOG_TAG} Routes:`);

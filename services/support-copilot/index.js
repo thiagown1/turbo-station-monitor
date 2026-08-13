@@ -14,6 +14,7 @@
  */
 
 const express = require('express');
+const crypto = require('crypto');
 const { PORT, BIND_HOST, LOG_TAG, MEDIA_DIR, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
 require('./lib/db'); // ensure DB is initialised before routes
 
@@ -31,6 +32,22 @@ app.get('/health', (_req, res) =>
 app.get('/ping', (_req, res) => res.send('pong'));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
+// Evolution API webhook — uses its own secret and must be mounted before the
+// generic /api/support dashboard middleware below.
+const evolutionAuth = (req, res, next) => {
+  if (!EVOLUTION_WEBHOOK_SECRET) {
+    console.error(`${LOG_TAG} Evolution webhook secret is not configured`);
+    return res.status(503).json({ error: 'Webhook unavailable' });
+  }
+  const header = req.headers['x-webhook-secret'] || req.headers['apikey'];
+  const provided = Buffer.from(String(header || ''));
+  const expected = Buffer.from(EVOLUTION_WEBHOOK_SECRET);
+  if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return next();
+  console.warn(`${LOG_TAG} Evolution webhook auth failed from ${req.ip}`);
+  return res.status(401).json({ error: 'Unauthorized' });
+};
+app.use('/api/support/ingest/evolution', evolutionAuth, require('./routes/ingest-evolution'));
+
 // SSE real-time events (replaces frontend polling)
 const { sseRouter } = require('./lib/sse');
 app.use('/api/support', requireSecret, sseRouter);
@@ -44,21 +61,11 @@ app.use('/api/support/actions', requireSecret, require('./routes/actions'));
 app.use('/api/support/test-runner', requireSecret, require('./routes/test-runner'));
 app.use('/api/support/ingest/whatsapp', requireSecret, require('./routes/ingest'));
 
-// Evolution API webhook — uses its own secret (separate from dashboard auth)
-const evolutionAuth = (req, res, next) => {
-  if (!EVOLUTION_WEBHOOK_SECRET) return next(); // no secret = open (dev)
-  const header = req.headers['x-webhook-secret'] || req.headers['apikey'];
-  if (header === EVOLUTION_WEBHOOK_SECRET) return next();
-  console.warn(`${LOG_TAG} Evolution webhook auth failed from ${req.ip}`);
-  return res.status(401).json({ error: 'Unauthorized' });
-};
-app.use('/api/support/ingest/evolution', evolutionAuth, require('./routes/ingest-evolution'));
-
 // WhatsApp management routes — dashboard can connect/disconnect WhatsApp accounts
 app.use('/api/support/whatsapp', requireSecret, require('./routes/whatsapp'));
 
 // Static media files (no auth — files have random names)
-app.use('/api/support/media', require('express').static(MEDIA_DIR));
+app.use('/api/support/media', requireSecret, require('express').static(MEDIA_DIR));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, BIND_HOST, () => {

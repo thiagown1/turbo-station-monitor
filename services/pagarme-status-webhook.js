@@ -9,27 +9,38 @@
  */
 
 const http = require('http');
-const { exec } = require('child_process');
+const crypto = require('crypto');
+const { spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 
 const PORT = resolveServicePort('PAGARME_WEBHOOK_PORT', 3004, '[pagarme-status-webhook]');
 const TELEGRAM_TARGET = process.env.PAGARME_STATUS_TELEGRAM_TARGET || 'telegram:-5250194812';
-
-// Security model: only allow this exact URL path; no token required.
-
-
-const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024;
+const WEBHOOK_SECRET = process.env.PAGARME_WEBHOOK_SECRET || '';
+const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
+const MAX_PAYLOAD_SIZE = 64 * 1024;
 
 function sendTelegram(text) {
-  const escaped = String(text).replace(/"/g, '\\"').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-  exec(
-    `openclaw message send --channel telegram --target ${TELEGRAM_TARGET} -m "${escaped}"`,
-    { timeout: 10000 },
-    (err) => {
-      if (err) console.error(`[pagarme-status] telegram send failed: ${err.message}`);
-      else console.log('[pagarme-status] telegram sent');
-    }
+  const child = spawn(
+    OPENCLAW_CLI,
+    ['message', 'send', '--channel', 'telegram', '--target', TELEGRAM_TARGET, '--message', String(text)],
+    { shell: false, timeout: 10000, stdio: 'ignore' }
   );
+  child.on('error', (err) => console.error(`[pagarme-status] telegram send failed: ${err.message}`));
+  child.on('close', (code) => {
+    if (code === 0) console.log('[pagarme-status] telegram sent');
+    else console.error(`[pagarme-status] telegram exited with code ${code}`);
+  });
+}
+
+function safeText(value, max) {
+  return String(value || '').replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, max);
+}
+
+function secretOk(header) {
+  if (!WEBHOOK_SECRET || !header) return false;
+  const provided = Buffer.from(String(header));
+  const expected = Buffer.from(WEBHOOK_SECRET);
+  return provided.length === expected.length && crypto.timingSafeEqual(provided, expected);
 }
 
 function ok(res, code, obj) {
@@ -40,10 +51,10 @@ function ok(res, code, obj) {
 function summarize(payload) {
   // statuspage fields vary; handle common ones
   const incident = payload.incident || payload;
-  const name = incident.name || payload.name || 'Pagar.me Status';
-  const status = incident.status || payload.status || payload.event_type || 'update';
-  const impact = incident.impact || payload.impact || '';
-  const url = incident.shortlink || incident.html_url || payload.url || '';
+  const name = safeText(incident.name || payload.name || 'Pagar.me Status', 160);
+  const status = safeText(incident.status || payload.status || payload.event_type || 'update', 80);
+  const impact = safeText(incident.impact || payload.impact || '', 80);
+  const url = safeText(incident.shortlink || incident.html_url || payload.url || '', 300);
 
   // prefer latest update body
   let body = '';
@@ -54,8 +65,7 @@ function summarize(payload) {
     body = incident.body;
   }
 
-  body = String(body || '').trim().replace(/\s+/g, ' ');
-  if (body.length > 240) body = body.slice(0, 240) + '...';
+  body = safeText(body, 240).replace(/\s+/g, ' ');
 
   const lines = [];
   lines.push(`🚦 Pagar.me Status: ${name}`);
@@ -82,6 +92,15 @@ function handler(req, res) {
 
   if (req.method !== 'POST') {
     ok(res, 405, { error: 'method_not_allowed' });
+    return;
+  }
+
+  if (!WEBHOOK_SECRET) {
+    ok(res, 503, { error: 'webhook_unavailable' });
+    return;
+  }
+  if (!secretOk(req.headers['x-webhook-secret'])) {
+    ok(res, 401, { error: 'unauthorized' });
     return;
   }
 
@@ -114,6 +133,10 @@ function handler(req, res) {
   });
 }
 
-http.createServer(handler).listen(PORT, BIND_HOST, () => {
-  console.log(`[pagarme-status] listening on ${BIND_HOST}:${PORT}`);
-});
+if (require.main === module) {
+  http.createServer(handler).listen(PORT, BIND_HOST, () => {
+    console.log(`[pagarme-status] listening on ${BIND_HOST}:${PORT}`);
+  });
+}
+
+module.exports = { handler, summarize, safeText, secretOk };

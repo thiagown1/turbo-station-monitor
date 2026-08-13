@@ -26,10 +26,7 @@ const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 // Configuration
 const PORT = resolveServicePort('VERCEL_DRAIN_PORT', 3001, '[vercel-drain]');
 const DRAIN_SECRET = process.env.DRAIN_SECRET || '';
-const TELEMETRY_API_KEY = process.env.TELEMETRY_API_KEY || 'f593c26c80894c8aef64a4c977f280d8ae687387b049f454';
-const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b367b04b35758df55a42b72d3c9ba65';
 const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '1700081a5b367b04b35758df55a42b72d3c9ba65';
 const DB_PATH = path.join(__dirname, '..', 'db', 'vercel.db');
 const MAX_PAYLOAD_SIZE = 10 * 1024 * 1024; // 10MB max
 
