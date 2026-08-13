@@ -347,6 +347,42 @@ try {
   console.warn(`${LOG_TAG} receipt_extractions migration:`, err.message);
 }
 
+// Contador outbox + daily-run ledger. Incoming webhooks only enqueue work;
+// network/model calls run outside the request and can be retried safely.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contador_jobs (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL UNIQUE,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contador_jobs_due
+      ON contador_jobs(status, next_attempt_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS contador_daily_runs (
+      run_date TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador migrations:`, err.message);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function nowIso() { return new Date().toISOString(); }

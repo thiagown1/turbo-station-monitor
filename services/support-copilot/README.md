@@ -1,11 +1,15 @@
 # Support Copilot Service
 
-Standalone Express + SQLite service for AI-powered WhatsApp support.
+Standalone Express + SQLite service for AI-powered WhatsApp support. The
+production WhatsApp connection is owned by the sibling `whatsapp-gateway`
+service, which uses Baileys directly and exposes an Evolution-compatible local
+HTTP contract. There is no external Evolution API process in this deployment.
 
 ## Architecture
 
 ```
-logs.turbostation.com.br/api/support/ → nginx → :3005 → Express → SQLite
+WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:3005) → SQLite
+                                                      └→ dashboard/API via nginx
 ```
 
 - **Port**: 3005 (PM2 managed)
@@ -30,17 +34,17 @@ logs.turbostation.com.br/api/support/ → nginx → :3005 → Express → SQLite
 | POST | `/api/support/conversations/:id/suggestions` | Create AI suggestion |
 | PATCH | `/api/support/conversations/:id/suggestions/:sid` | Accept/reject suggestion |
 | POST | `/api/support/ingest/whatsapp` | Inbound WhatsApp message (generic) |
-| POST | `/api/support/ingest/evolution` | **Inbound from Evolution API webhook** |
+| POST | `/api/support/ingest/evolution` | Inbound Evolution-compatible webhook from the local Baileys gateway |
 
-## Evolution API Integration
+## WhatsApp / Baileys integration
 
 ### Flow
 
 ```
-Customer WhatsApp
+WhatsApp
        │
        ▼
-Evolution API (Docker, port 8080)
+whatsapp-gateway (PM2, port 3006, Baileys session on local disk)
        │ webhook POST (messages.upsert)
        ▼
 POST /api/support/ingest/evolution
@@ -49,27 +53,32 @@ POST /api/support/ingest/evolution
 SQLite (conversations + messages)
        │
        ▼
-Dashboard (polling)
+Dashboard (SSE + API)
        │ operator sends reply
        ▼
-POST /api/support/conversations/:id/messages
+POST /api/support/conversations/:id/messages or Contador outbox
        │ saves to DB + calls Evolution API sendText
        ▼
-Evolution API → Customer WhatsApp
+local Evolution-compatible API (:3006) → Baileys → WhatsApp
 ```
+
+The route and client retain `evolution` names for compatibility with the
+payload/endpoints already used by the dashboard. They do not identify the
+underlying WhatsApp library.
 
 ### Environment Variables
 
 | Variable | Description | Example |
 |----------|-------------|---------|
-| `EVOLUTION_API_URL` | Base URL of Evolution API | `http://localhost:8080` |
-| `EVOLUTION_API_KEY` | Global API key | `your-api-key` |
-| `EVOLUTION_WEBHOOK_SECRET` | Optional: verify inbound webhooks | `webhook-secret` |
-| `EVOLUTION_INSTANCE_MAP` | Map instance→brand | `turbostation:turbo,zev:zev` |
+| `EVOLUTION_API_URL` | Local Baileys gateway compatibility URL | `http://localhost:3006` |
+| `EVOLUTION_API_KEY` | Shared local gateway API key | secret |
+| `EVOLUTION_WEBHOOK_SECRET` | Verifies gateway → copilot webhooks | secret |
+| `EVOLUTION_INSTANCE_MAP` | Map instance→brand | `turbostation:turbo_station` |
 
-### Evolution API Webhook Setup
+### Gateway webhook setup
 
-Configure Evolution API to send `messages.upsert` events to:
+`ecosystem.config.js` configures `whatsapp-gateway` to send
+`messages.upsert` events to:
 
 ```
 POST https://logs.turbostation.com.br/api/support/ingest/evolution
@@ -101,13 +110,20 @@ curl -X POST https://logs.turbostation.com.br/api/support/ingest/whatsapp \
 ## PM2
 
 ```bash
-pm2 start index.js --name support-copilot --env PORT=3005
+pm2 start ecosystem.config.js --only whatsapp-gateway,support-copilot
 pm2 save
-pm2 logs support-copilot
+pm2 logs whatsapp-gateway support-copilot
 ```
+
+The gateway owns the WhatsApp socket, QR/auth state and media download. The
+copilot owns webhook authentication, conversation/message persistence,
+operator sends and agent routing. See [docs/CONTADOR.md](docs/CONTADOR.md) for
+the accounting-agent boundaries and activation runbook.
 
 ## Database
 
-SQLite with WAL mode. Tables: `brands`, `conversations`, `messages`, `suggestions`, `audit_log`.
+SQLite with WAL mode. Core tables: `brands`, `conversations`, `messages`,
+`suggestions`, `audit_log`; feature tables are added by idempotent startup
+migrations, including the Contador outbox and daily-run ledger.
 
-Schema auto-created on first connection. No migrations needed.
+Schema and migrations run automatically on startup.
