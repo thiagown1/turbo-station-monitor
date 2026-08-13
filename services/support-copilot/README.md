@@ -74,6 +74,7 @@ underlying WhatsApp library.
 | `EVOLUTION_API_KEY` | Shared local gateway API key | secret |
 | `EVOLUTION_WEBHOOK_SECRET` | Verifies gateway → copilot webhooks | secret |
 | `EVOLUTION_INSTANCE_MAP` | Map instance→brand | `turbostation:turbo_station` |
+| `SUPPORT_COPILOT_MEDIA_DIR` | Shared inbound-media directory | repository `db/media` by default |
 
 ### Gateway webhook setup
 

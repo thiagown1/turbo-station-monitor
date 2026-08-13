@@ -15,7 +15,7 @@ const { resolveSuggestionBackend, callSuggestionBackend, isStateless } = require
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
-const { LOG_TAG, DB_PATH } = require('./constants');
+const { LOG_TAG, MEDIA_DIR } = require('./constants');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
 const { classifyConversationOutcome } = require('./outcome-classifier');
@@ -29,8 +29,6 @@ function capBody(body) {
 
 const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/home/openclaw/.npm-global/bin/openclaw';
 const OPENCLAW_SRC_ROOT = process.env.OPENCLAW_SRC_ROOT || '/home/openclaw/openclaw';
-const MEDIA_DIR = path.join(path.dirname(DB_PATH), 'media');
-
 /**
  * Map brand_id → openclaw agent id.
  * Each brand gets an isolated agent workspace with its own knowledge

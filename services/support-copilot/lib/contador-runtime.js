@@ -8,7 +8,7 @@ const { db, nowIso, randomId } = require('./db');
 const { sendText } = require('./evolution-client');
 const { emitEvent } = require('./sse');
 const {
-  DB_PATH,
+  MEDIA_DIR,
   LOG_TAG,
   CONTADOR_ENABLED,
   CONTADOR_GROUP_CONVERSATION_ID,
@@ -22,10 +22,10 @@ const {
 } = require('./constants');
 
 const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/home/openclaw/.npm-global/bin/openclaw';
-const MEDIA_DIR = path.resolve(path.dirname(DB_PATH), 'media');
 const WORKER_INTERVAL_MS = 15_000;
 const HEARTBEAT_INTERVAL_MS = 15 * 60_000;
 const MAX_ATTEMPTS = 5;
+let runtimeStarted = false;
 
 const config = {
   enabled: CONTADOR_ENABLED,
@@ -206,6 +206,11 @@ function enqueueContadorMessage(event) {
     randomId('contador_job'), event.messageId, event.conversationId, event.brandId,
     event.groupJid, payload.instance, classification.kind, JSON.stringify(payload), now, now, now
   );
+  if (result.changes === 1 && runtimeStarted) {
+    setImmediate(() => processPendingJobs().catch((err) => {
+      console.warn(`${LOG_TAG} [contador] immediate worker failed:`, err.message);
+    }));
+  }
   return { ...classification, enqueued: result.changes === 1 };
 }
 
@@ -322,6 +327,7 @@ function startContadorRuntime() {
     SET status = 'failed', last_error = 'interrupted_process', updated_at = ?
     WHERE status = 'processing'
   `).run(recoveredAt);
+  runtimeStarted = true;
   console.log(`${LOG_TAG} [contador] runtime enabled for configured group; heartbeat hour=${CONTADOR_HEARTBEAT_HOUR} America/Sao_Paulo`);
   processPendingJobs().catch((err) => console.warn(`${LOG_TAG} [contador] initial worker failed:`, err.message));
   processHeartbeat().catch((err) => console.warn(`${LOG_TAG} [contador] initial heartbeat failed:`, err.message));

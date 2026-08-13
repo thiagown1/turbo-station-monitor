@@ -14,7 +14,7 @@
  */
 
 const express = require('express');
-const { PORT, BIND_HOST, LOG_TAG, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
+const { PORT, BIND_HOST, LOG_TAG, MEDIA_DIR, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
 require('./lib/db'); // ensure DB is initialised before routes
 
 const app = express();
@@ -58,8 +58,7 @@ app.use('/api/support/ingest/evolution', evolutionAuth, require('./routes/ingest
 app.use('/api/support/whatsapp', requireSecret, require('./routes/whatsapp'));
 
 // Static media files (no auth — files have random names)
-const path = require('path');
-app.use('/api/support/media', require('express').static(path.join(__dirname, '..', '..', 'db', 'media')));
+app.use('/api/support/media', require('express').static(MEDIA_DIR));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
 app.listen(PORT, BIND_HOST, () => {
