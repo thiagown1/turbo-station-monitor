@@ -122,6 +122,8 @@ test('tool loop stops after five calls and asks the agent for an evidence-only f
   assert.equal(result.status, 'sent');
   assert.equal(toolCalls.length, 5);
   assert.equal(toolCalls[0].tool, 'drafts_abertos');
+  assert.match(prompts[0], /protocolo JSON intermediado pelo runtime/i);
+  assert.match(prompts[0], /Nunca responda que uma ferramenta permitida está indisponível/i);
   assert.match(prompts.at(-1), /limite de 5 ferramentas/i);
 });
 

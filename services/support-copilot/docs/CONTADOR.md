@@ -57,7 +57,7 @@ queried on demand, never read from memory files.
 | `CONTADOR_GROUP_CONVERSATION_ID` | yes | exact group JID, e.g. `...@g.us` |
 | `CONTADOR_NEXT_BASE_URL` | yes | Turbo Station app origin, no trailing slash |
 | `CONTADOR_NEXT_SECRET` | yes | scoped Bearer secret; can fall back to `ENERGY_BILL_INTAKE_SECRET` |
-| `CONTADOR_INSTANCE` | no | gateway instance, default `turbostation` |
+| `CONTADOR_INSTANCE` | no | gateway instance, default `turbostation`; set it explicitly to the existing Baileys instance name in production |
 | `CONTADOR_OPENCLAW_AGENT` | no | dedicated agent id, default `contador` |
 | `CONTADOR_OPENCLAW_MODEL` | no | default `claude-cli/claude-opus-4-8` |
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
@@ -65,9 +65,11 @@ queried on demand, never read from memory files.
 | `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
 
 Provision the dedicated OpenClaw agent with a workspace based on
-`contador-workspace/`. Its identity and long-term notes live there; the SQLite
-conversation and fixed session id provide short-term continuity. Do not copy
-secrets or structured monthly values into the workspace.
+`contador-workspace/`. Copy the template after `openclaw agents add` as well,
+so the generated generic `AGENTS.md` cannot replace the Contador protocol. Its
+identity and long-term notes live there; the SQLite conversation and fixed
+session id provide short-term continuity. Do not copy secrets or structured
+monthly values into the workspace.
 
 ## Implemented behavior
 
