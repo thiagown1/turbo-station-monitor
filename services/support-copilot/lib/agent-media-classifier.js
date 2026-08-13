@@ -10,7 +10,8 @@ const SYSTEM = 'Você é o roteador de documentos e incidentes da Turbo Station.
 const PROMPT = `Classifique a mensagem/mídia em exatamente um tipo:
 partner_payment_receipt (comprovante de repasse PIX/TED), expense_receipt (comprovante de dinheiro que saiu da Turbo Station), energy_invoice (fatura/conta de energia), station_support (pedido ou evidência de análise de carregador), support_attention (bug/erro que merece atenção), other.
 Extraia somente o que estiver legível. suggested_reply deve ser curta, em português, e nunca afirmar que um problema foi corrigido.
-JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null}`;
+Para expense_receipt, informe currency (ISO 4217), original_amount e settled_brl_amount. Se for moeda estrangeira e o valor final cobrado em reais não estiver legível, settled_brl_amount deve ser null. Não converta câmbio. Extraia transaction_date (AAAA-MM-DD), competency {year,month} e recurring_hint somente quando houver evidência no documento/texto.
+JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"settled_brl_amount":null,"currency":null,"original_amount":null,"transaction_date":null,"competency":null,"recurring_hint":false,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null}`;
 
 function mediaPart(absPath, mediaType, mimetype) {
   if (!absPath) return null;
@@ -39,6 +40,15 @@ function estimateCost(usage) {
   return ((usage?.prompt_tokens || 0) * inputRate + (usage?.completion_tokens || 0) * outputRate) / 1_000_000;
 }
 
+function extractFinancialFields(parsed) {
+  const currency = cleanString(parsed?.currency, 3)?.toUpperCase();
+  const originalAmountMinor = parseAmountToCents(parsed?.original_amount) || undefined;
+  const amountCents = currency && currency !== 'BRL'
+    ? (parseAmountToCents(parsed?.settled_brl_amount) || undefined)
+    : (parseAmountToCents(parsed?.settled_brl_amount) || parseAmountToCents(parsed?.amount) || undefined);
+  return { currency, originalAmountMinor, amountCents };
+}
+
 async function classifyMessage({ absPath, mediaType, mimetype, body, context, model }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return { status: 'error', reason: 'no_api_key', environmental: true };
@@ -65,13 +75,23 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
   const kinds = new Set(['partner_payment_receipt', 'expense_receipt', 'energy_invoice', 'station_support', 'support_attention', 'other']);
   if (!parsed || !kinds.has(parsed.kind)) return { status: 'error', reason: 'unparseable_reply' };
   const usage = data?.usage || {};
+  const { currency, originalAmountMinor, amountCents } = extractFinancialFields(parsed);
+  const competency = parsed.competency && Number.isInteger(Number(parsed.competency.year)) && Number.isInteger(Number(parsed.competency.month))
+    && Number(parsed.competency.month) >= 1 && Number(parsed.competency.month) <= 12
+    ? { year: Number(parsed.competency.year), month: Number(parsed.competency.month) }
+    : undefined;
   return {
     status: 'ok',
     kind: parsed.kind,
     summary: cleanString(parsed.summary, 1000) || 'Mídia recebida pelo WhatsApp',
     confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
     needsAttention: parsed.needs_attention === true,
-    amountCents: parseAmountToCents(parsed.amount) || undefined,
+    amountCents,
+    currency,
+    originalAmountMinor,
+    transactionDate: /^\d{4}-\d{2}-\d{2}$/.test(String(parsed.transaction_date || '')) ? parsed.transaction_date : undefined,
+    suggestedPeriod: competency,
+    recurringHint: parsed.recurring_hint === true,
     receiptRef: cleanString(parsed.transaction_id, 200),
     payee: cleanString(parsed.payee, 300),
     suggestedCategory: cleanString(parsed.suggested_category, 100),
@@ -85,4 +105,4 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
   };
 }
 
-module.exports = { classifyMessage, estimateCost };
+module.exports = { classifyMessage, estimateCost, extractFinancialFields };

@@ -2,6 +2,7 @@ const path = require('path');
 const { db, nowIso, randomId } = require('./db');
 const { MEDIA_DIR } = require('./receipt-extractor');
 const { classifyMessage } = require('./agent-media-classifier');
+const { parseExpenseDecision, parseExpenseBrlAmount } = require('./expense-decision');
 
 const configCache = new Map();
 let worker = null;
@@ -120,12 +121,59 @@ async function routeInboundMessage(input) {
     amountCents: result.amountCents,
     receiptRef: result.receiptRef,
     payee: result.payee,
+    transactionDate: result.transactionDate,
+    suggestedPeriod: result.suggestedPeriod,
+    currency: result.currency,
+    originalAmountMinor: result.originalAmountMinor,
+    recurringHint: result.recurringHint,
     suggestedCategory: result.suggestedCategory,
     suggestedReply: result.suggestedReply,
     partnerId,
     cost: result.cost,
   });
   return result;
+}
+
+async function routeExpenseDecisionReply(input) {
+  const codeMatch = String(input.quotedBody || '').match(/\bEXP-([A-F0-9]{8})\b/i);
+  const amountCents = parseExpenseBrlAmount(input.body);
+  const action = amountCents ? 'set_brl_amount' : parseExpenseDecision(input.body);
+  if (!codeMatch || !action) return { handled: false };
+  const config = await loadConfig(input.brandId);
+  if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
+    return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
+  }
+  if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
+    || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
+    return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
+  }
+  try {
+    const res = await fetch(`${baseUrl()}/api/agents/expense-decisions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },
+      body: JSON.stringify({
+        brandId: input.brandId,
+        conversationId: input.conversationId,
+        senderId: input.senderId,
+        decisionCode: codeMatch[1].toUpperCase(),
+        action,
+        amountCents,
+        sourceMessageId: input.externalMessageId || input.messageId,
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { handled: true, reply: `Não consegui concluir: ${data.error || `erro ${res.status}`}. Confira no dashboard.` };
+    return {
+      handled: true,
+      reply: action === 'set_brl_amount' ? 'Valor em reais recebido. Enviei as opções para registrar a despesa.'
+        : action === 'reject' ? 'Certo, o comprovante foi ignorado.'
+        : action === 'register_monthly' ? 'Despesa registrada e marcada como recorrente mensal. Os próximos meses continuarão exigindo um comprovante.'
+          : 'Despesa registrada somente nesta competência.',
+    };
+  } catch (_) {
+    return { handled: true, reply: 'Não consegui falar com o sistema contábil agora. Tente novamente citando a mesma mensagem.' };
+  }
 }
 
 async function deliverDueEvents() {
@@ -161,4 +209,4 @@ function startAgentEventWorker() {
   void deliverDueEvents();
 }
 
-module.exports = { routeInboundMessage, deliverDueEvents, startAgentEventWorker, loadConfig };
+module.exports = { routeInboundMessage, routeExpenseDecisionReply, parseExpenseDecision, deliverDueEvents, startAgentEventWorker, loadConfig };

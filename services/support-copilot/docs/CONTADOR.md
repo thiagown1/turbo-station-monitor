@@ -85,6 +85,24 @@ monthly values into the workspace.
 - failed model/API work is visible in `contador_jobs` with attempts and a
   redacted error, and transient failures use bounded backoff.
 
+## Expense receipts and recurrence
+
+The central router may extract supplier, category, competency, currency and the
+settled BRL amount from an expense receipt. When the dashboard explicitly
+enables WhatsApp expense confirmation, the Contador asks whether to register
+the charge once, register it and mark it monthly recurring, or ignore it.
+
+The reply must cite the Contador prompt containing `EXP-XXXXXXXX`, originate in
+the configured accounting group and carry an allowlisted stable `senderId`.
+The Next boundary revalidates all of those controls before any financial write.
+A recurring rule creates only an expectation for another receipt; it never
+copies a charge into a future month.
+
+The router never calculates foreign exchange. If a foreign-currency document
+does not show the final amount settled in BRL, the Contador asks for `valor R$
+...`. That reply only fills the review; the user must still make a second,
+explicit register-once or register-recurring decision.
+
 ## Known contract gaps
 
 Two items in the original v1 plan cannot safely be completed with the currently
