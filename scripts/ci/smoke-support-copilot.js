@@ -64,12 +64,32 @@ function waitForHealth(deadline) {
   });
 }
 
+function request({ path: requestPath, method = 'GET', headers = {}, body = '' }) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1', port: PORT, path: requestPath, method, headers, timeout: 2000,
+    }, (res) => {
+      let responseBody = '';
+      res.on('data', (chunk) => { responseBody += chunk; });
+      res.on('end', () => resolve({ status: res.statusCode, body: responseBody }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
 (async () => {
   // SUPPORT_COPILOT_PORT, not PORT: services deliberately ignore the generic
   // PORT (see services/lib/service-port.js). PORT is deleted rather than
   // overwritten so the smoke run does not trip the drift warning if the
   // runner's own environment happens to carry one.
-  const childEnv = { ...process.env, SUPPORT_COPILOT_PORT: String(PORT), SUPPORT_COPILOT_DB_PATH: DB_PATH };
+  const childEnv = {
+    ...process.env,
+    SUPPORT_COPILOT_PORT: String(PORT),
+    SUPPORT_COPILOT_DB_PATH: DB_PATH,
+    SUPPORT_API_SECRET: 'smoke-secret-not-real',
+    EVOLUTION_WEBHOOK_SECRET: '',
+  };
   delete childEnv.PORT;
 
   const child = spawn(process.execPath, ['index.js'], {
@@ -91,7 +111,18 @@ function waitForHealth(deadline) {
       waitForHealth(Date.now() + BOOT_TIMEOUT_MS),
       exitedEarly.then((code) => { throw new Error(`process exited early with code ${code}\n${output}`); }),
     ]);
-    console.log('✓ support-copilot booted and GET /health returned 200');
+    const webhook = await request({
+      path: '/api/support/ingest/evolution',
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    if (webhook.status !== 503) throw new Error(`unconfigured Evolution webhook returned ${webhook.status}, expected 503`);
+
+    const media = await request({ path: '/api/support/media/missing.pdf' });
+    if (media.status !== 401) throw new Error(`unauthenticated media returned ${media.status}, expected 401`);
+
+    console.log('✓ support-copilot booted, health passed, and inbound/media routes fail closed');
     process.exitCode = 0;
   } catch (err) {
     console.error('✗ support-copilot boot smoke test failed:', err.message);

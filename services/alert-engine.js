@@ -78,6 +78,25 @@ const DEBOUNCE_WINDOW = 60 * 60 * 1000; // 1 hour
 const QUERY_WINDOW = 5 * 60 * 1000; // Last 5 minutes
 const CORRELATION_WINDOW = 30 * 1000; // ±30 seconds for correlation
 
+/**
+ * Return the newest row received by the OCPP collector. `ocpp_events` is
+ * filtered/throttled and may remain unchanged while raw charger logs continue,
+ * so the watchdog prefers `ocpp_raw` and falls back for legacy databases.
+ */
+function getLatestOcppIngestTimestamp(db) {
+    for (const table of ['ocpp_raw', 'ocpp_events']) {
+        try {
+            const row = db.prepare(`SELECT MAX(timestamp) AS max_ts FROM ${table}`).get();
+            const value = row?.max_ts;
+            if (typeof value === 'number') return value;
+            if (value != null && Number.isFinite(Number(value))) return Number(value);
+        } catch (_) {
+            // Try the legacy table when the preferred table is unavailable.
+        }
+    }
+    return null;
+}
+
 // --- Causal correlation gate (added 2026-06-12) --------------------------
 // A charger fault and a backend error are only CAUSALLY related when the
 // backend failure could actually have blocked a charge action on THAT charger
@@ -445,7 +464,7 @@ class AlertEngine {
             }
         };
 
-        const ocppMax = getMaxTs(this.ocppDb, 'SELECT MAX(timestamp) AS max_ts FROM ocpp_events');
+        const ocppMax = getLatestOcppIngestTimestamp(this.ocppDb);
         const vercelMax = getMaxTs(this.vercelDb, 'SELECT MAX(timestamp) AS max_ts FROM vercel_logs');
         const mobileMax = getMaxTs(this.mobileDb, 'SELECT MAX(received_at) AS max_ts FROM mobile_events');
 
@@ -1710,3 +1729,4 @@ module.exports.windowForStreak = windowForStreak;
 module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
 module.exports.deliveryPollScheduleMs = deliveryPollScheduleMs;
 module.exports.UNSENT_RETRY_WINDOW_MS = UNSENT_RETRY_WINDOW_MS;
+module.exports.getLatestOcppIngestTimestamp = getLatestOcppIngestTimestamp;

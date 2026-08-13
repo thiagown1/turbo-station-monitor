@@ -10,7 +10,7 @@
  */
 
 const assert = require('assert');
-const request = require('supertest');
+const supertest = require('supertest');
 const zlib = require('zlib');
 const { promisify } = require('util');
 const gzip = promisify(zlib.gzip);
@@ -53,12 +53,30 @@ async function runAll() {
 
 // Set env var before requiring app so auth middleware works
 process.env.MONITOR_API_SECRET = 'test-secret-12345';
+process.env.TELEMETRY_API_KEY = 'test-telemetry-key-not-real';
 
 const app = require('../index');
 const { db, stmts } = require('../lib/db');
 const { parseLocation, deriveSeverity, buildBrandFilter, DEFAULT_BRAND_ID } = require('../lib/utils');
+const { deleteOlderThan, sweep, CHUNK_SIZE } = require('../lib/retention');
 
 const SECRET = 'test-secret-12345';
+const TELEMETRY_KEY = 'test-telemetry-key-not-real';
+
+// Most integration tests exercise valid authenticated traffic. Security tests
+// below use supertest(app) directly to omit or corrupt the key.
+function request(target) {
+    const client = supertest(target);
+    const originalPost = client.post.bind(client);
+    client.post = (url) => {
+        const pending = originalPost(url);
+        if (url === '/api/telemetry/mobile' || url === '/api/telemetry/user-logs') {
+            pending.set('x-telemetry-key', TELEMETRY_KEY);
+        }
+        return pending;
+    };
+    return client;
+}
 
 // ─── 1. Unit Tests: lib/utils ───────────────────────────────────────────────────
 
@@ -186,6 +204,47 @@ test('GET /api/telemetry/online-users with wrong secret → 401', async () => {
     const res = await request(app)
         .get('/api/telemetry/online-users')
         .set('X-Monitor-Secret', 'wrong');
+    assert.strictEqual(res.status, 401);
+});
+
+test('retention deletes events before raw rows and chunks large deletes', async () => {
+    const order = [];
+    const counts = {
+        mobile_events: [CHUNK_SIZE, 2],
+        mobile_raw: [3],
+    };
+    const fakeDb = {
+        prepare(sql) {
+            const table = sql.includes('mobile_events') ? 'mobile_events' : 'mobile_raw';
+            order.push(table);
+            return { run: () => ({ changes: counts[table].shift() || 0 }) };
+        },
+    };
+    assert.strictEqual(await deleteOlderThan('mobile_events', 123, fakeDb), CHUNK_SIZE + 2);
+    const result = await sweep({ database: fakeDb, now: Date.now(), log: { log() {}, error() {} } });
+    assert.deepStrictEqual(result, { events: 0, raw: 3 });
+    assert.deepStrictEqual(order, ['mobile_events', 'mobile_events', 'mobile_raw']);
+});
+
+test('retention rejects arbitrary table names', async () => {
+    await assert.rejects(() => deleteOlderThan('users', 0, {}), /unsupported retention table/);
+});
+
+test('POST /api/telemetry/mobile without telemetry key → 401', async () => {
+    const res = await supertest(app).post('/api/telemetry/mobile').send({ events: [] });
+    assert.strictEqual(res.status, 401);
+});
+
+test('POST /api/telemetry/mobile with wrong telemetry key → 401', async () => {
+    const res = await supertest(app)
+        .post('/api/telemetry/mobile')
+        .set('x-telemetry-key', 'wrong')
+        .send({ events: [] });
+    assert.strictEqual(res.status, 401);
+});
+
+test('POST /api/telemetry/user-logs without telemetry key → 401', async () => {
+    const res = await supertest(app).post('/api/telemetry/user-logs').send({ logs: {} });
     assert.strictEqual(res.status, 401);
 });
 
@@ -504,6 +563,20 @@ test('POST /api/telemetry/mobile — missing events → 400', async () => {
         .send({ session_id: 'x', device_id: 'y' });
     assert.strictEqual(res.status, 400);
     assert.ok(res.body.error.includes('events'));
+});
+
+test('POST /api/telemetry/mobile — rejects more than 250 events', async () => {
+    const res = await request(app)
+        .post('/api/telemetry/mobile')
+        .send(makePayload({ events: Array.from({ length: 251 }, () => ({ event_type: 'x', data: {} })) }));
+    assert.strictEqual(res.status, 400);
+});
+
+test('POST /api/telemetry/mobile — rejects oversized metadata', async () => {
+    const res = await request(app)
+        .post('/api/telemetry/mobile')
+        .send(makePayload({ device_id: 'x'.repeat(201) }));
+    assert.strictEqual(res.status, 400);
 });
 
 test('POST /api/telemetry/mobile — invalid JSON → 400', async () => {
