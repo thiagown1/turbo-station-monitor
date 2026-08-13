@@ -71,4 +71,8 @@ app.listen(PORT, BIND_HOST, () => {
   // Contador is fail-closed and starts only when all required env values exist.
   const { startContadorRuntime } = require('./lib/contador-runtime');
   startContadorRuntime();
+
+  // The reviewed-agent outbox is independent and also fail-closed.
+  const { startAgentEventWorker } = require('./lib/agent-router');
+  startAgentEventWorker();
 });

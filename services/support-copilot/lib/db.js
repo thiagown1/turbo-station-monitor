@@ -162,6 +162,9 @@ safeAddColumn('messages', 'delivery_status', 'TEXT DEFAULT NULL');
 // pipeline shipped — but the column only ever existed in prod via an ad-hoc
 // ALTER; fresh DBs lacked it (same class of gap as phone_aliases/tags above).
 safeAddColumn('messages', 'media_json', 'TEXT DEFAULT NULL');
+// Stable group-participant/phone identity. Display names are not authorization.
+safeAddColumn('messages', 'sender_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'sender_name', 'TEXT DEFAULT NULL');
 
 // Copilot settings — per-brand configuration for the AI assistant
 try {
@@ -381,6 +384,47 @@ try {
   `);
 } catch (err) {
   console.warn(`${LOG_TAG} contador migrations:`, err.message);
+}
+
+// One paid media classification per inbound message, plus a durable delivery
+// outbox to the Next.js action/review boundary. Neither table stores the media.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_media_analyses (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      model TEXT,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      estimated_cost_usd REAL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 1,
+      analyzed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_media_brand_at ON agent_media_analyses(brand_id, analyzed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS agent_event_outbox (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      response_status INTEGER,
+      response_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_outbox_due ON agent_event_outbox(status, next_attempt_at);
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} agent router migration:`, err.message);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

@@ -15,6 +15,9 @@ WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:
 - **Port**: 3005 (PM2 managed)
 - **DB**: `services/../db/support-copilot.sqlite` (dev) or `/var/lib/turbo-station/support-copilot.sqlite` (prod)
 - **Auth**: `X-Api-Secret` header (env `SUPPORT_API_SECRET`)
+- **Agent routing**: each inbound image/PDF is classified at most once and
+  delivered to the dashboard through a durable SQLite outbox. Financial and
+  outbound actions begin behind human review.
 
 ## Routes
 
@@ -75,6 +78,10 @@ underlying WhatsApp library.
 | `EVOLUTION_WEBHOOK_SECRET` | Verifies gateway → copilot webhooks | secret |
 | `EVOLUTION_INSTANCE_MAP` | Map instance→brand | `turbostation:turbo_station` |
 | `SUPPORT_COPILOT_MEDIA_DIR` | Shared inbound-media directory | repository `db/media` by default |
+| `AGENT_EVENT_BASE_URL` | Dashboard base URL that receives agent events | `https://app.example.com` |
+| `AGENT_EVENT_SECRET` | Dedicated shared secret for config/events | random secret |
+| `OPENROUTER_API_KEY` | Vision/classification provider | provider key |
+| `AGENT_VISION_MODEL` | Cheap vision-capable model | `openai/gpt-4o-mini` |
 
 ### Gateway webhook setup
 

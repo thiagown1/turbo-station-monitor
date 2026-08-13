@@ -1,0 +1,88 @@
+const fs = require('fs');
+const path = require('path');
+const { parseAmountToCents, parseModelJson } = require('./receipt-extractor');
+
+const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const TIMEOUT_MS = 60_000;
+const MAX_BYTES = 8 * 1024 * 1024;
+
+const SYSTEM = 'Você é o roteador de documentos e incidentes da Turbo Station. Responda somente JSON válido. Não invente valores, destinatários, IDs ou diagnóstico.';
+const PROMPT = `Classifique a mensagem/mídia em exatamente um tipo:
+partner_payment_receipt (comprovante de repasse PIX/TED), expense_receipt (comprovante de dinheiro que saiu da Turbo Station), energy_invoice (fatura/conta de energia), station_support (pedido ou evidência de análise de carregador), support_attention (bug/erro que merece atenção), other.
+Extraia somente o que estiver legível. suggested_reply deve ser curta, em português, e nunca afirmar que um problema foi corrigido.
+JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null}`;
+
+function mediaPart(absPath, mediaType, mimetype) {
+  if (!absPath) return null;
+  const stat = fs.statSync(absPath);
+  if (stat.size > MAX_BYTES) throw new Error('file_too_large');
+  const base64 = fs.readFileSync(absPath).toString('base64');
+  const pdf = String(mimetype || '').includes('pdf') || path.extname(absPath).toLowerCase() === '.pdf';
+  if (pdf) return { type: 'file', file: { filename: path.basename(absPath), file_data: `data:application/pdf;base64,${base64}` } };
+  if (mediaType === 'image' || String(mimetype || '').startsWith('image/')) {
+    const mime = String(mimetype || '').split(';')[0] || 'image/jpeg';
+    return { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } };
+  }
+  return null;
+}
+
+function cleanString(value, max) {
+  if (typeof value !== 'string') return undefined;
+  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  return cleaned ? cleaned.slice(0, max) : undefined;
+}
+
+function estimateCost(usage) {
+  if (typeof usage?.cost === 'number' && Number.isFinite(usage.cost)) return usage.cost;
+  const inputRate = Number(process.env.AGENT_INPUT_USD_PER_MILLION || 0);
+  const outputRate = Number(process.env.AGENT_OUTPUT_USD_PER_MILLION || 0);
+  return ((usage?.prompt_tokens || 0) * inputRate + (usage?.completion_tokens || 0) * outputRate) / 1_000_000;
+}
+
+async function classifyMessage({ absPath, mediaType, mimetype, body, context, model }) {
+  const apiKey = process.env.OPENROUTER_API_KEY;
+  if (!apiKey) return { status: 'error', reason: 'no_api_key', environmental: true };
+  const content = [{ type: 'text', text: `${PROMPT}\n\nContexto recente:\n${String(context || '').slice(-4000)}\n\nMensagem atual:\n${String(body || '').slice(0, 1500)}` }];
+  try {
+    const part = mediaPart(absPath, mediaType, mimetype);
+    if (part) content.push(part);
+  } catch (error) {
+    return { status: 'error', reason: error.message };
+  }
+  const selectedModel = model || process.env.AGENT_VISION_MODEL || process.env.RECEIPT_VISION_MODEL || 'openai/gpt-4o-mini';
+  let response;
+  try {
+    response = await fetch(OPENROUTER_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model: selectedModel, max_tokens: 500, temperature: 0, messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content }] }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
+    });
+  } catch (_) { return { status: 'error', reason: 'transport', environmental: true }; }
+  if (!response.ok) return { status: 'error', reason: `http_${response.status}`, environmental: [401, 403, 429].includes(response.status) };
+  const data = await response.json().catch(() => null);
+  const parsed = parseModelJson(data?.choices?.[0]?.message?.content);
+  const kinds = new Set(['partner_payment_receipt', 'expense_receipt', 'energy_invoice', 'station_support', 'support_attention', 'other']);
+  if (!parsed || !kinds.has(parsed.kind)) return { status: 'error', reason: 'unparseable_reply' };
+  const usage = data?.usage || {};
+  return {
+    status: 'ok',
+    kind: parsed.kind,
+    summary: cleanString(parsed.summary, 1000) || 'Mídia recebida pelo WhatsApp',
+    confidence: Math.max(0, Math.min(1, Number(parsed.confidence) || 0)),
+    needsAttention: parsed.needs_attention === true,
+    amountCents: parseAmountToCents(parsed.amount) || undefined,
+    receiptRef: cleanString(parsed.transaction_id, 200),
+    payee: cleanString(parsed.payee, 300),
+    suggestedCategory: cleanString(parsed.suggested_category, 100),
+    suggestedReply: cleanString(parsed.suggested_reply, 3000),
+    cost: {
+      model: selectedModel,
+      inputTokens: Number(usage.prompt_tokens) || 0,
+      outputTokens: Number(usage.completion_tokens) || 0,
+      estimatedCostUsd: estimateCost(usage),
+    },
+  };
+}
+
+module.exports = { classifyMessage, estimateCost };
