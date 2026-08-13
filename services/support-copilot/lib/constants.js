@@ -34,6 +34,18 @@ const EVOLUTION_WEBHOOK_SECRET = process.env.EVOLUTION_WEBHOOK_SECRET || '';
 /** Agent to use for WhatsApp group conversations (partner reports, station reports, etc.) */
 const GROUP_AGENT = process.env.GROUP_AGENT || 'support_turbo_station';
 
+// ─── Contador (internal accounting group agent) ─────────────────────────────
+// Fail closed: code can be deployed without enabling WhatsApp writes or reads.
+const CONTADOR_ENABLED = process.env.CONTADOR_ENABLED === 'true';
+const CONTADOR_GROUP_CONVERSATION_ID = (process.env.CONTADOR_GROUP_CONVERSATION_ID || '').trim();
+const CONTADOR_NEXT_BASE_URL = (process.env.CONTADOR_NEXT_BASE_URL || '').replace(/\/$/, '');
+const CONTADOR_NEXT_SECRET = process.env.CONTADOR_NEXT_SECRET || process.env.ENERGY_BILL_INTAKE_SECRET || '';
+const CONTADOR_INSTANCE = process.env.CONTADOR_INSTANCE || process.env.GATEWAY_INSTANCE_NAME || 'turbostation';
+const CONTADOR_OPENCLAW_AGENT = process.env.CONTADOR_OPENCLAW_AGENT || 'contador';
+const CONTADOR_OPENCLAW_MODEL = process.env.CONTADOR_OPENCLAW_MODEL || 'claude-cli/claude-opus-4-8';
+const CONTADOR_SESSION_ID = process.env.CONTADOR_SESSION_ID || 'contador-contas';
+const CONTADOR_HEARTBEAT_HOUR = Math.min(23, Math.max(0, Number(process.env.CONTADOR_HEARTBEAT_HOUR || 8)));
+
 /**
  * Map Evolution API instance name → brand_id.
  * Format in env: "instanceA:brandA,instanceB:brandB"
@@ -61,4 +73,13 @@ module.exports = {
   EVOLUTION_WEBHOOK_SECRET,
   EVOLUTION_INSTANCE_BRAND_MAP,
   GROUP_AGENT,
+  CONTADOR_ENABLED,
+  CONTADOR_GROUP_CONVERSATION_ID,
+  CONTADOR_NEXT_BASE_URL,
+  CONTADOR_NEXT_SECRET,
+  CONTADOR_INSTANCE,
+  CONTADOR_OPENCLAW_AGENT,
+  CONTADOR_OPENCLAW_MODEL,
+  CONTADOR_SESSION_ID,
+  CONTADOR_HEARTBEAT_HOUR,
 };

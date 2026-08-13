@@ -68,4 +68,8 @@ app.listen(PORT, BIND_HOST, () => {
   // Start auto-close worker (closes stale conversations + compacts sessions)
   const { startAutoClose } = require('./lib/auto-close');
   startAutoClose();
+
+  // Contador is fail-closed and starts only when all required env values exist.
+  const { startContadorRuntime } = require('./lib/contador-runtime');
+  startContadorRuntime();
 });

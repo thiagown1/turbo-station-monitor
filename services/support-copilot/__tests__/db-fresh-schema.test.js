@@ -243,6 +243,39 @@ test('messages.media_json column exists after a fresh load', () => {
   }
 });
 
+test('Contador outbox and daily-run ledger exist after a fresh load', () => {
+  const dbPath = freshDbPath('contador-tables');
+
+  try {
+    execFileSync(
+      process.execPath,
+      [
+        '-e',
+        `
+        require('./lib/db.js');
+        const Database = require('better-sqlite3');
+        const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
+        const tables = check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
+        for (const expected of ['contador_jobs', 'contador_daily_runs']) {
+          if (!tables.includes(expected)) throw new Error(expected + ' table missing: ' + tables.join(','));
+        }
+        const jobCols = check.prepare("PRAGMA table_info('contador_jobs')").all().map(r => r.name);
+        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json']) {
+          if (!jobCols.includes(expected)) throw new Error('contador_jobs.' + expected + ' column missing');
+        }
+        `,
+      ],
+      {
+        cwd: path.join(__dirname, '..'),
+        env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath },
+        encoding: 'utf8',
+      }
+    );
+  } finally {
+    cleanup(dbPath);
+  }
+});
+
 test('INSERT/UPDATE messages.delivery_status does not throw against a fresh load', () => {
   const dbPath = freshDbPath('delivery-status-update');
 

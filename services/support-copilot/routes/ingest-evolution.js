@@ -32,6 +32,7 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
+const { enqueueContadorMessage } = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 
@@ -182,6 +183,27 @@ function extractMedia(message) {
     }
   }
   return null;
+}
+
+function quotedMessageId(message) {
+  const candidates = [
+    message?.extendedTextMessage?.contextInfo,
+    message?.imageMessage?.contextInfo,
+    message?.documentMessage?.contextInfo,
+    message?.videoMessage?.contextInfo,
+  ];
+  return candidates.find(Boolean)?.stanzaId || null;
+}
+
+function isReplyToContador(message, conversationId) {
+  const stanzaId = quotedMessageId(message);
+  if (!stanzaId) return false;
+  return Boolean(db.prepare(`
+    SELECT 1 FROM messages
+    WHERE conversation_id = ? AND external_message_id = ?
+      AND direction = 'outbound' AND source = 'contador'
+    LIMIT 1
+  `).get(conversationId, stanzaId));
 }
 
 // ─── Main webhook handler ───────────────────────────────────────────────────
@@ -390,9 +412,24 @@ router.post('/', (req, res) => {
       } : null,
     });
 
-    // Pre-generate a copilot suggestion for the dashboard (groups: suggest-only).
+    // The configured accounting group is routed to the Contador outbox. Other
+    // groups keep the existing suggest-only behavior.
     if (direction === 'inbound') {
-      scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+      const contadorRoute = enqueueContadorMessage({
+        messageId: externalMessageId || msgId,
+        conversationId,
+        brandId,
+        groupJid,
+        instance,
+        direction,
+        sender: senderName,
+        body,
+        media,
+        replyToContador: isReplyToContador(message, conversationId),
+      });
+      if (contadorRoute.kind === 'ignored') {
+        scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+      }
     }
 
     return res.status(201).json({
