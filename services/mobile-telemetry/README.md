@@ -10,8 +10,8 @@ read-only query endpoints for the dashboard.
 | `GET` | `/health` `/ping` | — | Liveness probe |
 | `GET` | `/api/telemetry/online-users` | `X-Monitor-Secret` | Currently active app users |
 | `GET` | `/api/telemetry/heatmap-data` | `X-Monitor-Secret` | Aggregated user demand density |
-| `POST` | `/api/telemetry/mobile` | *(disabled)* | Event ingestion from mobile app |
-| `POST` | `/api/telemetry/user-logs` | — | User-submitted diagnostic log dump |
+| `POST` | `/api/telemetry/mobile` | `X-Telemetry-Key` | Event ingestion from mobile app |
+| `POST` | `/api/telemetry/user-logs` | `X-Telemetry-Key` | User-submitted diagnostic log dump |
 | `GET` | `/api/telemetry/user-logs` | `X-Monitor-Secret` | Query stored log dumps |
 
 ## Architecture
@@ -57,7 +57,8 @@ per request for performance.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `3003` | HTTP port |
-| `TELEMETRY_API_KEY` | *(hardcoded)* | Mobile app auth key (currently disabled) |
+| `TELEMETRY_API_KEY` | *(required)* | Mobile app ingestion key |
+| `MOBILE_TTL_DAYS` | `180` | Retention for `mobile_events` and `mobile_raw` |
 | `MONITOR_API_SECRET` | *(empty)* | Shared secret for dashboard endpoints |
 
 ## Local Development

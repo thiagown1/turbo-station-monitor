@@ -13,6 +13,7 @@ const GROUP_JID = 'contas-test@g.us';
 const MESSAGE_ID = `wamid-contador-pdf-${process.pid}-${Date.now()}`;
 const DB_PATH = path.join(os.tmpdir(), `contador-pdf-integration-${process.pid}-${Date.now()}.sqlite`);
 const MEDIA_DIR = path.join(os.tmpdir(), `contador-media-${process.pid}-${Date.now()}`);
+const WEBHOOK_SECRET = 'integration-webhook-secret-not-real';
 
 function listen(server) {
   return new Promise((resolve, reject) => {
@@ -87,6 +88,7 @@ function jsonServer(handler) {
         CONTADOR_NEXT_SECRET: 'integration-secret',
         CONTADOR_INSTANCE: 'turbostation',
         EVOLUTION_API_URL: `http://127.0.0.1:${gatewayPort}`,
+        EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
         EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -118,7 +120,7 @@ function jsonServer(handler) {
     };
     const response = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
       body: JSON.stringify(webhookPayload),
     });
     assert.equal(response.status, 201, await response.text());
@@ -140,7 +142,7 @@ function jsonServer(handler) {
 
     const replay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
       body: JSON.stringify(webhookPayload),
     });
     assert.equal(replay.status, 200);

@@ -20,7 +20,7 @@ const PORT = resolveServicePort('MOBILE_TELEMETRY_PORT', 3003, '[mobile-telemetr
 
 /** API key expected from the mobile app on POST /api/telemetry/mobile. */
 const TELEMETRY_API_KEY =
-    process.env.TELEMETRY_API_KEY || 'f593c26c80894c8aef64a4c977f280d8ae687387b049f454';
+    process.env.TELEMETRY_API_KEY || '';
 
 /** Shared secret for dashboard → monitor communication (read-only endpoints). */
 const MONITOR_API_SECRET = process.env.MONITOR_API_SECRET || '';
@@ -33,7 +33,7 @@ const DB_PATH = path.join(__dirname, '..', '..', '..', 'db', 'mobile.db');
 // ─── Ingestion ──────────────────────────────────────────────────────────────────
 
 /** Maximum request body size (uncompressed). */
-const MAX_PAYLOAD_BYTES = 10 * 1024 * 1024; // 10 MB
+const MAX_PAYLOAD_BYTES = 2 * 1024 * 1024; // 2 MB
 
 // ─── Presence ───────────────────────────────────────────────────────────────────
 
@@ -62,6 +62,13 @@ const PERIOD_MS = {
     '30d': 30 * 24 * 60 * 60 * 1000,
 };
 
+// ─── Retention ──────────────────────────────────────────────────────────────
+const configuredTtlDays = Number.parseInt(process.env.MOBILE_TTL_DAYS || '180', 10);
+const MOBILE_TTL_DAYS = Number.isFinite(configuredTtlDays) && configuredTtlDays > 0
+    ? configuredTtlDays
+    : 180;
+const RETENTION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 // ─── Logging ────────────────────────────────────────────────────────────────────
 
 /** Prefix for all console logs from this service. */
@@ -77,5 +84,7 @@ module.exports = {
     PRESENCE_WINDOW_MS,
     RECENT_LOCATIONS_MAX_WINDOW_MS,
     PERIOD_MS,
+    MOBILE_TTL_DAYS,
+    RETENTION_SWEEP_INTERVAL_MS,
     LOG_TAG,
 };

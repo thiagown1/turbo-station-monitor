@@ -4,7 +4,7 @@
  * Receives diagnostic log dumps from mobile app users and stores them
  * for later analysis. Auto-purges entries older than 3 days.
  *
- * @route   POST /api/telemetry/user-logs   — submit logs (no auth)
+ * @route   POST /api/telemetry/user-logs   — submit logs (telemetry key)
  * @route   GET  /api/telemetry/user-logs   — query logs (requires secret)
  */
 
@@ -12,12 +12,12 @@ const { Router } = require('express');
 const express = require('express');
 const { db } = require('../lib/db');
 const { LOG_TAG } = require('../lib/constants');
-const { requireSecret } = require('../middleware/auth');
+const { requireSecret, requireTelemetryKey } = require('../middleware/auth');
 
 const router = Router();
 
 // JSON body parser (user-logs payloads are not gzip-compressed from mobile)
-router.use(express.json({ limit: '5mb' }));
+router.use(express.json({ limit: '1mb' }));
 
 /** Auto-purge retention: 3 days in milliseconds. */
 const RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
@@ -54,12 +54,18 @@ const purgeOld = db.prepare(`
 
 // ─── POST: Submit logs ──────────────────────────────────────────────────────────
 
-router.post('/', (req, res) => {
+router.post('/', requireTelemetryKey, (req, res) => {
     try {
         const { user_id, device_id, app_version, platform, logs } = req.body;
 
-        if (!logs || typeof logs !== 'object') {
+        if (!logs || typeof logs !== 'object' || Array.isArray(logs)) {
             return res.status(400).json({ error: 'Invalid payload: logs object required' });
+        }
+
+        for (const value of [user_id, device_id, app_version, platform]) {
+            if (value != null && (typeof value !== 'string' || value.length > 200)) {
+                return res.status(400).json({ error: 'Invalid payload metadata' });
+            }
         }
 
         const receivedAt = Date.now();

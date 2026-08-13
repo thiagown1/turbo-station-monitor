@@ -16,7 +16,7 @@ const DB_PATH = path.join(__dirname, '..', 'db', 'logs.db');
 const LIVE = process.argv.includes('--live');
 const PORT = 3001;
 const BASE_URL = `http://localhost:${PORT}`;
-const API_KEY = 'f593c26c80894c8aef64a4c977f280d8ae687387b049f454';
+const API_KEY = 'test-telemetry-key-not-real';
 
 let passed = 0;
 let failed = 0;
