@@ -205,6 +205,18 @@ function isReplyToContador(message, conversationId) {
   `).get(conversationId, stanzaId));
 }
 
+function recentConversationContext(conversationId) {
+  try {
+    const recentMsgs = db.prepare(
+      'SELECT direction, body FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 5'
+    ).all(conversationId);
+    return recentMsgs.reverse().map(m => {
+      const role = m.direction === 'inbound' ? 'Cliente' : 'Operador';
+      return `[${role}]: ${m.body}`;
+    }).join('\n');
+  } catch { return ''; }
+}
+
 // ─── Main webhook handler ───────────────────────────────────────────────────
 
 router.post('/', (req, res) => {
@@ -281,6 +293,7 @@ router.post('/', (req, res) => {
     // The sender is tracked via pushName in the message body prefix
     const groupJid = key.remoteJid;
     const senderName = pushName || (key.participant ? phoneFromJid(key.participant) : null) || 'Unknown';
+    const senderId = key.participant ? normalizePhone(phoneFromJid(key.participant)) : null;
 
     // Find or create group conversation by group JID
     let existing = db.prepare(
@@ -344,9 +357,9 @@ router.post('/', (req, res) => {
 
     db.transaction(() => {
       db.prepare(`
-        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
-        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?)
-      `).run(msgId, conversationId, brandId, direction, groupBody, null, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, now);
+        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name, created_at)
+        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(msgId, conversationId, brandId, direction, groupBody, null, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, senderId, senderName, now);
 
       if (direction === 'inbound') {
         db.prepare('UPDATE conversations SET last_message_at = ?, last_inbound_at = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?')
@@ -411,10 +424,12 @@ router.post('/', (req, res) => {
       } : null,
     });
 
-    // The configured accounting group is routed to the Contador outbox. Other
-    // groups keep the existing suggest-only behavior.
+    // Media/station requests first enter the reviewed central router. If that
+    // router is disabled or unavailable, fall back to the pre-existing
+    // Contador/group-suggestion behavior. A successful central classification
+    // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
-      const contadorRoute = enqueueContadorMessage({
+      const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
         brandId,
@@ -425,9 +440,39 @@ router.post('/', (req, res) => {
         body,
         media,
         replyToContador: isReplyToContador(message, conversationId),
-      });
-      if (contadorRoute.kind === 'ignored') {
-        scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+      };
+      // Central media router: every image/PDF is classified once. Text-only
+      // messages use a free deterministic gate and invoke the model only when
+      // they look like a request to inspect a charger.
+      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
+      if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
+        const { routeInboundMessage } = require('../lib/agent-router');
+        routeInboundMessage({
+          messageId: msgId, externalMessageId, conversationId, brandId, groupJid,
+          senderId, body: groupBody, media, receivedAt: now,
+        }).then(result => {
+          if (result?.skipped || result?.status === 'error') {
+            const contadorRoute = enqueueContadorMessage(contadorEvent);
+            if (contadorRoute.kind === 'ignored') {
+              scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+            }
+          } else if (result?.kind === 'support_attention' || result?.kind === 'other') {
+            // The normal support copilot adds a richer suggestion while the
+            // central run keeps the classification/history/cost audit.
+            scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+          }
+        }).catch(err => {
+          console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message);
+          const contadorRoute = enqueueContadorMessage(contadorEvent);
+          if (contadorRoute.kind === 'ignored') {
+            scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+          }
+        });
+      } else {
+        const contadorRoute = enqueueContadorMessage(contadorEvent);
+        if (contadorRoute.kind === 'ignored') {
+          scheduleGroupSuggestion(conversationId, brandId, { media: false });
+        }
       }
     }
 
@@ -655,9 +700,9 @@ router.post('/', (req, res) => {
 
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
-      VALUES (?, ?, ?, ?, 'evolution', ?, NULL, ?, ?, ?, ?)
-    `).run(msgId, conversationId, brandId, direction, body, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, now);
+      INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name, created_at)
+      VALUES (?, ?, ?, ?, 'evolution', ?, NULL, ?, ?, ?, ?, ?, ?)
+    `).run(msgId, conversationId, brandId, direction, body, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, normalizedPhone, pushName || null, now);
 
     if (direction === 'inbound') {
       db.prepare(`
@@ -726,25 +771,15 @@ router.post('/', (req, res) => {
   // all pending messages when the operator clicks Copilot. This avoids
   // wasting tokens on messages the operator may not need help with.
 
-  // Process media in background (transcribe audio, describe images/video)
-  if (media && media.url && direction === 'inbound') {
+  // Process audio/video through the legacy media pipeline. Images and PDFs are
+  // handled by the central router below so they incur exactly one vision call.
+  if (media && media.url && direction === 'inbound' && !['image', 'document'].includes(media.media_type)) {
     const { processMedia } = require('../lib/media-processor');
     const mediaFilePath = path.join(MEDIA_DIR, path.basename(media.url));
     const mediaType = media.media_type; // audio, image, video, document, sticker
 
     // Build recent conversation context for the media describer
-    let conversationContext = '';
-    try {
-      const recentMsgs = db.prepare(
-        'SELECT direction, body FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 5'
-      ).all(conversationId);
-      if (recentMsgs.length > 0) {
-        conversationContext = recentMsgs.reverse().map(m => {
-          const role = m.direction === 'inbound' ? 'Cliente' : 'Operador';
-          return `[${role}]: ${m.body}`;
-        }).join('\n');
-      }
-    } catch { /* ignore */ }
+    const conversationContext = recentConversationContext(conversationId);
 
     // Fire-and-forget: process and update message body
     processMedia(mediaFilePath, mediaType, { conversationContext }).then(description => {
@@ -759,6 +794,32 @@ router.post('/', (req, res) => {
     }).catch(err => {
       console.warn(`${LOG_TAG} Media processing failed for msg ${msgId}:`, err.message);
     });
+  }
+
+  if (media && direction === 'inbound' && ['image', 'document'].includes(media.media_type)) {
+    const { routeInboundMessage } = require('../lib/agent-router');
+    routeInboundMessage({
+      messageId: msgId, externalMessageId, conversationId, brandId,
+      senderId: normalizedPhone, body, media, receivedAt: now,
+    }).then(result => {
+      if (result?.status === 'ok' && result.summary) {
+        const enrichedBody = `${body} [Análise automática]: ${result.summary}`;
+        db.prepare('UPDATE messages SET body = ? WHERE id = ?').run(enrichedBody, msgId);
+        emitEvent({ type: 'message_update', conversationId, messageId: msgId, brandId });
+      } else if (result?.skipped && media.url) {
+        // Router off/no eligible agent: preserve the existing support image
+        // description instead of silently degrading the atendimento screen.
+        const { processMedia } = require('../lib/media-processor');
+        const mediaFilePath = path.join(MEDIA_DIR, path.basename(media.url));
+        processMedia(mediaFilePath, media.media_type, { conversationContext: recentConversationContext(conversationId) })
+          .then(description => {
+            if (!description) return;
+            db.prepare('UPDATE messages SET body = ? WHERE id = ?').run(`${body} ${description}`, msgId);
+            emitEvent({ type: 'message_update', conversationId, messageId: msgId, brandId });
+          })
+          .catch(err => console.warn(`${LOG_TAG} fallback media processing failed for ${msgId}:`, err.message));
+      }
+    }).catch(err => console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message));
   }
 
   res.status(201).json({
