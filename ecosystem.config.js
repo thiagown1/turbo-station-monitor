@@ -156,6 +156,34 @@ module.exports = {
       env: { ...dotenv }
     },
     {
+      // Private dashboard gateway for the paid ChatGPT/Codex and Claude
+      // subscriptions. nginx is the only public edge; the process itself is
+      // loopback-only and accepts only two curated, read-only agent profiles.
+      name: 'ai-openclaw-agent',
+      script: './services/ai-subscription-gateway/index.js',
+      cwd: CWD,
+      instances: 1,
+      exec_mode: 'fork',
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '120M',
+      max_restarts: 10,
+      min_uptime: '30s',
+      error_file: './logs/ai-openclaw-agent-error.log',
+      out_file: './logs/ai-openclaw-agent-out.log',
+      log_date_format: 'YYYY-MM-DD HH:mm:ss',
+      merge_logs: true,
+      env: {
+        ...dotenv,
+        OPENCLAW_AGENT_HOST: '127.0.0.1',
+        OPENCLAW_AGENT_PORT: dotenv.OPENCLAW_AGENT_PORT || 3105,
+        AI_SUBSCRIPTION_CLAUDE_AGENT_ID:
+          dotenv.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+        AI_SUBSCRIPTION_CODEX_AGENT_ID:
+          dotenv.AI_SUBSCRIPTION_CODEX_AGENT_ID || 'ai_dashboard_codex',
+      }
+    },
+    {
       name: 'support-copilot',
       script: './services/support-copilot/index.js',
       cwd: CWD,
