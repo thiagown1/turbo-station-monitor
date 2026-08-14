@@ -278,7 +278,11 @@ test('caps durable media retries and performs skipped fallback before completion
         let mediaCalls = 0;
         let emitted = 0;
         require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
-          enqueueContadorMessage: () => { contadorCalls++; return { kind: 'pdf', enqueued: true }; },
+          enqueueContadorMessage: (event) => {
+            if (!event.groupJid) return { kind: 'ignored', enqueued: false };
+            contadorCalls++;
+            return { kind: 'pdf', enqueued: true };
+          },
         } };
         require.cache[require.resolve('./lib/media-processor')] = { exports: {
           processMedia: async () => { mediaCalls++; return '[descrição recuperada]'; },
