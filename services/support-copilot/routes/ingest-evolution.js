@@ -32,7 +32,7 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
-const { enqueueContadorMessage } = require('../lib/contador-runtime');
+const { enqueueContadorMessage, sendReply } = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 
@@ -194,15 +194,19 @@ function quotedMessageId(message) {
   return candidates.find(Boolean)?.stanzaId || null;
 }
 
-function isReplyToContador(message, conversationId) {
+function quotedOutboundMessage(message, conversationId) {
   const stanzaId = quotedMessageId(message);
-  if (!stanzaId) return false;
-  return Boolean(db.prepare(`
-    SELECT 1 FROM messages
+  if (!stanzaId) return null;
+  return db.prepare(`
+    SELECT body, source FROM messages
     WHERE conversation_id = ? AND external_message_id = ?
-      AND direction = 'outbound' AND source = 'contador'
+      AND direction = 'outbound' AND source IN ('contador', 'system')
     LIMIT 1
-  `).get(conversationId, stanzaId));
+  `).get(conversationId, stanzaId) || null;
+}
+
+function isReplyToContador(message, conversationId) {
+  return quotedOutboundMessage(message, conversationId)?.source === 'contador';
 }
 
 function recentConversationContext(conversationId) {
@@ -219,7 +223,7 @@ function recentConversationContext(conversationId) {
 
 // ─── Main webhook handler ───────────────────────────────────────────────────
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { event, instance, data } = req.body;
 
   // Only process messages.upsert events
@@ -441,6 +445,18 @@ router.post('/', (req, res) => {
         media,
         replyToContador: isReplyToContador(message, conversationId),
       };
+      const quoted = quotedOutboundMessage(message, conversationId);
+      if (quoted?.body && /\bEXP-[A-F0-9]{8}\b/i.test(quoted.body)) {
+        const { routeExpenseDecisionReply } = require('../lib/agent-router');
+        const decision = await routeExpenseDecisionReply({
+          messageId: msgId, externalMessageId, conversationId, brandId, senderId,
+          body, quotedBody: quoted.body,
+        });
+        if (decision.handled) {
+          await sendReply(decision.reply, contadorEvent).catch((err) => console.warn(`${LOG_TAG} expense decision reply failed:`, err.message));
+          return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
+        }
+      }
       // Central media router: every image/PDF is classified once. Text-only
       // messages use a free deterministic gate and invoke the model only when
       // they look like a request to inspect a charger.

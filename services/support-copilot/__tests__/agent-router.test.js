@@ -6,7 +6,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { estimateCost } = require('../lib/agent-media-classifier');
+const { estimateCost, extractFinancialFields } = require('../lib/agent-media-classifier');
+const { parseExpenseDecision, parseExpenseBrlAmount } = require('../lib/expense-decision');
 
 let passed = 0;
 let failed = 0;
@@ -25,6 +26,52 @@ test('falls back to configured token rates when provider cost is absent', () => 
   process.env.AGENT_INPUT_USD_PER_MILLION = '0.15';
   process.env.AGENT_OUTPUT_USD_PER_MILLION = '0.60';
   assert.equal(estimateCost({ prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 0.75);
+});
+
+test('does not invent a BRL value for a foreign-currency charge', () => {
+  assert.deepEqual(extractFinancialFields({ currency: 'USD', original_amount: 'US$ 200.00', amount: 'US$ 200.00', settled_brl_amount: null }), {
+    currency: 'USD', originalAmountMinor: 20000, amountCents: undefined,
+  });
+  assert.equal(extractFinancialFields({ currency: 'USD', original_amount: 'US$ 200.00', settled_brl_amount: 'R$ 1.120,35' }).amountCents, 112035);
+});
+
+test('parses only explicit expense decisions and gives recurrence precedence', () => {
+  assert.equal(parseExpenseDecision('1'), 'register_once');
+  assert.equal(parseExpenseDecision('registrar recorrente mensal'), 'register_monthly');
+  assert.equal(parseExpenseDecision('3 - ignorar'), 'reject');
+  assert.equal(parseExpenseDecision('acho que sim talvez'), null);
+  assert.equal(parseExpenseBrlAmount('valor R$ 1.120,35'), 112035);
+  assert.equal(parseExpenseBrlAmount('sim'), undefined);
+});
+
+test('requires the cited expense code and an allowlisted sender before posting a decision', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-decision-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        let decisionCalls = 0;
+        global.fetch = async (url, init) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: true, whatsappExpenseConfirmationEnabled: true, accountingGroupConversationIds: ['conv1'], allowedAccountingDecisionSenderIds: ['5511999999999'], agents: { accounting: true } } }) };
+          if (String(url).includes('/api/agents/expense-decisions')) { decisionCalls++; return { ok: true, json: async () => ({ ok: true }) }; }
+          throw new Error('unexpected URL ' + url);
+        };
+        const router = require('./lib/agent-router');
+        const missingQuote = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'sem codigo', messageId: 'm1' });
+        const denied = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511888888888', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm2' });
+        const allowed = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: 'registrar recorrente', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm3' });
+        if (missingQuote.handled) throw new Error('uncited reply was handled');
+        if (!denied.handled || !denied.reply.includes('não está autorizado')) throw new Error('unauthorized sender not blocked');
+        if (!allowed.handled || decisionCalls !== 1) throw new Error('allowed decision not posted exactly once');
+        console.log('agent-decision-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-decision-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
 });
 
 test('classifies once, caches the receipt and durably delivers one event', () => {

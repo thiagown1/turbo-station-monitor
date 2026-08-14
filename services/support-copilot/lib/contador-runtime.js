@@ -346,4 +346,5 @@ module.exports = {
   processHeartbeat,
   startContadorRuntime,
   resolveMediaPath,
+  sendReply,
 };

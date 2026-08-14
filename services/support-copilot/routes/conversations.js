@@ -195,8 +195,8 @@ router.post('/:id/messages', async (req, res) => {
   if (targetPhone && (conv.channel === 'whatsapp' || conv.channel === 'whatsapp-group')) {
     const instance = BRAND_TO_INSTANCE[conv.brand_id] || conv.brand_id;
     sendText(instance, targetPhone, msgBody)
-      .then(() => {
-        db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('sent', id);
+      .then((result) => {
+        db.prepare('UPDATE messages SET delivery_status = ?, external_message_id = ? WHERE id = ?').run('sent', result?.key?.id || null, id);
         emitEvent({ type: 'delivery_update', conversationId: conv.id, brandId: conv.brand_id, messageId: id, deliveryStatus: 'sent' });
       })
       .catch(err => {
