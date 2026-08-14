@@ -20,8 +20,9 @@ The WhatsApp socket is entirely in this repository:
    same SQLite transaction; a cached classification can also recover a missing
    job without another paid model call. Configuration fetch failures and model
    failures remain retryable; they do not create an extraction-less Contador
-   job. The worker retries transient failures and recovers jobs interrupted by
-   a PM2 restart.
+   job. Media work stops after five failed attempts. Explicitly skipped work
+   completes only after the Contador or suggestion fallback has run. The worker
+   recovers jobs interrupted by a PM2 restart.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
@@ -100,6 +101,9 @@ monthly values into the workspace.
   tool result and the quoted outbound message carries the
   same draft prompt metadata. Quoting another Contador heartbeat, summary or
   draft cannot authorize the write. Confirmed UC mappings are persisted and
+  numeric corrections must be labeled by side/type (for example,
+  `distribuidora: 812 kWh; solar: 650 kWh`); matching a number elsewhere in the
+  message is insufficient,
   replaying the reply does not duplicate the original entry. If OCR did not
   produce a stable UC, the operator may provide it literally in the quoted
   reply before registration. Literal UC/numeric/date values are extracted by
@@ -112,7 +116,8 @@ monthly values into the workspace.
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
 - once the day-3 heartbeat schedule has passed, a separate once-per-month
-  ledger closes the previous month. After a deploy or outage it walks every
+  ledger closes the previous month. On activation it seeds the current run
+  month as pending even before the first schedule. After a deploy or outage it walks every
   missing monthly key in chronological order, so crossing a month boundary
   cannot silently skip an older closing,
   using `resumo_contabil`, `resumo_energia`, `pendencias` and

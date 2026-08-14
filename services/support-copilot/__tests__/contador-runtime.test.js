@@ -9,6 +9,7 @@ const { execFileSync } = require('node:child_process');
 
 const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${process.pid}-${Date.now()}.sqlite`);
 const backfillDbPath = `${dbPath}-backfill`;
+const baselineDbPath = `${dbPath}-baseline`;
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
@@ -139,8 +140,48 @@ try {
     { run_month: '2026-09', status: 'sent', attempts: 1 },
   ]);
   console.log('PASS Contador monthly summary backfills every missed run month in order');
+
+  const baselineOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      const calls = [];
+      runtime._setContadorForTest({
+        heartbeat: async () => { throw new Error('daily heartbeat must not replace monthly backlog'); },
+        monthlySummary: async (runDate) => {
+          calls.push(runDate.toISOString().slice(0, 10));
+          return { status: 'sent' };
+        },
+      });
+      await runtime.processMonthlySummary(new Date('2026-08-01T11:00:00.000Z'));
+      await runtime.processMonthlySummary(new Date('2026-09-04T11:00:00.000Z'));
+      const rows = db.prepare('SELECT run_month, status, attempts FROM contador_monthly_runs ORDER BY run_month').all();
+      process.stdout.write(JSON.stringify({ calls, rows }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: baselineDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const baseline = JSON.parse(baselineOutput.slice(baselineOutput.lastIndexOf('\n') + 1));
+  assert.deepEqual(baseline.calls, ['2026-08-03', '2026-09-03']);
+  assert.deepEqual(baseline.rows, [
+    { run_month: '2026-08', status: 'sent', attempts: 1 },
+    { run_month: '2026-09', status: 'sent', attempts: 1 },
+  ]);
+  console.log('PASS Contador monthly summary seeds an empty ledger before the first schedule');
 } finally {
-  for (const target of [dbPath, backfillDbPath]) {
+  for (const target of [dbPath, backfillDbPath, baselineDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }

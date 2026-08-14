@@ -249,6 +249,53 @@ test('retries a temporary config failure without reserving the Contador message 
   }
 });
 
+test('caps durable media retries and performs skipped fallback before completion', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-terminal-retry-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        let contadorCalls = 0;
+        require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
+          enqueueContadorMessage: () => { contadorCalls++; return { kind: 'pdf', enqueued: true }; },
+        } };
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) throw new Error('permanent config failure');
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const failedInput = { messageId: 'media-failed', conversationId: 'conv1', brandId: 'turbo_station', body: 'imagem', receivedAt: nowIso() };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 4, ?, ?, ?)` + "`" + `).run(failedInput.messageId, JSON.stringify(failedInput), nowIso(), nowIso(), nowIso());
+        await router.deliverDueMediaJobs();
+        const failed = db.prepare('SELECT status, attempts FROM agent_media_jobs WHERE message_id = ?').get(failedInput.messageId);
+        if (failed.status !== 'failed' || failed.attempts !== 5) throw new Error('media retries were not capped');
+
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: false } }) };
+          throw new Error('unexpected URL ' + url);
+        };
+        const skipped = await router.routeInboundMessageDurably({
+          messageId: 'media-skipped', externalMessageId: 'wa-skipped', conversationId: 'conv1', brandId: 'turbo_station',
+          groupJid: 'contas@g.us', instance: 'turbostation', body: 'conta.pdf',
+          media: { media_type: 'document', mimetype: 'application/pdf' }, receivedAt: nowIso(),
+        });
+        const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('media-skipped');
+        if (!skipped.fallbackHandled || !skipped.contadorFallbackEnqueued || contadorCalls !== 1) throw new Error('skipped fallback was not delivered');
+        if (completed.status !== 'completed') throw new Error('skipped media job was not completed after fallback');
+        console.log('agent-terminal-retry-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-terminal-retry-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
 test('does not spend a model call on partner media from a non-allowlisted sender', () => {
   const dbPath = path.join(os.tmpdir(), `agent-router-sender-${process.pid}-${Date.now()}.sqlite`);
   try {

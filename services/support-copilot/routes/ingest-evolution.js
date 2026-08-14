@@ -475,9 +475,11 @@ router.post('/', async (req, res) => {
         routeInboundMessageDurably({
           messageId: msgId, externalMessageId, conversationId, brandId, groupJid,
           instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+          replyToContador: contadorEvent.replyToContador,
+          quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
           deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
         }).then(result => {
-          if (result?.skipped || result?.status === 'error') {
+          if ((result?.skipped || result?.status === 'error') && !result?.fallbackHandled) {
             const contadorRoute = enqueueContadorMessage(contadorEvent);
             if (contadorRoute.kind === 'ignored') {
               scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
@@ -835,7 +837,7 @@ router.post('/', async (req, res) => {
         const enrichedBody = `${body} [Análise automática]: ${result.summary}`;
         db.prepare('UPDATE messages SET body = ? WHERE id = ?').run(enrichedBody, msgId);
         emitEvent({ type: 'message_update', conversationId, messageId: msgId, brandId });
-      } else if (result?.skipped && media.url) {
+      } else if (result?.skipped && !result?.fallbackHandled && media.url) {
         // Router off/no eligible agent: preserve the existing support image
         // description instead of silently degrading the atendimento screen.
         const { processMedia } = require('../lib/media-processor');

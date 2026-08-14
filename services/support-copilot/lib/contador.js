@@ -119,6 +119,53 @@ function parseLiteralNumber(token) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function literalNumberVariants(token) {
+  const values = [];
+  const parsed = parseLiteralNumber(token);
+  if (parsed !== null) values.push(parsed);
+  if (/^\d{1,3}(?:\.\d{3})+$/.test(String(token || ''))) values.push(Number(String(token).replace(/\./g, '')));
+  return [...new Set(values)];
+}
+
+function extractLabeledDraftNumbers(text) {
+  const numericFields = {};
+  const add = (field, values) => {
+    if (!values.length) return;
+    numericFields[field] = [...new Set([...(numericFields[field] || []), ...values])];
+  };
+  const token = '-?\\d+(?:[.,]\\d+)*';
+  const segments = String(text || '').split(/(?:\r?\n|;|\s+e\s+)/i);
+  for (const segment of segments) {
+    const utility = /distribuidora|n[aã]o\s+compensad|consumo\s+(?:da\s+)?rede/i.test(segment);
+    const solar = !utility && /solar|gerador|scee|\bcompensad/i.test(segment);
+    const kwhMatch = segment.match(new RegExp(`(${token})\\s*kwh`, 'i'))
+      || segment.match(new RegExp(`kwh\\s*[:=-]?\\s*(${token})`, 'i'));
+    if (kwhMatch && (utility || solar)) {
+      add(utility ? 'kwhNaoCompensado' : 'kwhCompensado', literalNumberVariants(kwhMatch[1]));
+    }
+
+    const tariffMatch = segment.match(new RegExp(`tarifa[^;\\n]{0,40}?(${token})`, 'i'))
+      || segment.match(new RegExp(`(${token})\\s*(?:r\\$\\s*)?[/]\\s*kwh`, 'i'));
+    if (tariffMatch && (utility || solar)) {
+      const withoutTaxes = /sem\s+tributos?/i.test(segment);
+      const field = utility
+        ? (withoutTaxes ? 'tarifaSemTributosNaoCompensada' : 'tarifaNaoCompensada')
+        : (withoutTaxes ? 'tarifaSemTributos' : 'tarifaScee');
+      add(field, literalNumberVariants(tariffMatch[1]));
+    }
+
+    if (/(?:total|valor\s+(?:da\s+)?(?:fatura|conta))/i.test(segment) && !/[/]\s*kwh/i.test(segment)) {
+      const amountMatch = segment.match(new RegExp(`R\\$\\s*(${token})`, 'i'))
+        || segment.match(new RegExp(`(?:total|valor\\s+(?:da\\s+)?(?:fatura|conta))\\s*[:=-]?\\s*(${token})`, 'i'));
+      if (amountMatch) {
+        const values = literalNumberVariants(amountMatch[1]);
+        add('totalCents', /centavos?/i.test(segment) ? values : values.map((value) => Math.round(value * 100)));
+      }
+    }
+  }
+  return numericFields;
+}
+
 function extractDraftReplyLiterals(body) {
   const text = String(body || '');
   const numericTokens = text.match(/-?\d+(?:[.,]\d+)*/g) || [];
@@ -155,15 +202,16 @@ function extractDraftReplyLiterals(body) {
     periods,
     dates: [...dates],
     brlAmountCents,
+    numericFields: extractLabeledDraftNumbers(text),
   };
 }
 
 function draftFieldsMatchReply(fields, body) {
   if (!fields || Object.keys(fields).length === 0) return true;
   const literals = extractDraftReplyLiterals(body);
-  const sameNumber = (value) => typeof value === 'number'
+  const sameLabeledNumber = (key, value) => typeof value === 'number'
     && Number.isFinite(value)
-    && literals.numbers.some((candidate) => Math.abs(candidate - value) <= 1e-9);
+    && (literals.numericFields[key] || []).some((candidate) => Math.abs(candidate - value) <= 1e-9);
   return Object.entries(fields).every(([key, value]) => {
     if (key === 'uc') {
       const digits = String(value || '').replace(/\D/g, '');
@@ -174,8 +222,7 @@ function draftFieldsMatchReply(fields, body) {
         && literals.periods.some((period) => period.year === Number(value.year) && period.month === Number(value.month)));
     }
     if (key === 'dueDate') return typeof value === 'string' && literals.dates.includes(value);
-    if (key === 'totalCents') return sameNumber(value) || literals.brlAmountCents === value;
-    return sameNumber(value);
+    return sameLabeledNumber(key, value);
   });
 }
 

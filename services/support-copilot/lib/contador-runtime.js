@@ -313,14 +313,21 @@ function dueMonthlyRunMonths(now, localDate = saoPauloDay(now)) {
   const rows = db.prepare(`
     SELECT run_month, status, attempts FROM contador_monthly_runs ORDER BY run_month ASC
   `).all();
-  if (!rows.length) return scheduleReached ? [currentMonth] : [];
+  if (!rows.length) {
+    const seededAt = nowIso();
+    db.prepare(`
+      INSERT OR IGNORE INTO contador_monthly_runs (run_month, status, attempts, created_at, updated_at)
+      VALUES (?, 'pending', 0, ?, ?)
+    `).run(currentMonth, seededAt, seededAt);
+    return scheduleReached ? [currentMonth] : [];
+  }
 
   const dueThrough = scheduleReached ? currentMonth : shiftMonth(currentMonth, -1);
   const byMonth = new Map(rows.map((row) => [row.run_month, row]));
   const due = [];
   for (let runMonth = rows[0].run_month; runMonth <= dueThrough; runMonth = shiftMonth(runMonth, 1)) {
     const row = byMonth.get(runMonth);
-    if (!row || (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS)) due.push(runMonth);
+    if (!row || row.status === 'pending' || (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS)) due.push(runMonth);
   }
   return due;
 }
@@ -395,7 +402,8 @@ async function processMonthlySummary(now = new Date()) {
         claim = db.prepare(`
           UPDATE contador_monthly_runs
           SET status = 'processing', attempts = attempts + 1, updated_at = ?
-          WHERE run_month = ? AND status = 'failed' AND attempts < ?
+          WHERE run_month = ?
+            AND ((status = 'pending' AND attempts = 0) OR (status = 'failed' AND attempts < ?))
         `).run(created, runMonth, MAX_ATTEMPTS);
       }
       if (!claim.changes) continue;

@@ -9,6 +9,7 @@ let worker = null;
 let delivering = false;
 let deliveringMediaJobs = false;
 let mediaJobsRecovered = false;
+const MEDIA_JOB_MAX_ATTEMPTS = 5;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
@@ -221,6 +222,31 @@ function persistMediaJob(input) {
     .run(input.messageId, JSON.stringify(input), now, now, now);
 }
 
+async function deliverSkippedMediaFallback(input) {
+  const contadorEvent = {
+    messageId: input.externalMessageId || input.messageId,
+    conversationId: input.conversationId,
+    brandId: input.brandId,
+    groupJid: input.groupJid,
+    instance: input.instance,
+    direction: 'inbound',
+    sender: input.sender,
+    senderId: input.senderId,
+    body: input.body,
+    media: input.media,
+    receivedAt: input.receivedAt,
+    replyToContador: input.replyToContador,
+    quotedContadorDraftId: input.quotedContadorDraftId,
+  };
+  const { enqueueContadorMessage } = require('./contador-runtime');
+  const contadorRoute = enqueueContadorMessage(contadorEvent);
+  if (contadorRoute.kind !== 'ignored') return { handled: true, contadorEnqueued: contadorRoute.enqueued === true };
+  if (!input.groupJid) return { handled: false, contadorEnqueued: false };
+  const { createGroupSuggestion } = require('./auto-suggest');
+  await createGroupSuggestion(input.conversationId, input.brandId);
+  return { handled: true, contadorEnqueued: false };
+}
+
 async function processMediaJob(messageId) {
   const claimed = db.prepare(`UPDATE agent_media_jobs
     SET status = 'processing', attempts = attempts + 1, updated_at = ?
@@ -230,17 +256,22 @@ async function processMediaJob(messageId) {
   if (!claimed.changes) return { queued: true, duplicate: true };
   const row = db.prepare('SELECT payload_json, attempts FROM agent_media_jobs WHERE message_id = ?').get(messageId);
   try {
-    const result = await routeInboundMessage(JSON.parse(row.payload_json));
+    const input = JSON.parse(row.payload_json);
+    const result = await routeInboundMessage(input);
     if (result?.status === 'error') throw new Error(result.error || 'media_classification_failed');
+    const fallback = result?.skipped ? await deliverSkippedMediaFallback(input) : { handled: false };
     db.prepare("UPDATE agent_media_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE message_id = ?")
       .run(nowIso(), messageId);
-    return result;
+    return { ...result, fallbackHandled: fallback.handled === true, contadorFallbackEnqueued: fallback.contadorEnqueued === true };
   } catch (error) {
-    const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(Number(row.attempts || 1), 8)));
+    const attempts = Number(row.attempts || 1);
+    const retryable = attempts < MEDIA_JOB_MAX_ATTEMPTS;
+    const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts, 8)));
+    const updatedAt = nowIso();
     db.prepare(`UPDATE agent_media_jobs
-      SET status = 'retry', next_attempt_at = ?, last_error = ?, updated_at = ?
+      SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
       WHERE message_id = ?`)
-      .run(new Date(Date.now() + delayMs).toISOString(), String(error?.message || error).slice(0, 500), nowIso(), messageId);
+      .run(retryable ? 'retry' : 'failed', retryable ? new Date(Date.now() + delayMs).toISOString() : updatedAt, String(error?.message || error).slice(0, 500), updatedAt, messageId);
     throw error;
   }
 }

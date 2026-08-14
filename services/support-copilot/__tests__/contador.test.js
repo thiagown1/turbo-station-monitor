@@ -336,6 +336,33 @@ test('draft resolution rejects model numbers that were not literal in the quoted
   assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
 });
 
+test('draft resolution binds each kWh literal to its labeled bill side', async () => {
+  let intakeCalls = 0;
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { intakeCalls += 1; return { replyMessage: 'não deveria registrar' }; },
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft', draftId: 'rcpt_open',
+      fields: { kwhNaoCompensado: 650, kwhCompensado: 812 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-swapped-kwh', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'distribuidora: 812 kWh; solar: 650 kWh',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.reason, 'draft_fields_not_literal');
+  assert.equal(intakeCalls, 0);
+  assert.match(replies[0].text, /confirmar esses valores/i);
+});
+
 test('heartbeat stays silent without actionable items and sends once when action is needed', async () => {
   const replies = [];
   const quiet = buildContador({
