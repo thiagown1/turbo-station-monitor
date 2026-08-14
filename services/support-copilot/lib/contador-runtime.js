@@ -48,6 +48,15 @@ function canRouteContadorEvent(event) {
   return Boolean(configured() && event?.direction === 'inbound' && event?.groupJid === config.groupConversationId);
 }
 
+function isQuotedContadorDraftReply(event) {
+  return Boolean(
+    canRouteContadorEvent(event)
+    && event?.replyToContador
+    && typeof event?.quotedContadorDraftId === 'string'
+    && event.quotedContadorDraftId.trim()
+  );
+}
+
 async function postNext(route, body) {
   if (!configured()) throw new Error('Contador is enabled but required configuration is incomplete');
   const response = await fetch(`${config.nextBaseUrl}${route}`, {
@@ -231,6 +240,11 @@ function nextRetryIso(attempts) {
   return new Date(Date.now() + minutes * 60_000).toISOString();
 }
 
+function monthlyRetryIso(attempts, now = new Date()) {
+  const hours = [1, 4, 12, 24][Math.min(Math.max(Number(attempts || 1) - 1, 0), 3)];
+  return new Date(now.getTime() + hours * 60 * 60_000).toISOString();
+}
+
 let workerBusy = false;
 async function processPendingJobs() {
   if (!configured() || workerBusy) return;
@@ -311,7 +325,7 @@ function dueMonthlyRunMonths(now, localDate = saoPauloDay(now)) {
   const currentMonth = localDate.slice(0, 7);
   const scheduleReached = monthlyScheduleReached(now, localDate);
   const rows = db.prepare(`
-    SELECT run_month, status, attempts FROM contador_monthly_runs ORDER BY run_month ASC
+    SELECT run_month, status, attempts, next_attempt_at FROM contador_monthly_runs ORDER BY run_month ASC
   `).all();
   if (!rows.length) {
     const seededAt = nowIso();
@@ -327,7 +341,16 @@ function dueMonthlyRunMonths(now, localDate = saoPauloDay(now)) {
   const due = [];
   for (let runMonth = rows[0].run_month; runMonth <= dueThrough; runMonth = shiftMonth(runMonth, 1)) {
     const row = byMonth.get(runMonth);
-    if (!row || row.status === 'pending' || (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS)) due.push(runMonth);
+    const retryAt = row?.next_attempt_at ? Date.parse(row.next_attempt_at) : NaN;
+    const retryDue = !row?.next_attempt_at || !Number.isFinite(retryAt) || retryAt <= now.getTime();
+    if (!row || row.status === 'pending') {
+      due.push(runMonth);
+      continue;
+    }
+    if (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS) {
+      if (retryDue) due.push(runMonth);
+      else break; // Never overtake an older closing that is waiting for retry.
+    }
   }
   return due;
 }
@@ -401,20 +424,29 @@ async function processMonthlySummary(now = new Date()) {
       if (!claim.changes) {
         claim = db.prepare(`
           UPDATE contador_monthly_runs
-          SET status = 'processing', attempts = attempts + 1, updated_at = ?
+          SET status = 'processing', attempts = attempts + 1, next_attempt_at = NULL, updated_at = ?
           WHERE run_month = ?
-            AND ((status = 'pending' AND attempts = 0) OR (status = 'failed' AND attempts < ?))
-        `).run(created, runMonth, MAX_ATTEMPTS);
+            AND (
+              (status = 'pending' AND attempts = 0)
+              OR (status = 'failed' AND attempts < ? AND (next_attempt_at IS NULL OR datetime(next_attempt_at) <= datetime(?)))
+            )
+        `).run(created, runMonth, MAX_ATTEMPTS, now.toISOString());
       }
       if (!claim.changes) continue;
 
       try {
         const result = await contador.monthlySummary(monthlyRunDate(runMonth));
-        db.prepare(`UPDATE contador_monthly_runs SET status = ?, updated_at = ? WHERE run_month = ?`)
+        db.prepare(`UPDATE contador_monthly_runs SET status = ?, next_attempt_at = NULL, updated_at = ? WHERE run_month = ?`)
           .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
       } catch (err) {
-        db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE run_month = ?`)
-          .run(String(err.message || err).slice(0, 500), nowIso(), runMonth);
+        const attempt = db.prepare('SELECT attempts FROM contador_monthly_runs WHERE run_month = ?').get(runMonth);
+        db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE run_month = ?`)
+          .run(
+            monthlyRetryIso(attempt?.attempts, now),
+            String(err.message || err).slice(0, 500),
+            nowIso(),
+            runMonth
+          );
         console.warn(`${LOG_TAG} [contador] monthly summary ${runMonth} failed:`, err.message);
         break;
       }
@@ -446,9 +478,9 @@ function startContadorRuntime() {
   `).run(recoveredAt);
   db.prepare(`
     UPDATE contador_monthly_runs
-    SET status = 'failed', last_error = 'interrupted_process', updated_at = ?
+    SET status = 'failed', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
     WHERE status = 'processing'
-  `).run(recoveredAt);
+  `).run(recoveredAt, recoveredAt);
   runtimeStarted = true;
   console.log(`${LOG_TAG} [contador] runtime enabled for configured group; heartbeat hour=${CONTADOR_HEARTBEAT_HOUR}, monthly day=${CONTADOR_MONTHLY_DAY} America/Sao_Paulo`);
   processPendingJobs().catch((err) => console.warn(`${LOG_TAG} [contador] initial worker failed:`, err.message));
@@ -468,6 +500,7 @@ module.exports = {
   config,
   configured,
   canRouteContadorEvent,
+  isQuotedContadorDraftReply,
   enqueueContadorMessage,
   processPendingJobs,
   processHeartbeat,

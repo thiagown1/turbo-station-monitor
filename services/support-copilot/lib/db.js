@@ -386,6 +386,7 @@ try {
       run_month TEXT PRIMARY KEY,
       status TEXT NOT NULL,
       attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
       last_error TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -393,6 +394,13 @@ try {
   `);
 } catch (err) {
   console.warn(`${LOG_TAG} contador migrations:`, err.message);
+}
+safeAddColumn('contador_monthly_runs', 'next_attempt_at', 'TEXT DEFAULT NULL');
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contador_monthly_runs_due
+    ON contador_monthly_runs(status, next_attempt_at, run_month);`);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador monthly retry index migration:`, err.message);
 }
 
 // One paid media classification per inbound message, plus a durable delivery

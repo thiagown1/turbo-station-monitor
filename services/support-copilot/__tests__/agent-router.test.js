@@ -61,6 +61,23 @@ test('normalizes energy invoice vision fields and rejects implausible tariffs', 
   assert.equal(bounded.kwhNaoCompensado, null);
   assert.equal(bounded.kwhCompensado, null);
   assert.equal(bounded.totalCents, null);
+  const zeroed = extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      kwh_nao_compensado: 0,
+      tarifa_nao_compensada: '0,00',
+      kwh_compensado: '0',
+      tarifa_scee: 0,
+      tarifa_sem_tributos_nao_compensada: 0,
+      tarifa_sem_tributos: '0',
+    },
+  });
+  assert.equal(zeroed.kwhNaoCompensado, 0);
+  assert.equal(zeroed.tarifaNaoCompensada, 0);
+  assert.equal(zeroed.kwhCompensado, 0);
+  assert.equal(zeroed.tarifaScee, 0);
+  assert.equal(zeroed.tarifaSemTributosNaoCompensada, 0);
+  assert.equal(zeroed.tarifaSemTributos, 0);
   assert.equal(extractEnergyBill({
     kind: 'energy_invoice', energy_bill: { total_brl: 'R$ 0,00' },
   }).totalCents, 0);

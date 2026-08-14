@@ -50,7 +50,7 @@ function extractFinancialFields(parsed) {
   return { currency, originalAmountMinor, amountCents };
 }
 
-function boundedPositive(value, max) {
+function boundedNonNegative(value, max) {
   if (value == null || value === '') return null;
   let normalized = value;
   if (typeof value === 'string') {
@@ -64,7 +64,7 @@ function boundedPositive(value, max) {
     }
   }
   const number = Number(normalized);
-  return Number.isFinite(number) && number > 0 && number <= max ? number : null;
+  return Number.isFinite(number) && number >= 0 && number <= max ? number : null;
 }
 
 function extractEnergyBill(parsed) {
@@ -84,12 +84,12 @@ function extractEnergyBill(parsed) {
     uc: cleanString(source.uc, 64) || null,
     refPeriod,
     dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.due_date || '')) ? source.due_date : null,
-    kwhNaoCompensado: boundedPositive(source.kwh_nao_compensado, 1_000_000),
-    tarifaNaoCompensada: boundedPositive(source.tarifa_nao_compensada, 10),
-    kwhCompensado: boundedPositive(source.kwh_compensado, 1_000_000),
-    tarifaScee: boundedPositive(source.tarifa_scee, 10),
-    tarifaSemTributosNaoCompensada: boundedPositive(source.tarifa_sem_tributos_nao_compensada, 10),
-    tarifaSemTributos: boundedPositive(source.tarifa_sem_tributos, 10),
+    kwhNaoCompensado: boundedNonNegative(source.kwh_nao_compensado, 1_000_000),
+    tarifaNaoCompensada: boundedNonNegative(source.tarifa_nao_compensada, 10),
+    kwhCompensado: boundedNonNegative(source.kwh_compensado, 1_000_000),
+    tarifaScee: boundedNonNegative(source.tarifa_scee, 10),
+    tarifaSemTributosNaoCompensada: boundedNonNegative(source.tarifa_sem_tributos_nao_compensada, 10),
+    tarifaSemTributos: boundedNonNegative(source.tarifa_sem_tributos, 10),
     totalCents: (() => {
       const cents = parseAmountToCents(source.total_brl);
       return Number.isInteger(cents) && cents >= 0 && cents <= 1_000_000_000 ? cents : null;

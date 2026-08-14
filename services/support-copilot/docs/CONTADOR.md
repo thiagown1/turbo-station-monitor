@@ -95,12 +95,15 @@ monthly values into the workspace.
   central media router. For an energy photo, the configured vision provider
   receives the image and returns a minimal typed extraction; the raw image is
   not forwarded to Next. kWh and amount bounds match the ledger contract, and
-  implausible fields fail closed at both boundaries;
+  literal zero consumption/tariffs remain valid while implausible fields fail
+  closed at both boundaries;
 - a quoted reply such as “é do Galois” must consult `estacoes` and can submit one
   exact `draftId + stationId` only when that station id appeared in the trusted
   tool result and the quoted outbound message carries the
   same draft prompt metadata. Quoting another Contador heartbeat, summary or
-  draft cannot authorize the write. Confirmed UC mappings are persisted and
+  draft cannot authorize the write. This quoted-draft path bypasses generic
+  station triage, while Next still revalidates the stable sender allowlist.
+  Confirmed UC mappings are persisted and
   numeric corrections must be labeled by side/type (for example,
   `distribuidora: 812 kWh; solar: 650 kWh`); matching a number elsewhere in the
   message is insufficient,
@@ -124,6 +127,9 @@ monthly values into the workspace.
   `drafts_abertos`, enriched with `contas_a_vencer`; it replaces that day's
   ordinary heartbeat so the group receives at most one proactive summary and
   stays silent without trusted data;
+- a failed monthly closing persists its next attempt and retries after 1h, 4h,
+  12h and 24h before exhausting the bounded five-attempt budget; the 15-minute
+  scheduler therefore cannot consume every attempt during a short outage;
 - failed model/API work is visible in `contador_jobs` with attempts and a
   redacted error, and transient failures use bounded backoff.
 

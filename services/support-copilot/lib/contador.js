@@ -365,7 +365,12 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
         fields: instruction.fields,
       });
       if (!result?.replyMessage) return { status: 'blocked', reason: 'draft_resolution_missing_reply', toolCalls: calls };
-      await sendReply(result.replyMessage, event);
+      const terminal = ['registered', 'duplicate', 'not_brand_paid'].includes(result.outcome)
+        || ['complete', 'duplicate', 'not_brand_paid'].includes(result.status);
+      await sendReply(result.replyMessage, {
+        ...event,
+        contadorDraftId: terminal ? undefined : (result.draftId || instruction.draftId),
+      });
       return { status: 'sent', outcome: result.outcome || result.status || null, toolCalls: calls };
     }
 

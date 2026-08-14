@@ -226,6 +226,38 @@ test('a draft write rejects a station id that was not returned by the station to
   assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
 });
 
+test('a partial draft resolution keeps draft metadata on the next prompt', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => ({
+      outcome: 'unrecognized',
+      status: 'missing_info',
+      draftId: 'rcpt_open',
+      replyMessage: 'Qual foi a tarifa da distribuidora?',
+    }),
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open', missing: ['tariff'] }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft',
+      draftId: 'rcpt_open',
+      fields: { kwhNaoCompensado: 812 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-partial', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'distribuidora: 812 kWh', replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(result.outcome, 'unrecognized');
+  assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
+});
+
 test('draft writes require a quoted reply even if the model asks to resolve', async () => {
   const replies = [];
   const contador = buildContador({

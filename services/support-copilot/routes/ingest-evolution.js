@@ -32,7 +32,12 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
-const { enqueueContadorMessage, canRouteContadorEvent, sendReply } = require('../lib/contador-runtime');
+const {
+  enqueueContadorMessage,
+  canRouteContadorEvent,
+  isQuotedContadorDraftReply,
+  sendReply,
+} = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 
@@ -470,7 +475,15 @@ router.post('/', async (req, res) => {
       // messages use a free deterministic gate and invoke the model only when
       // they look like a request to inspect a charger.
       const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
-      if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
+      if (isQuotedContadorDraftReply(contadorEvent)) {
+        // A quoted draft answer belongs to the Contador loop even when it says
+        // "estação". The Next boundary still revalidates the stable sender
+        // allowlist before accepting any financial mutation.
+        const contadorRoute = enqueueContadorMessage(contadorEvent);
+        if (contadorRoute.kind === 'ignored') {
+          scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+        }
+      } else if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
         const { routeInboundMessageDurably } = require('../lib/agent-router');
         routeInboundMessageDurably({
           messageId: msgId, externalMessageId, conversationId, brandId, groupJid,

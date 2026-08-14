@@ -10,10 +10,11 @@ const { execFileSync } = require('node:child_process');
 const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${process.pid}-${Date.now()}.sqlite`);
 const backfillDbPath = `${dbPath}-backfill`;
 const baselineDbPath = `${dbPath}-baseline`;
+const retryDbPath = `${dbPath}-retry`;
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
-    const { enqueueContadorMessage, configured, _recordOutboundForTest } = require('./lib/contador-runtime');
+    const { enqueueContadorMessage, configured, isQuotedContadorDraftReply, _recordOutboundForTest } = require('./lib/contador-runtime');
     const { db } = require('./lib/db');
     if (!configured()) throw new Error('test runtime should be configured');
     const base = {
@@ -30,12 +31,20 @@ try {
     const replay = enqueueContadorMessage(base);
     const chatter = enqueueContadorMessage({ ...base, messageId: 'wamid-chat', body: 'ok', media: null });
     const wrongGroup = enqueueContadorMessage({ ...base, messageId: 'wamid-other', groupJid: 'other@g.us' });
+    const quotedDraftStationReply = isQuotedContadorDraftReply({
+      ...base, media: null, body: 'é da estação Galois', replyToContador: true,
+      quotedContadorDraftId: 'rcpt_open',
+    });
+    const untrustedQuote = isQuotedContadorDraftReply({
+      ...base, groupJid: 'other@g.us', media: null, replyToContador: true,
+      quotedContadorDraftId: 'rcpt_open',
+    });
     _recordOutboundForTest('De qual estação é essa conta?', {
       conversationId: 'conv-1', brandId: 'turbo_station', contadorDraftId: 'rcpt_open',
     }, 'wamid-draft-prompt');
     const jobs = db.prepare('SELECT message_id, kind, status FROM contador_jobs ORDER BY created_at').all();
     const prompt = db.prepare("SELECT media_json FROM messages WHERE external_message_id = 'wamid-draft-prompt'").get();
-    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, jobs, prompt }));
+    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, quotedDraftStationReply, untrustedQuote, jobs, prompt }));
     db.close();
   `], {
     cwd: path.join(__dirname, '..'),
@@ -56,6 +65,8 @@ try {
   assert.equal(result.replay.enqueued, false);
   assert.equal(result.chatter.kind, 'ignored');
   assert.equal(result.wrongGroup.reason, 'group_not_allowed');
+  assert.equal(result.quotedDraftStationReply, true);
+  assert.equal(result.untrustedQuote, false);
   assert.deepEqual(result.jobs, [{ message_id: 'wamid-queue-1', kind: 'pdf', status: 'pending' }]);
   assert.equal(JSON.parse(result.prompt.media_json).contador.draftId, 'rcpt_open');
   console.log('PASS Contador runtime outbox is group-scoped and idempotent');
@@ -96,6 +107,49 @@ try {
   assert.equal(monthly.calls, 1);
   assert.deepEqual(monthly.rows, [{ run_month: '2026-08', status: 'sent', attempts: 1 }]);
   console.log('PASS Contador monthly summary catches up after the schedule and stays idempotent');
+
+  const retryOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      let calls = 0;
+      runtime._setContadorForTest({
+        heartbeat: async () => ({ status: 'silent' }),
+        monthlySummary: async () => { calls += 1; throw new Error('temporary model outage'); },
+      });
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:00:00.000Z'));
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:15:00.000Z'));
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:30:00.000Z'));
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:45:00.000Z'));
+      const beforeRetry = db.prepare('SELECT status, attempts, next_attempt_at FROM contador_monthly_runs WHERE run_month = ?').get('2026-08');
+      await runtime.processMonthlySummary(new Date('2026-08-03T12:00:00.000Z'));
+      const afterRetry = db.prepare('SELECT status, attempts, next_attempt_at FROM contador_monthly_runs WHERE run_month = ?').get('2026-08');
+      process.stdout.write(JSON.stringify({ calls, beforeRetry, afterRetry }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: retryDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const retry = JSON.parse(retryOutput.slice(retryOutput.lastIndexOf('\n') + 1));
+  assert.equal(retry.calls, 2);
+  assert.deepEqual(retry.beforeRetry, {
+    status: 'failed', attempts: 1, next_attempt_at: '2026-08-03T12:00:00.000Z',
+  });
+  assert.deepEqual(retry.afterRetry, {
+    status: 'failed', attempts: 2, next_attempt_at: '2026-08-03T16:00:00.000Z',
+  });
+  console.log('PASS Contador monthly retries respect persisted backoff');
 
   const backfillOutput = execFileSync(process.execPath, ['-e', `
     (async () => {
@@ -181,7 +235,7 @@ try {
   ]);
   console.log('PASS Contador monthly summary seeds an empty ledger before the first schedule');
 } finally {
-  for (const target of [dbPath, backfillDbPath, baselineDbPath]) {
+  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }
