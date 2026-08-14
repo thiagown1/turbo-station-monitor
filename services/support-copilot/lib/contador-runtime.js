@@ -19,6 +19,7 @@ const {
   CONTADOR_OPENCLAW_MODEL,
   CONTADOR_SESSION_ID,
   CONTADOR_HEARTBEAT_HOUR,
+  CONTADOR_MONTHLY_DAY,
 } = require('./constants');
 
 const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/home/openclaw/.npm-global/bin/openclaw';
@@ -41,6 +42,10 @@ const config = {
 
 function configured() {
   return Boolean(config.enabled && config.groupConversationId && config.nextBaseUrl && config.secret);
+}
+
+function canRouteContadorEvent(event) {
+  return Boolean(configured() && event?.direction === 'inbound' && event?.groupJid === config.groupConversationId);
 }
 
 async function postNext(route, body) {
@@ -177,7 +182,7 @@ async function sendReply(text, event) {
   return result;
 }
 
-const contador = buildContador({
+let contador = buildContador({
   config,
   readMedia,
   intake: (payload) => postNext('/api/accounting/energy-bill-intake', payload),
@@ -190,6 +195,10 @@ const contador = buildContador({
   runAgent,
   loadContext,
 });
+
+function _setContadorForTest(value) {
+  contador = value;
+}
 
 function enqueueContadorMessage(event) {
   if (!configured()) return { kind: 'ignored', reason: config.enabled ? 'incomplete_config' : 'disabled' };
@@ -277,8 +286,14 @@ function saoPauloHour(now = new Date()) {
 
 let heartbeatBusy = false;
 async function processHeartbeat(now = new Date()) {
-  if (!configured() || heartbeatBusy || saoPauloHour(now) !== CONTADOR_HEARTBEAT_HOUR) return;
-  const runDate = saoPauloDay(now);
+  const localDate = saoPauloDay(now);
+  if (
+    !configured()
+    || heartbeatBusy
+    || saoPauloHour(now) !== CONTADOR_HEARTBEAT_HOUR
+    || Number(localDate.slice(-2)) === CONTADOR_MONTHLY_DAY
+  ) return;
+  const runDate = localDate;
   const created = nowIso();
   let claim = db.prepare(`
     INSERT OR IGNORE INTO contador_daily_runs (run_date, status, attempts, created_at, updated_at)
@@ -307,6 +322,40 @@ async function processHeartbeat(now = new Date()) {
   }
 }
 
+let monthlyBusy = false;
+async function processMonthlySummary(now = new Date()) {
+  const localDate = saoPauloDay(now);
+  const localDay = Number(localDate.slice(-2));
+  if (!configured() || monthlyBusy || localDay !== CONTADOR_MONTHLY_DAY || saoPauloHour(now) !== CONTADOR_HEARTBEAT_HOUR) return;
+  const runMonth = localDate.slice(0, 7);
+  const created = nowIso();
+  let claim = db.prepare(`
+    INSERT OR IGNORE INTO contador_monthly_runs (run_month, status, attempts, created_at, updated_at)
+    VALUES (?, 'processing', 1, ?, ?)
+  `).run(runMonth, created, created);
+  if (!claim.changes) {
+    claim = db.prepare(`
+      UPDATE contador_monthly_runs
+      SET status = 'processing', attempts = attempts + 1, updated_at = ?
+      WHERE run_month = ? AND status = 'failed' AND attempts < ?
+    `).run(created, runMonth, MAX_ATTEMPTS);
+  }
+  if (!claim.changes) return;
+
+  monthlyBusy = true;
+  try {
+    const result = await contador.monthlySummary(now);
+    db.prepare(`UPDATE contador_monthly_runs SET status = ?, updated_at = ? WHERE run_month = ?`)
+      .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
+  } catch (err) {
+    db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE run_month = ?`)
+      .run(String(err.message || err).slice(0, 500), nowIso(), runMonth);
+    console.warn(`${LOG_TAG} [contador] monthly summary ${runMonth} failed:`, err.message);
+  } finally {
+    monthlyBusy = false;
+  }
+}
+
 function startContadorRuntime() {
   if (!config.enabled) {
     console.log(`${LOG_TAG} [contador] disabled (CONTADOR_ENABLED is not true)`);
@@ -327,12 +376,21 @@ function startContadorRuntime() {
     SET status = 'failed', last_error = 'interrupted_process', updated_at = ?
     WHERE status = 'processing'
   `).run(recoveredAt);
+  db.prepare(`
+    UPDATE contador_monthly_runs
+    SET status = 'failed', last_error = 'interrupted_process', updated_at = ?
+    WHERE status = 'processing'
+  `).run(recoveredAt);
   runtimeStarted = true;
-  console.log(`${LOG_TAG} [contador] runtime enabled for configured group; heartbeat hour=${CONTADOR_HEARTBEAT_HOUR} America/Sao_Paulo`);
+  console.log(`${LOG_TAG} [contador] runtime enabled for configured group; heartbeat hour=${CONTADOR_HEARTBEAT_HOUR}, monthly day=${CONTADOR_MONTHLY_DAY} America/Sao_Paulo`);
   processPendingJobs().catch((err) => console.warn(`${LOG_TAG} [contador] initial worker failed:`, err.message));
   processHeartbeat().catch((err) => console.warn(`${LOG_TAG} [contador] initial heartbeat failed:`, err.message));
+  processMonthlySummary().catch((err) => console.warn(`${LOG_TAG} [contador] initial monthly summary failed:`, err.message));
   const workerTimer = setInterval(() => processPendingJobs().catch((err) => console.warn(`${LOG_TAG} [contador] worker failed:`, err.message)), WORKER_INTERVAL_MS);
-  const heartbeatTimer = setInterval(() => processHeartbeat().catch((err) => console.warn(`${LOG_TAG} [contador] heartbeat failed:`, err.message)), HEARTBEAT_INTERVAL_MS);
+  const heartbeatTimer = setInterval(() => {
+    processHeartbeat().catch((err) => console.warn(`${LOG_TAG} [contador] heartbeat failed:`, err.message));
+    processMonthlySummary().catch((err) => console.warn(`${LOG_TAG} [contador] monthly summary failed:`, err.message));
+  }, HEARTBEAT_INTERVAL_MS);
   workerTimer.unref?.();
   heartbeatTimer.unref?.();
   return { started: true };
@@ -341,10 +399,13 @@ function startContadorRuntime() {
 module.exports = {
   config,
   configured,
+  canRouteContadorEvent,
   enqueueContadorMessage,
   processPendingJobs,
   processHeartbeat,
+  processMonthlySummary,
   startContadorRuntime,
   resolveMediaPath,
   sendReply,
+  _setContadorForTest,
 };

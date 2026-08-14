@@ -49,6 +49,7 @@ const CONTADOR_OPENCLAW_AGENT = process.env.CONTADOR_OPENCLAW_AGENT || 'contador
 const CONTADOR_OPENCLAW_MODEL = process.env.CONTADOR_OPENCLAW_MODEL || 'claude-cli/claude-opus-4-8';
 const CONTADOR_SESSION_ID = process.env.CONTADOR_SESSION_ID || 'contador-contas';
 const CONTADOR_HEARTBEAT_HOUR = Math.min(23, Math.max(0, Number(process.env.CONTADOR_HEARTBEAT_HOUR || 8)));
+const CONTADOR_MONTHLY_DAY = Math.min(28, Math.max(1, Number(process.env.CONTADOR_MONTHLY_DAY || 3)));
 
 /**
  * Map Evolution API instance name → brand_id.
@@ -87,4 +88,5 @@ module.exports = {
   CONTADOR_OPENCLAW_MODEL,
   CONTADOR_SESSION_ID,
   CONTADOR_HEARTBEAT_HOUR,
+  CONTADOR_MONTHLY_DAY,
 };

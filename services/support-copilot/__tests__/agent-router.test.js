@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { estimateCost, extractFinancialFields } = require('../lib/agent-media-classifier');
+const { estimateCost, extractFinancialFields, extractEnergyBill } = require('../lib/agent-media-classifier');
 const { parseExpenseDecision, parseExpenseBrlAmount } = require('../lib/expense-decision');
 
 let passed = 0;
@@ -33,6 +33,24 @@ test('does not invent a BRL value for a foreign-currency charge', () => {
     currency: 'USD', originalAmountMinor: 20000, amountCents: undefined,
   });
   assert.equal(extractFinancialFields({ currency: 'USD', original_amount: 'US$ 200.00', settled_brl_amount: 'R$ 1.120,35' }).amountCents, 112035);
+});
+
+test('normalizes energy invoice vision fields and rejects implausible tariffs', () => {
+  assert.deepEqual(extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      distributor: 'equatorial_go', uc: '4.397.850.012-06', ref_period: { year: 2026, month: 5 },
+      due_date: '2026-05-28', kwh_nao_compensado: '6.173', tarifa_nao_compensada: '0,774023',
+      kwh_compensado: null, tarifa_scee: 99, tarifa_sem_tributos_nao_compensada: '0,62',
+      tarifa_sem_tributos: null, total_brl: 'R$ 135,07',
+    },
+  }), {
+    distributor: 'equatorial_go', uc: '4.397.850.012-06', refPeriod: { year: 2026, month: 5 },
+    dueDate: '2026-05-28', kwhNaoCompensado: 6173, tarifaNaoCompensada: 0.774023,
+    kwhCompensado: null, tarifaScee: null, tarifaSemTributosNaoCompensada: 0.62,
+    tarifaSemTributos: null, totalCents: 13507,
+  });
+  assert.equal(extractEnergyBill({ kind: 'expense_receipt' }), undefined);
 });
 
 test('parses only explicit expense decisions and gives recurrence precedence', () => {
@@ -126,6 +144,39 @@ test('classifies once, caches the receipt and durably delivers one event', () =>
       env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.ok(output.includes('agent-router-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('defers an energy invoice to Contador with structured fields and no duplicate generic event', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-energy-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        let eventCalls = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv1'], agents: { accounting: true } } }) };
+          if (String(url).includes('openrouter.ai')) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ kind: 'energy_invoice', summary: 'Conta Equatorial', confidence: 0.99, needs_attention: true, energy_bill: { distributor: 'equatorial_go', uc: '1234', ref_period: { year: 2026, month: 7 }, due_date: '2026-08-10', kwh_nao_compensado: 812, tarifa_nao_compensada: 0.75, kwh_compensado: null, tarifa_scee: null, tarifa_sem_tributos_nao_compensada: 0.6, tarifa_sem_tributos: null, total_brl: 'R$ 609,00' } }) } }], usage: {} }) };
+          if (String(url).includes('/api/agents/events')) { eventCalls++; return { ok: true, status: 202, text: async () => '{}' }; }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        const router = require('./lib/agent-router');
+        const result = await router.routeInboundMessage({ messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', body: 'conta de energia', receivedAt: now, deferEnergyInvoiceEvent: true });
+        await router.deliverDueEvents();
+        const outbox = db.prepare('SELECT COUNT(*) count FROM agent_event_outbox').get();
+        if (!result.eventDeferred || result.energyBill.kwhNaoCompensado !== 812) throw new Error('energy extraction not deferred');
+        if (outbox.count !== 0 || eventCalls !== 0) throw new Error('generic event was duplicated');
+        console.log('energy-deferred-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('energy-deferred-ok'));
   } finally {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
   }

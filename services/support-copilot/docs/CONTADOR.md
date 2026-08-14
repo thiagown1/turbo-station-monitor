@@ -15,7 +15,7 @@ The WhatsApp socket is entirely in this repository:
 4. `contador-runtime.js` persists accepted work in `contador_jobs` before any
    model or network call. The worker retries transient failures and recovers
    jobs interrupted by a PM2 restart.
-5. PDF registration and all accounting reads go through the Turbo Station Next
+5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
    `messages.source = 'contador'` for audit and reply detection.
@@ -23,8 +23,8 @@ The WhatsApp socket is entirely in this repository:
 Operational ownership is therefore split as follows:
 
 - `whatsapp-gateway`: WhatsApp/Baileys connection, media download and outbound transport.
-- `support-copilot`: group allow-list, durable outbox, model orchestration, history and daily heartbeat.
-- Turbo Station Next app: secret/kill switch, PDF parsing, UC resolution, accounting validation, Firestore writes and read-only tool shapes.
+- `support-copilot`: group allow-list, one paid media classification, durable outbox, model orchestration, history, daily heartbeat and monthly scheduler.
+- Turbo Station Next app: secret/kill switch, PDF parsing, structured-photo validation, UC resolution, audited draft completion, accounting validation, Firestore writes and read-only tool shapes.
 - Operator (currently Thiago): production activation, group id, secret rotation, OpenClaw agent provisioning and review of blocked/failed jobs.
 
 ## Safety defaults
@@ -44,8 +44,11 @@ messages or accounting writes.
 
 The model can call only the eight read-only tools exposed by
 `/api/accounting/energy-agent/query`, with at most five tool calls per turn.
-The only write is the deterministic PDF intake keyed by the original WhatsApp
-message id. Context sent to the model is capped at 30 messages and masks email
+The only writes are the deterministic intake keyed by the original WhatsApp
+message id and an exact `resolve_draft` action for a quoted operator reply.
+The latter names one draft and optionally one station/field patch; the Next
+boundary revalidates group, brand, production station and `energyPaidBy` before
+writing. Context sent to the model is capped at 30 messages and masks email
 addresses and long numeric identifiers. Structured amounts and tariffs are
 queried on demand, never read from memory files.
 
@@ -62,6 +65,7 @@ queried on demand, never read from memory files.
 | `CONTADOR_OPENCLAW_MODEL` | no | default `claude-cli/claude-opus-4-8` |
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
+| `CONTADOR_MONTHLY_DAY` | no | monthly closing day, default `3` (clamped to 1..28) |
 | `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
 
 Provision the dedicated OpenClaw agent with a workspace based on
@@ -78,10 +82,22 @@ monthly values into the workspace.
 - ordinary group chatter is ignored without invoking Opus;
 - PDF bytes are read from the local media directory and forwarded to the Next
   intake; its `replyMessage` is sent verbatim;
+- an image/PDF in the accounting group is classified exactly once by the
+  central media router. For an energy photo, the configured vision provider
+  receives the image and returns a minimal typed extraction; the raw image is
+  not forwarded to Next. Implausible fields fail closed at both boundaries;
+- a quoted reply such as “é do Galois” can consult `estacoes` and submit one
+  exact `draftId + stationId`. Confirmed UC mappings are persisted and replaying
+  the reply does not duplicate the original entry;
 - natural-language questions use the read-only tool loop and Claude Opus in a
   persistent OpenClaw session;
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
+- on day 3, at the heartbeat hour, a separate once-per-month ledger closes the
+  previous month using `resumo_contabil`, `resumo_energia`, `pendencias` and
+  `drafts_abertos`, enriched with `contas_a_vencer`; it replaces that day's
+  ordinary heartbeat so the group receives at most one proactive summary and
+  stays silent without trusted data;
 - failed model/API work is visible in `contador_jobs` with attempts and a
   redacted error, and transient failures use bounded backoff.
 
@@ -103,22 +119,7 @@ does not show the final amount settled in BRL, the Contador asks for `valor R$
 ...`. That reply only fills the review; the user must still make a second,
 explicit register-once or register-recurring decision.
 
-## Known contract gaps
-
-Two items in the original v1 plan cannot safely be completed with the currently
-merged Next contract:
-
-1. `/api/accounting/energy-bill-intake` accepts only a real PDF whose bytes
-   start with `%PDF-`. Images are parked as `blocked / image_intake_not_supported`;
-   the agent does not fabricate a PDF or bypass server validation.
-2. The query route lists open drafts but exposes no write that maps a human
-   answer such as “é do Galois” back to the draft. The Contador can ask/read,
-   but cannot complete that draft until a scoped, audited completion endpoint
-   exists.
-
-The “day 3 monthly summary enrichment” also has no corresponding monthly job in
-this repository. The daily heartbeat is implemented; monthly integration must
-be attached to an identified, owned scheduler before activation.
+## Remaining product boundary
 
 Future accounting context remains tracked here: a brand-scoped read-only API
 for complete company expenses (not only energy) is still out of scope.
@@ -132,12 +133,13 @@ Activation is a separate production change and requires explicit approval.
 2. Provision the `contador` OpenClaw agent/workspace and run an offline prompt
    smoke test without sending WhatsApp messages.
 3. Verify the exact group JID and that the Next feature flag is enabled for the
-   same group/brand. Test the Next query and PDF intake with a non-production
+   same group/brand. Test the Next query, PDF/photo intake and draft completion with a non-production
    fixture or approved dry run.
 4. Set the local config and enable `CONTADOR_ENABLED=true` in a separate step;
    restart only `support-copilot` and observe `contador_jobs` plus both PM2 logs.
-5. Test one question and one approved PDF. Confirm one outbound message per
-   inbound id and the resulting dashboard entry.
+5. Test one question, one approved PDF, one photo and one quoted draft reply.
+   Confirm one outbound message per inbound id, the resulting dashboard entry,
+   the UC mapping and both scheduler ledgers.
 
 Rollback: set `CONTADOR_ENABLED=false` and restart `support-copilot`. If the
 Next half must also stop, disable `feature_flags/energy_bill_intake`. Do not

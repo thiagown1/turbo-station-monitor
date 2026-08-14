@@ -60,6 +60,28 @@ function parseAgentInstruction(value) {
         : {};
       return { action: 'tool', tool: parsed.tool, params };
     }
+    if (parsed?.action === 'resolve_draft' && typeof parsed.draftId === 'string' && parsed.draftId.trim()) {
+      const fields = parsed.fields && typeof parsed.fields === 'object' && !Array.isArray(parsed.fields)
+        ? parsed.fields
+        : undefined;
+      const allowedFieldNames = new Set([
+        'refPeriod', 'dueDate', 'kwhNaoCompensado', 'tarifaNaoCompensada', 'kwhCompensado',
+        'tarifaScee', 'tarifaSemTributosNaoCompensada', 'tarifaSemTributos', 'totalCents',
+      ]);
+      const safeFields = fields
+        ? Object.fromEntries(Object.entries(fields).filter(([key]) => allowedFieldNames.has(key)))
+        : undefined;
+      const stationId = typeof parsed.stationId === 'string' && parsed.stationId.trim()
+        ? parsed.stationId.trim().slice(0, 128)
+        : undefined;
+      if (!stationId && (!safeFields || Object.keys(safeFields).length === 0)) return { action: 'invalid' };
+      return {
+        action: 'resolve_draft',
+        draftId: parsed.draftId.trim().slice(0, 128),
+        stationId,
+        fields: safeFields,
+      };
+    }
   } catch {}
   return { action: 'invalid' };
 }
@@ -94,9 +116,13 @@ function initialPrompt(event, messages, openDrafts) {
     'As ferramentas abaixo são um protocolo JSON intermediado pelo runtime; elas não aparecem como ferramentas nativas do OpenClaw.',
     'Para usá-las, retorne action=tool no JSON. Nunca responda que uma ferramenta permitida está indisponível.',
     'Ferramentas permitidas: pendencias, lancamentos, tarifa_efetiva, resumo_energia, drafts_abertos, estacoes, resumo_contabil, contas_a_vencer.',
+    'Se esta mensagem for uma resposta citada a uma pergunta sua sobre um draft, consulte estacoes quando necessário e conclua SOMENTE o draft explícito.',
+    'Para concluir, use {"action":"resolve_draft","draftId":"...","stationId":"...","fields":{...}}. Só copie campos numéricos literalmente informados pelo operador; nunca derive valores. totalCents é inteiro em centavos; kWh e tarifas são números decimais nas unidades originais.',
+    'Se um kWh ou tarifa puder pertencer tanto à distribuidora quanto ao gerador solar, faça uma pergunta objetiva; nunca escolha o lado por suposição.',
     'Responda SOMENTE JSON em um destes formatos:',
     '{"action":"tool","tool":"pendencias","params":{"year":2026,"month":8}}',
     '{"action":"reply","text":"resposta curta"}',
+    '{"action":"resolve_draft","draftId":"rcpt_...","stationId":"station-id"}',
     '{"action":"silent"}',
     '',
     `Data atual: ${new Date().toISOString().slice(0, 10)}`,
@@ -171,6 +197,25 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       instruction = parseAgentInstruction(await runAgent(finalPrompt(maxToolCalls)));
     }
 
+    if (instruction.action === 'resolve_draft') {
+      if (!event.replyToContador) {
+        await sendReply('Para concluir um rascunho, responda citando a mensagem em que eu pedi a informação.', event);
+        return { status: 'sent', reason: 'draft_reply_not_quoted', toolCalls: calls };
+      }
+      const result = await intake({
+        action: 'resolve_draft',
+        messageId: event.messageId,
+        groupConversationId: event.groupJid,
+        sender: event.senderId || undefined,
+        draftId: instruction.draftId,
+        stationId: instruction.stationId,
+        fields: instruction.fields,
+      });
+      if (!result?.replyMessage) return { status: 'blocked', reason: 'draft_resolution_missing_reply', toolCalls: calls };
+      await sendReply(result.replyMessage, event);
+      return { status: 'sent', outcome: result.outcome || result.status || null, toolCalls: calls };
+    }
+
     if (instruction.action === 'silent') return { status: 'silent', toolCalls: calls };
     if (instruction.action !== 'reply') return { status: 'blocked', reason: 'invalid_agent_output', toolCalls: calls };
 
@@ -184,7 +229,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       const result = await intake({
         messageId: event.messageId,
         groupConversationId: event.groupJid,
-        sender: event.sender || undefined,
+        sender: event.senderId || undefined,
         fileName: event.media?.filename || undefined,
         mimeType: 'application/pdf',
         contentBase64: content.toString('base64'),
@@ -194,9 +239,23 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       return { status: 'sent', outcome: result.outcome || result.status || null };
     }
 
-    // The merged Next route validates mimeType as literal application/pdf.
-    // Keeping images parked is safer than fabricating a PDF or bypassing intake.
-    if (event.kind === 'image') return { status: 'blocked', reason: 'image_intake_not_supported' };
+    if (event.kind === 'image') {
+      if (!event.visionExtraction) return { status: 'blocked', reason: 'image_extraction_missing' };
+      const mimeType = ['image/jpeg', 'image/png', 'image/webp'].includes(String(event.media?.mimetype || '').toLowerCase())
+        ? String(event.media.mimetype).toLowerCase()
+        : 'image/jpeg';
+      const result = await intake({
+        messageId: event.messageId,
+        groupConversationId: event.groupJid,
+        sender: event.senderId || undefined,
+        fileName: event.media?.filename || undefined,
+        mimeType,
+        extraction: event.visionExtraction,
+      });
+      if (!result?.replyMessage) return { status: 'blocked', reason: 'intake_missing_reply' };
+      await sendReply(result.replyMessage, event);
+      return { status: 'sent', outcome: result.outcome || result.status || null };
+    }
     if (event.kind === 'query') return answerQuery(event);
     return { status: 'ignored' };
   }
@@ -222,7 +281,45 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     return { status: 'sent' };
   }
 
-  return { handle, heartbeat };
+  async function monthlySummary(now = new Date()) {
+    const current = periodInSaoPaulo(now);
+    const period = current.month === 1
+      ? { year: current.year - 1, month: 12 }
+      : { year: current.year, month: current.month - 1 };
+    const results = {
+      period,
+      resumo_contabil: await queryTool('resumo_contabil', period),
+      resumo_energia: await queryTool('resumo_energia', period),
+      pendencias: await queryTool('pendencias', period),
+      drafts_abertos: await queryTool('drafts_abertos', {}),
+      contas_a_vencer: await queryTool('contas_a_vencer', { days: 15 }),
+    };
+    const accountingTotals = results.resumo_contabil?.totals || {};
+    const hasData = Boolean(
+      Object.values(accountingTotals).some((value) => Number(value || 0) !== 0)
+      || (results.resumo_contabil?.stations || []).length > 0
+      || Number(results.resumo_energia?.totalKwh || 0) !== 0
+      || Number(results.pendencias?.pendingCount || 0) > 0
+      || Number(results.drafts_abertos?.count || 0) > 0
+      || (results.contas_a_vencer?.entries || []).length > 0
+      || (results.contas_a_vencer?.drafts || []).length > 0
+      || (results.contas_a_vencer?.pendingRegistration?.stations || []).length > 0
+    );
+    if (!hasData) return { status: 'silent', period };
+    const prompt = [
+      'Você é o Contador da Turbo Station. Produza o fechamento mensal curto do período informado.',
+      'Use somente os dados confiáveis abaixo. Inclua: resultado contábil, energia, pendências, próximos vencimentos e no máximo 3 recomendações ou marcações sugeridas.',
+      'Não cite PII, não invente números e deixe claro que recomendações exigem confirmação humana.',
+      'Responda SOMENTE JSON: {"action":"reply","text":"..."} ou {"action":"silent"}.',
+      JSON.stringify(results),
+    ].join('\n');
+    const instruction = parseAgentInstruction(await runAgent(prompt));
+    if (instruction.action !== 'reply') return { status: 'silent', period };
+    await sendReply(redactForModel(instruction.text), { kind: 'monthly_summary', groupJid: config.groupConversationId });
+    return { status: 'sent', period };
+  }
+
+  return { handle, heartbeat, monthlySummary };
 }
 
 module.exports = {

@@ -381,6 +381,15 @@ try {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS contador_monthly_runs (
+      run_month TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 } catch (err) {
   console.warn(`${LOG_TAG} contador migrations:`, err.message);

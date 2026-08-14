@@ -52,6 +52,15 @@ function queueEvent(messageId, brandId, payload) {
   void deliverDueEvents();
 }
 
+function shouldDeferEnergyInvoice(input, result) {
+  const isPdf = String(input.media?.mimetype || '').toLowerCase() === 'application/pdf'
+    || String(input.media?.filename || '').toLowerCase().endsWith('.pdf');
+  return input.deferEnergyInvoiceEvent === true
+    && result.kind === 'energy_invoice'
+    && (isPdf || Boolean(result.energyBill))
+    && (isPdf || Number(result.confidence || 0) >= 0.85);
+}
+
 async function routeInboundMessage(input) {
   const existing = db.prepare('SELECT status, attempts FROM agent_media_analyses WHERE message_id = ?').get(input.messageId);
   if (existing && existing.status !== 'error') return { duplicate: true };
@@ -114,7 +123,7 @@ async function routeInboundMessage(input) {
       .run(input.messageId, input.conversationId, result.amountCents ? 'ok' : 'error', result.amountCents || null, result.receiptRef || null, result.cost?.model || null, now);
   }
   const partnerId = input.groupJid ? partnerForGroup(input.groupJid) : undefined;
-  queueEvent(input.messageId, input.brandId, {
+  const eventPayload = {
     brandId: input.brandId,
     kind: result.kind,
     sourceMessageId: input.externalMessageId || input.messageId,
@@ -136,8 +145,10 @@ async function routeInboundMessage(input) {
     suggestedReply: result.suggestedReply,
     partnerId,
     cost: result.cost,
-  });
-  return result;
+  };
+  const eventDeferred = shouldDeferEnergyInvoice(input, result);
+  if (!eventDeferred) queueEvent(input.messageId, input.brandId, eventPayload);
+  return { ...result, eventDeferred };
 }
 
 async function routeExpenseDecisionReply(input) {
@@ -215,4 +226,12 @@ function startAgentEventWorker() {
   void deliverDueEvents();
 }
 
-module.exports = { routeInboundMessage, routeExpenseDecisionReply, parseExpenseDecision, deliverDueEvents, startAgentEventWorker, loadConfig };
+module.exports = {
+  routeInboundMessage,
+  routeExpenseDecisionReply,
+  parseExpenseDecision,
+  deliverDueEvents,
+  startAgentEventWorker,
+  loadConfig,
+  shouldDeferEnergyInvoice,
+};

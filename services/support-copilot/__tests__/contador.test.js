@@ -68,13 +68,13 @@ test('PDF intake forwards the original message id and sends the deterministic re
   assert.deepEqual(calls[1], ['reply', 'Conta registrada para Galois.']);
 });
 
-test('image bill is held safely because the upstream intake only accepts PDF', async () => {
-  let sent = false;
+test('image bill forwards only the on-box extraction and never reads/sends image bytes', async () => {
+  const calls = [];
   const contador = buildContador({
     config,
-    readMedia: async () => Buffer.from('image'),
-    intake: async () => { throw new Error('must not send an image to the PDF-only endpoint'); },
-    sendReply: async () => { sent = true; },
+    readMedia: async () => { throw new Error('image bytes must stay out of the intake payload'); },
+    intake: async (payload) => { calls.push(payload); return { outcome: 'registered', replyMessage: 'Foto registrada.' }; },
+    sendReply: async (text) => { calls.push(text); },
     runAgent: async () => '',
     queryTool: async () => ({}),
     loadContext: async () => [],
@@ -84,12 +84,32 @@ test('image bill is held safely because the upstream intake only accepts PDF', a
     kind: 'image',
     messageId: 'wamid-image',
     groupJid: config.groupConversationId,
+    senderId: '5511999999999',
     media: { mimetype: 'image/jpeg', url: '/api/support/media/wamid-image.jpg' },
+    visionExtraction: {
+      distributor: 'equatorial_go', uc: '1234', refPeriod: { year: 2026, month: 8 }, dueDate: null,
+      kwhNaoCompensado: 812, tarifaNaoCompensada: 0.75, kwhCompensado: null, tarifaScee: null,
+      tarifaSemTributosNaoCompensada: null, tarifaSemTributos: null, totalCents: 60900,
+    },
   });
 
-  assert.equal(result.status, 'blocked');
-  assert.equal(result.reason, 'image_intake_not_supported');
-  assert.equal(sent, false);
+  assert.equal(result.status, 'sent');
+  assert.equal(calls[0].mimeType, 'image/jpeg');
+  assert.equal(calls[0].contentBase64, undefined);
+  assert.equal(calls[0].sender, '5511999999999');
+  assert.equal(calls[0].extraction.kwhNaoCompensado, 812);
+  assert.equal(calls[1], 'Foto registrada.');
+});
+
+test('image bill fails closed when the paid classifier produced no extraction', async () => {
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0), intake: async () => { throw new Error('must not call intake'); },
+    sendReply: async () => {}, runAgent: async () => '', queryTool: async () => ({}), loadContext: async () => [],
+  });
+  assert.deepEqual(await contador.handle({ kind: 'image', messageId: 'm', groupJid: config.groupConversationId, media: {} }), {
+    status: 'blocked', reason: 'image_extraction_missing',
+  });
 });
 
 test('tool loop stops after five calls and asks the agent for an evidence-only final answer', async () => {
@@ -127,6 +147,54 @@ test('tool loop stops after five calls and asks the agent for an evidence-only f
   assert.match(prompts.at(-1), /limite de 5 ferramentas/i);
 });
 
+test('a quoted operator answer resolves exactly the draft and station selected through tools', async () => {
+  const calls = [];
+  let agentTurn = 0;
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async (payload) => { calls.push(['intake', payload]); return { outcome: 'registered', replyMessage: 'Conta concluída para Galois.' }; },
+    sendReply: async (text) => calls.push(['reply', text]),
+    loadContext: async () => [],
+    queryTool: async (tool) => {
+      calls.push(['tool', tool]);
+      if (tool === 'drafts_abertos') return { count: 1, drafts: [{ draftId: 'rcpt_open', missing: ['station'] }] };
+      if (tool === 'estacoes') return { stations: [{ id: 'station-galois', name: 'Galois' }] };
+      return {};
+    },
+    runAgent: async () => {
+      agentTurn += 1;
+      if (agentTurn === 1) return JSON.stringify({ action: 'tool', tool: 'estacoes', params: {} });
+      return JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', stationId: 'station-galois' });
+    },
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'operator-reply-1', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'é do Galois', replyToContador: true,
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(calls.find(([kind]) => kind === 'intake')[1], {
+    action: 'resolve_draft', messageId: 'operator-reply-1', groupConversationId: config.groupConversationId,
+    sender: '5511999999999', draftId: 'rcpt_open', stationId: 'station-galois', fields: undefined,
+  });
+  assert.deepEqual(calls.at(-1), ['reply', 'Conta concluída para Galois.']);
+});
+
+test('draft writes require a quoted reply even if the model asks to resolve', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config, readMedia: async () => Buffer.alloc(0), intake: async () => { throw new Error('must not write'); },
+    sendReply: async (text) => replies.push(text), loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', stationId: 'station-galois' }),
+  });
+  const result = await contador.handle({ kind: 'query', messageId: 'm', groupJid: config.groupConversationId, body: 'Galois' });
+  assert.equal(result.reason, 'draft_reply_not_quoted');
+  assert.match(replies[0], /responda citando/i);
+});
+
 test('heartbeat stays silent without actionable items and sends once when action is needed', async () => {
   const replies = [];
   const quiet = buildContador({
@@ -162,10 +230,43 @@ test('heartbeat stays silent without actionable items and sends once when action
   assert.deepEqual(replies, ['Verificar 1 conta que vence amanha.']);
 });
 
+test('monthly summary closes the previous month and stays silent without trusted data', async () => {
+  const replies = [];
+  const calls = [];
+  const active = buildContador({
+    config, readMedia: async () => Buffer.alloc(0), intake: async () => ({}), loadContext: async () => [],
+    sendReply: async (text) => replies.push(text),
+    runAgent: async () => JSON.stringify({ action: 'reply', text: 'Julho fechou com dados conferidos e 1 pendência.' }),
+    queryTool: async (tool, params) => {
+      calls.push({ tool, params });
+      if (tool === 'resumo_contabil') return { totalRevenueCents: 100000, totalCostsCents: 60000 };
+      if (tool === 'resumo_energia') return { totalKwh: 812 };
+      if (tool === 'pendencias') return { pendingCount: 1 };
+      return { count: 0, drafts: [] };
+    },
+  });
+  const result = await active.monthlySummary(new Date('2026-08-03T12:00:00Z'));
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(result.period, { year: 2026, month: 7 });
+  assert.deepEqual(calls[0], { tool: 'resumo_contabil', params: { year: 2026, month: 7 } });
+  assert.equal(replies.length, 1);
+
+  const quiet = buildContador({
+    config, readMedia: async () => Buffer.alloc(0), intake: async () => ({}), loadContext: async () => [],
+    sendReply: async () => { throw new Error('must stay silent'); }, runAgent: async () => { throw new Error('must not call model'); },
+    queryTool: async (tool) => tool === 'drafts_abertos' ? { count: 0, drafts: [] } : {},
+  });
+  assert.equal((await quiet.monthlySummary(new Date('2026-01-03T12:00:00Z'))).status, 'silent');
+});
+
 test('agent instructions reject unknown tools and malformed replies', () => {
   assert.deepEqual(parseAgentInstruction('{"action":"tool","tool":"drop_database","params":{}}'), { action: 'invalid' });
   assert.deepEqual(parseAgentInstruction('not json'), { action: 'invalid' });
   assert.deepEqual(parseAgentInstruction('{"action":"reply","text":"Tudo certo."}'), { action: 'reply', text: 'Tudo certo.' });
+  assert.deepEqual(
+    parseAgentInstruction('{"action":"resolve_draft","draftId":"rcpt_1","stationId":"S1","fields":{"kwhNaoCompensado":812,"hack":true}}'),
+    { action: 'resolve_draft', draftId: 'rcpt_1', stationId: 'S1', fields: { kwhNaoCompensado: 812 } },
+  );
 });
 
 test('model context masks common PII formats', () => {

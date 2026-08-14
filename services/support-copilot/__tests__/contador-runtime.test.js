@@ -52,6 +52,42 @@ try {
   assert.equal(result.wrongGroup.reason, 'group_not_allowed');
   assert.deepEqual(result.jobs, [{ message_id: 'wamid-queue-1', kind: 'pdf', status: 'pending' }]);
   console.log('PASS Contador runtime outbox is group-scoped and idempotent');
+
+  const monthlyOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      let calls = 0;
+      runtime._setContadorForTest({
+        heartbeat: async () => { throw new Error('daily heartbeat must be replaced on monthly day'); },
+        monthlySummary: async () => { calls++; return { status: 'sent' }; },
+      });
+      const now = new Date('2026-08-03T11:00:00.000Z');
+      await runtime.processHeartbeat(now);
+      await runtime.processMonthlySummary(now);
+      await runtime.processMonthlySummary(now);
+      const rows = db.prepare('SELECT run_month, status, attempts FROM contador_monthly_runs').all();
+      process.stdout.write(JSON.stringify({ calls, rows }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: dbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const monthly = JSON.parse(monthlyOutput.slice(monthlyOutput.lastIndexOf('\n') + 1));
+  assert.equal(monthly.calls, 1);
+  assert.deepEqual(monthly.rows, [{ run_month: '2026-08', status: 'sent', attempts: 1 }]);
+  console.log('PASS Contador monthly summary ledger is day-scoped and idempotent');
 } finally {
   for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
 }

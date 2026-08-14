@@ -11,7 +11,8 @@ const PROMPT = `Classifique a mensagem/mídia em exatamente um tipo:
 partner_payment_receipt (comprovante de repasse PIX/TED), expense_receipt (comprovante de dinheiro que saiu da Turbo Station), energy_invoice (fatura/conta de energia), station_support (pedido ou evidência de análise de carregador), support_attention (bug/erro que merece atenção), other.
 Extraia somente o que estiver legível. suggested_reply deve ser curta, em português, e nunca afirmar que um problema foi corrigido.
 Para expense_receipt, informe currency (ISO 4217), original_amount e settled_brl_amount. Se for moeda estrangeira e o valor final cobrado em reais não estiver legível, settled_brl_amount deve ser null. Não converta câmbio. Extraia transaction_date (AAAA-MM-DD), competency {year,month} e recurring_hint somente quando houver evidência no documento/texto.
-JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"settled_brl_amount":null,"currency":null,"original_amount":null,"transaction_date":null,"competency":null,"recurring_hint":false,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null}`;
+Para energy_invoice, preencha energy_bill somente com campos literalmente legíveis na conta. distributor deve ser equatorial_go, neoenergia_df ou unknown. Valores ausentes ficam null; não derive tarifa dividindo total por kWh e não trate crédito SCEE como preço do gerador.
+JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"settled_brl_amount":null,"currency":null,"original_amount":null,"transaction_date":null,"competency":null,"recurring_hint":false,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null,"energy_bill":{"distributor":"unknown","uc":null,"ref_period":null,"due_date":null,"kwh_nao_compensado":null,"tarifa_nao_compensada":null,"kwh_compensado":null,"tarifa_scee":null,"tarifa_sem_tributos_nao_compensada":null,"tarifa_sem_tributos":null,"total_brl":null}}`;
 
 function mediaPart(absPath, mediaType, mimetype) {
   if (!absPath) return null;
@@ -49,6 +50,42 @@ function extractFinancialFields(parsed) {
   return { currency, originalAmountMinor, amountCents };
 }
 
+function boundedPositive(value, max) {
+  if (value == null || value === '') return null;
+  const normalized = typeof value === 'string'
+    ? value.replace(/\s/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.')
+    : value;
+  const number = Number(normalized);
+  return Number.isFinite(number) && number > 0 && number <= max ? number : null;
+}
+
+function extractEnergyBill(parsed) {
+  if (parsed?.kind !== 'energy_invoice') return undefined;
+  const source = parsed.energy_bill && typeof parsed.energy_bill === 'object' ? parsed.energy_bill : {};
+  const distributor = ['equatorial_go', 'neoenergia_df'].includes(source.distributor)
+    ? source.distributor
+    : 'unknown';
+  const ref = source.ref_period;
+  const refPeriod = ref && Number.isInteger(Number(ref.year)) && Number.isInteger(Number(ref.month))
+    && Number(ref.year) >= 2020 && Number(ref.year) <= 2100
+    && Number(ref.month) >= 1 && Number(ref.month) <= 12
+    ? { year: Number(ref.year), month: Number(ref.month) }
+    : null;
+  return {
+    distributor,
+    uc: cleanString(source.uc, 64) || null,
+    refPeriod,
+    dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.due_date || '')) ? source.due_date : null,
+    kwhNaoCompensado: boundedPositive(source.kwh_nao_compensado, 100_000_000),
+    tarifaNaoCompensada: boundedPositive(source.tarifa_nao_compensada, 10),
+    kwhCompensado: boundedPositive(source.kwh_compensado, 100_000_000),
+    tarifaScee: boundedPositive(source.tarifa_scee, 10),
+    tarifaSemTributosNaoCompensada: boundedPositive(source.tarifa_sem_tributos_nao_compensada, 10),
+    tarifaSemTributos: boundedPositive(source.tarifa_sem_tributos, 10),
+    totalCents: parseAmountToCents(source.total_brl),
+  };
+}
+
 async function classifyMessage({ absPath, mediaType, mimetype, body, context, model }) {
   const apiKey = process.env.OPENROUTER_API_KEY;
   if (!apiKey) return { status: 'error', reason: 'no_api_key', environmental: true };
@@ -76,6 +113,7 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
   if (!parsed || !kinds.has(parsed.kind)) return { status: 'error', reason: 'unparseable_reply' };
   const usage = data?.usage || {};
   const { currency, originalAmountMinor, amountCents } = extractFinancialFields(parsed);
+  const energyBill = extractEnergyBill(parsed);
   const competency = parsed.competency && Number.isInteger(Number(parsed.competency.year)) && Number.isInteger(Number(parsed.competency.month))
     && Number(parsed.competency.month) >= 1 && Number(parsed.competency.month) <= 12
     ? { year: Number(parsed.competency.year), month: Number(parsed.competency.month) }
@@ -96,6 +134,7 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
     payee: cleanString(parsed.payee, 300),
     suggestedCategory: cleanString(parsed.suggested_category, 100),
     suggestedReply: cleanString(parsed.suggested_reply, 3000),
+    energyBill,
     cost: {
       model: selectedModel,
       inputTokens: Number(usage.prompt_tokens) || 0,
@@ -105,4 +144,4 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
   };
 }
 
-module.exports = { classifyMessage, estimateCost, extractFinancialFields };
+module.exports = { classifyMessage, estimateCost, extractFinancialFields, extractEnergyBill };
