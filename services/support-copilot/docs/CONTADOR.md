@@ -18,8 +18,10 @@ The WhatsApp socket is entirely in this repository:
    after a PM2 restart. The successful
    `agent_media_analyses` row and its deferred `contador_jobs` row commit in the
    same SQLite transaction; a cached classification can also recover a missing
-   job without another paid model call. The worker retries transient failures
-   and recovers jobs interrupted by a PM2 restart.
+   job without another paid model call. Configuration fetch failures and model
+   failures remain retryable; they do not create an extraction-less Contador
+   job. The worker retries transient failures and recovers jobs interrupted by
+   a PM2 restart.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
@@ -93,8 +95,9 @@ monthly values into the workspace.
   receives the image and returns a minimal typed extraction; the raw image is
   not forwarded to Next. kWh and amount bounds match the ledger contract, and
   implausible fields fail closed at both boundaries;
-- a quoted reply such as “é do Galois” can consult `estacoes` and submit one
-  exact `draftId + stationId` only when the quoted outbound message carries the
+- a quoted reply such as “é do Galois” must consult `estacoes` and can submit one
+  exact `draftId + stationId` only when that station id appeared in the trusted
+  tool result and the quoted outbound message carries the
   same draft prompt metadata. Quoting another Contador heartbeat, summary or
   draft cannot authorize the write. Confirmed UC mappings are persisted and
   replaying the reply does not duplicate the original entry. If OCR did not

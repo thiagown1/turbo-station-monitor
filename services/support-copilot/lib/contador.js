@@ -220,6 +220,13 @@ function toolResultPrompt(tool, params, result) {
   ].join('\n');
 }
 
+function rememberTrustedStationIds(tool, result, trustedStationIds) {
+  if (tool !== 'estacoes' || !Array.isArray(result?.stations)) return;
+  for (const station of result.stations) {
+    if (typeof station?.id === 'string' && station.id.trim()) trustedStationIds.add(station.id.trim());
+  }
+}
+
 function finalPrompt(maxToolCalls) {
   return [
     `O limite de ${maxToolCalls} ferramentas foi atingido. Não chame outra ferramenta.`,
@@ -261,12 +268,14 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
   async function answerQuery(event) {
     const messages = await loadContext(event.conversationId, 30);
     const openDrafts = await queryTool('drafts_abertos', {});
+    const trustedStationIds = new Set();
     let raw = await runAgent(initialPrompt(event, messages, openDrafts));
     let instruction = parseAgentInstruction(raw);
     let calls = 1;
 
     while (instruction.action === 'tool' && calls < maxToolCalls) {
       const data = await queryTool(instruction.tool, instruction.params);
+      rememberTrustedStationIds(instruction.tool, data, trustedStationIds);
       calls += 1;
       raw = await runAgent(toolResultPrompt(instruction.tool, instruction.params, data));
       instruction = parseAgentInstruction(raw);
@@ -291,6 +300,13 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
           contadorDraftId: event.quotedContadorDraftId || undefined,
         });
         return { status: 'blocked', reason: 'draft_fields_not_literal', toolCalls: calls };
+      }
+      if (instruction.stationId && !trustedStationIds.has(instruction.stationId)) {
+        await sendReply('Não consegui confirmar essa estação em uma consulta confiável. Diga novamente o nome da estação.', {
+          ...event,
+          contadorDraftId: event.quotedContadorDraftId || undefined,
+        });
+        return { status: 'blocked', reason: 'draft_station_not_verified', toolCalls: calls };
       }
       const result = await intake({
         action: 'resolve_draft',

@@ -436,7 +436,7 @@ router.post('/', async (req, res) => {
     });
 
     // Media/station requests first enter the reviewed central router. If that
-    // router is disabled or unavailable, fall back to the pre-existing
+    // router is explicitly disabled or ineligible, fall back to the pre-existing
     // Contador/group-suggestion behavior. A successful central classification
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
@@ -493,10 +493,9 @@ router.post('/', async (req, res) => {
           }
         }).catch(err => {
           console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message);
-          const contadorRoute = enqueueContadorMessage(contadorEvent);
-          if (contadorRoute.kind === 'ignored') {
-            scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
-          }
+          // The durable media job owns transient configuration/classification
+          // failures and will retry. Do not reserve the Contador message id with
+          // an extraction-less fallback while that retry is pending.
         });
       } else {
         const contadorRoute = enqueueContadorMessage(contadorEvent);

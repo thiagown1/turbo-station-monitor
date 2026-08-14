@@ -13,6 +13,13 @@ let mediaJobsRecovered = false;
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
 
+class AgentConfigUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'AgentConfigUnavailableError';
+  }
+}
+
 async function loadConfig(brandId) {
   const cached = configCache.get(brandId);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
@@ -21,11 +28,13 @@ async function loadConfig(brandId) {
     const res = await fetch(`${baseUrl()}/api/agents/config?brandId=${encodeURIComponent(brandId)}`, {
       headers: { Authorization: `Bearer ${secret()}` }, signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) throw new Error(`config_http_${res.status}`);
     const value = (await res.json()).config;
     configCache.set(brandId, { value, expiresAt: Date.now() + 60_000 });
     return value;
-  } catch (_) { return null; }
+  } catch (error) {
+    throw new AgentConfigUnavailableError(`agent_config_unavailable: ${String(error?.message || error)}`);
+  }
 }
 
 function recentContext(conversationId) {
@@ -89,9 +98,16 @@ function deferredContadorJob(input, result) {
   };
   const now = nowIso();
   return db.prepare(`
-    INSERT OR IGNORE INTO contador_jobs
+    INSERT INTO contador_jobs
       (id, message_id, conversation_id, brand_id, group_jid, instance, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+    ON CONFLICT(message_id) DO UPDATE SET
+      payload_json = excluded.payload_json,
+      status = 'pending',
+      attempts = 0,
+      next_attempt_at = excluded.next_attempt_at,
+      updated_at = excluded.updated_at
+    WHERE contador_jobs.status = 'blocked' AND excluded.kind = 'image'
   `).run(
     randomId('contador_job'), messageId, input.conversationId, input.brandId,
     input.groupJid, input.instance || '', kind, JSON.stringify(payload), now, now, now,

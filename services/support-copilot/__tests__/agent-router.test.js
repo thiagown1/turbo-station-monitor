@@ -205,6 +205,50 @@ test('defers an energy invoice to Contador with structured fields and no duplica
   }
 });
 
+test('retries a temporary config failure without reserving the Contador message id', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-config-retry-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        let configCalls = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) {
+            configCalls++;
+            if (configCalls === 1) throw new Error('temporary config timeout');
+            return { ok: true, json: async () => ({ config: { enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv1'], agents: { accounting: true } } }) };
+          }
+          if (String(url).includes('openrouter.ai')) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ kind: 'energy_invoice', summary: 'Conta Equatorial', confidence: 0.99, needs_attention: true, energy_bill: { distributor: 'equatorial_go', uc: '1234', ref_period: { year: 2026, month: 7 }, due_date: null, kwh_nao_compensado: 812, tarifa_nao_compensada: 0.75, kwh_compensado: null, tarifa_scee: null, tarifa_sem_tributos_nao_compensada: null, tarifa_sem_tributos: null, total_brl: 'R$ 609,00' } }) } }], usage: {} }) };
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const input = { messageId: 'energy-config-retry', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', media: { media_type: 'image', mimetype: 'image/jpeg' }, receivedAt: nowIso(), deferEnergyInvoiceEvent: true };
+        let firstFailed = false;
+        try { await router.routeInboundMessageDurably(input); } catch (_) { firstFailed = true; }
+        const retryJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+        const prematureContador = db.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get(input.messageId);
+        if (!firstFailed || retryJob?.status !== 'retry') throw new Error('config failure was not left retryable');
+        if (prematureContador.count !== 0) throw new Error('retry reserved the Contador message id');
+        db.prepare("UPDATE agent_media_jobs SET next_attempt_at = ? WHERE message_id = ?").run(nowIso(), input.messageId);
+        await router.deliverDueMediaJobs();
+        const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+        const contadorJob = db.prepare('SELECT status, payload_json FROM contador_jobs WHERE message_id = ?').get(input.messageId);
+        const payload = JSON.parse(contadorJob?.payload_json || '{}');
+        if (completed?.status !== 'completed' || contadorJob?.status !== 'pending') throw new Error('retry did not complete the durable handoff');
+        if (payload.visionExtraction?.kwhNaoCompensado !== 812) throw new Error('retry lost the extracted invoice');
+        console.log('agent-config-retry-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-config-retry-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
 test('does not spend a model call on partner media from a non-allowlisted sender', () => {
   const dbPath = path.join(os.tmpdir(), `agent-router-sender-${process.pid}-${Date.now()}.sqlite`);
   try {

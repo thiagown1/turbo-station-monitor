@@ -190,6 +190,42 @@ test('a quoted operator answer resolves exactly the draft and station selected t
   assert.deepEqual(calls.at(-1), ['reply', 'Conta concluída para Galois.']);
 });
 
+test('a draft write rejects a station id that was not returned by the station tool', async () => {
+  const replies = [];
+  let intakeCalls = 0;
+  let agentTurn = 0;
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { intakeCalls += 1; return {}; },
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async (tool) => {
+      if (tool === 'drafts_abertos') return { count: 1, drafts: [{ draftId: 'rcpt_open', missing: ['station'] }] };
+      if (tool === 'estacoes') return { stations: [{ id: 'station-galois', name: 'Galois' }] };
+      return {};
+    },
+    runAgent: async () => {
+      agentTurn += 1;
+      return agentTurn === 1
+        ? JSON.stringify({ action: 'tool', tool: 'estacoes', params: {} })
+        : JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', stationId: 'station-hallucinated' });
+    },
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'operator-reply-untrusted-station', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'é do Galois', replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'draft_station_not_verified');
+  assert.equal(intakeCalls, 0);
+  assert.match(replies[0].text, /confirmar essa estação/i);
+  assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
+});
+
 test('draft writes require a quoted reply even if the model asks to resolve', async () => {
   const replies = [];
   const contador = buildContador({
