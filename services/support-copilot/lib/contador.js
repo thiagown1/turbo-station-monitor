@@ -137,7 +137,7 @@ function toolResultPrompt(tool, params, result) {
     `Resultado confiável da ferramenta ${tool}:`,
     JSON.stringify({ params, data: result }),
     'Escolha outra ferramenta permitida se ainda for indispensável, ou responda agora.',
-    'Responda SOMENTE JSON: {"action":"tool",...}, {"action":"reply","text":"..."} ou {"action":"silent"}.',
+    'Responda SOMENTE JSON: {"action":"tool",...}, {"action":"reply","text":"..."}, {"action":"resolve_draft","draftId":"rcpt_...","stationId":"station-id","fields":{}} ou {"action":"silent"}.',
   ].join('\n');
 }
 
@@ -145,7 +145,7 @@ function finalPrompt(maxToolCalls) {
   return [
     `O limite de ${maxToolCalls} ferramentas foi atingido. Não chame outra ferramenta.`,
     'Responda somente com o que os resultados já comprovam. Se não houver evidência suficiente, diga que não foi possível confirmar.',
-    'Responda SOMENTE JSON: {"action":"reply","text":"..."} ou {"action":"silent"}.',
+    'Responda SOMENTE JSON: {"action":"reply","text":"..."}, {"action":"resolve_draft","draftId":"rcpt_...","stationId":"station-id","fields":{}} ou {"action":"silent"}.',
   ].join('\n');
 }
 
@@ -294,10 +294,18 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       drafts_abertos: await queryTool('drafts_abertos', {}),
       contas_a_vencer: await queryTool('contas_a_vencer', { days: 15 }),
     };
-    const accountingTotals = results.resumo_contabil?.totals || {};
+    const accountingSummary = results.resumo_contabil || {};
+    const accountingTotals = accountingSummary.totals || {};
+    const accountingMetadataKeys = new Set(['year', 'month', 'period', 'generatedAt', 'stations', 'totals']);
+    const hasRootAccountingTotals = Object.entries(accountingSummary).some(([key, value]) => {
+      if (accountingMetadataKeys.has(key) || !['number', 'string'].includes(typeof value)) return false;
+      const numeric = Number(value);
+      return Number.isFinite(numeric) && numeric !== 0;
+    });
     const hasData = Boolean(
-      Object.values(accountingTotals).some((value) => Number(value || 0) !== 0)
-      || (results.resumo_contabil?.stations || []).length > 0
+      hasRootAccountingTotals
+      || Object.values(accountingTotals).some((value) => Number(value || 0) !== 0)
+      || (accountingSummary.stations || []).length > 0
       || Number(results.resumo_energia?.totalKwh || 0) !== 0
       || Number(results.pendencias?.pendingCount || 0) > 0
       || Number(results.drafts_abertos?.count || 0) > 0

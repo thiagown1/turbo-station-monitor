@@ -42,13 +42,13 @@ test('normalizes energy invoice vision fields and rejects implausible tariffs', 
       distributor: 'equatorial_go', uc: '4.397.850.012-06', ref_period: { year: 2026, month: 5 },
       due_date: '2026-05-28', kwh_nao_compensado: '6.173', tarifa_nao_compensada: '0,774023',
       kwh_compensado: null, tarifa_scee: 99, tarifa_sem_tributos_nao_compensada: '0,62',
-      tarifa_sem_tributos: null, total_brl: 'R$ 135,07',
+      tarifa_sem_tributos: '0.774', total_brl: 'R$ 135,07',
     },
   }), {
     distributor: 'equatorial_go', uc: '4.397.850.012-06', refPeriod: { year: 2026, month: 5 },
     dueDate: '2026-05-28', kwhNaoCompensado: 6173, tarifaNaoCompensada: 0.774023,
     kwhCompensado: null, tarifaScee: null, tarifaSemTributosNaoCompensada: 0.62,
-    tarifaSemTributos: null, totalCents: 13507,
+    tarifaSemTributos: 0.774, totalCents: 13507,
   });
   assert.equal(extractEnergyBill({ kind: 'expense_receipt' }), undefined);
 });

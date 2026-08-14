@@ -52,9 +52,17 @@ function extractFinancialFields(parsed) {
 
 function boundedPositive(value, max) {
   if (value == null || value === '') return null;
-  const normalized = typeof value === 'string'
-    ? value.replace(/\s/g, '').replace(/\.(?=\d{3}(?:\D|$))/g, '').replace(',', '.')
-    : value;
+  let normalized = value;
+  if (typeof value === 'string') {
+    const compact = value.replace(/\s/g, '');
+    if (compact.includes(',')) {
+      normalized = compact.replace(/\./g, '').replace(',', '.');
+    } else if (max > 10 && /^\d{1,3}(?:\.\d{3})+$/.test(compact)) {
+      normalized = compact.replace(/\./g, '');
+    } else {
+      normalized = compact;
+    }
+  }
   const number = Number(normalized);
   return Number.isFinite(number) && number > 0 && number <= max ? number : null;
 }

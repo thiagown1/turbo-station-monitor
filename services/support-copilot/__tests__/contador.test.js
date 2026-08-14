@@ -162,9 +162,10 @@ test('a quoted operator answer resolves exactly the draft and station selected t
       if (tool === 'estacoes') return { stations: [{ id: 'station-galois', name: 'Galois' }] };
       return {};
     },
-    runAgent: async () => {
+    runAgent: async (prompt) => {
       agentTurn += 1;
       if (agentTurn === 1) return JSON.stringify({ action: 'tool', tool: 'estacoes', params: {} });
+      assert.match(prompt, /"action":"resolve_draft"/);
       return JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', stationId: 'station-galois' });
     },
   });
@@ -240,8 +241,8 @@ test('monthly summary closes the previous month and stays silent without trusted
     queryTool: async (tool, params) => {
       calls.push({ tool, params });
       if (tool === 'resumo_contabil') return { totalRevenueCents: 100000, totalCostsCents: 60000 };
-      if (tool === 'resumo_energia') return { totalKwh: 812 };
-      if (tool === 'pendencias') return { pendingCount: 1 };
+      if (tool === 'resumo_energia') return { totalKwh: 0 };
+      if (tool === 'pendencias') return { pendingCount: 0 };
       return { count: 0, drafts: [] };
     },
   });
