@@ -11,7 +11,7 @@ const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${proces
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
-    const { enqueueContadorMessage, configured } = require('./lib/contador-runtime');
+    const { enqueueContadorMessage, configured, _recordOutboundForTest } = require('./lib/contador-runtime');
     const { db } = require('./lib/db');
     if (!configured()) throw new Error('test runtime should be configured');
     const base = {
@@ -28,8 +28,12 @@ try {
     const replay = enqueueContadorMessage(base);
     const chatter = enqueueContadorMessage({ ...base, messageId: 'wamid-chat', body: 'ok', media: null });
     const wrongGroup = enqueueContadorMessage({ ...base, messageId: 'wamid-other', groupJid: 'other@g.us' });
+    _recordOutboundForTest('De qual estação é essa conta?', {
+      conversationId: 'conv-1', brandId: 'turbo_station', contadorDraftId: 'rcpt_open',
+    }, 'wamid-draft-prompt');
     const jobs = db.prepare('SELECT message_id, kind, status FROM contador_jobs ORDER BY created_at').all();
-    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, jobs }));
+    const prompt = db.prepare("SELECT media_json FROM messages WHERE external_message_id = 'wamid-draft-prompt'").get();
+    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, jobs, prompt }));
     db.close();
   `], {
     cwd: path.join(__dirname, '..'),
@@ -51,6 +55,7 @@ try {
   assert.equal(result.chatter.kind, 'ignored');
   assert.equal(result.wrongGroup.reason, 'group_not_allowed');
   assert.deepEqual(result.jobs, [{ message_id: 'wamid-queue-1', kind: 'pdf', status: 'pending' }]);
+  assert.equal(JSON.parse(result.prompt.media_json).contador.draftId, 'rcpt_open');
   console.log('PASS Contador runtime outbox is group-scoped and idempotent');
 
   const monthlyOutput = execFileSync(process.execPath, ['-e', `
@@ -62,10 +67,11 @@ try {
         heartbeat: async () => { throw new Error('daily heartbeat must be replaced on monthly day'); },
         monthlySummary: async () => { calls++; return { status: 'sent' }; },
       });
-      const now = new Date('2026-08-03T11:00:00.000Z');
-      await runtime.processHeartbeat(now);
-      await runtime.processMonthlySummary(now);
-      await runtime.processMonthlySummary(now);
+      const beforeSchedule = new Date('2026-08-03T10:59:00.000Z');
+      const afterMissedWindow = new Date('2026-08-04T11:00:00.000Z');
+      await runtime.processMonthlySummary(beforeSchedule);
+      await runtime.processMonthlySummary(afterMissedWindow);
+      await runtime.processMonthlySummary(afterMissedWindow);
       const rows = db.prepare('SELECT run_month, status, attempts FROM contador_monthly_runs').all();
       process.stdout.write(JSON.stringify({ calls, rows }));
       db.close();
@@ -87,7 +93,8 @@ try {
   const monthly = JSON.parse(monthlyOutput.slice(monthlyOutput.lastIndexOf('\n') + 1));
   assert.equal(monthly.calls, 1);
   assert.deepEqual(monthly.rows, [{ run_month: '2026-08', status: 'sent', attempts: 1 }]);
-  console.log('PASS Contador monthly summary ledger is day-scoped and idempotent');
+  console.log('PASS Contador monthly summary catches up after the schedule and stays idempotent');
 } finally {
   for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
 }
+

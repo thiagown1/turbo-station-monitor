@@ -127,6 +127,7 @@ function initialPrompt(event, messages, openDrafts) {
     '',
     `Data atual: ${new Date().toISOString().slice(0, 10)}`,
     `Mensagem atual: ${redactForModel(event.body)}`,
+    `Draft autorizado pela mensagem citada: ${event.quotedContadorDraftId || 'nenhum'}`,
     `Últimas mensagens (máximo 30): ${JSON.stringify(contextBlock(messages))}`,
     `Drafts abertos (consulta confiável): ${JSON.stringify(openDrafts || { count: 0, drafts: [] })}`,
   ].join('\n');
@@ -198,9 +199,13 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     }
 
     if (instruction.action === 'resolve_draft') {
-      if (!event.replyToContador) {
+      if (!event.replyToContador || event.quotedContadorDraftId !== instruction.draftId) {
         await sendReply('Para concluir um rascunho, responda citando a mensagem em que eu pedi a informação.', event);
-        return { status: 'sent', reason: 'draft_reply_not_quoted', toolCalls: calls };
+        return {
+          status: 'sent',
+          reason: event.replyToContador ? 'draft_reply_mismatch' : 'draft_reply_not_quoted',
+          toolCalls: calls,
+        };
       }
       const result = await intake({
         action: 'resolve_draft',
@@ -235,7 +240,10 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
         contentBase64: content.toString('base64'),
       });
       if (!result?.replyMessage) return { status: 'blocked', reason: 'intake_missing_reply' };
-      await sendReply(result.replyMessage, event);
+      await sendReply(result.replyMessage, {
+        ...event,
+        contadorDraftId: result.draftId || undefined,
+      });
       return { status: 'sent', outcome: result.outcome || result.status || null };
     }
 
@@ -253,7 +261,10 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
         extraction: event.visionExtraction,
       });
       if (!result?.replyMessage) return { status: 'blocked', reason: 'intake_missing_reply' };
-      await sendReply(result.replyMessage, event);
+      await sendReply(result.replyMessage, {
+        ...event,
+        contadorDraftId: result.draftId || undefined,
+      });
       return { status: 'sent', outcome: result.outcome || result.status || null };
     }
     if (event.kind === 'query') return answerQuery(event);
@@ -338,3 +349,4 @@ module.exports = {
   redactForModel,
   heartbeatHasActionable,
 };
+

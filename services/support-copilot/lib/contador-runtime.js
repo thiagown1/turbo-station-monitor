@@ -131,12 +131,15 @@ function loadContext(conversationId, limit = 30) {
 function recordOutbound(text, event, externalMessageId) {
   const now = nowIso();
   const messageId = randomId('msg');
+  const metadata = event.contadorDraftId
+    ? JSON.stringify({ contador: { kind: 'draft_prompt', draftId: event.contadorDraftId } })
+    : null;
   db.transaction(() => {
     db.prepare(`
       INSERT INTO messages
-        (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, delivery_status, created_at)
-      VALUES (?, ?, ?, 'outbound', 'contador', ?, NULL, ?, 'sent', ?)
-    `).run(messageId, event.conversationId, event.brandId, text, externalMessageId || null, now);
+        (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
+      VALUES (?, ?, ?, 'outbound', 'contador', ?, NULL, ?, ?, 'sent', ?)
+    `).run(messageId, event.conversationId, event.brandId, text, externalMessageId || null, metadata, now);
     db.prepare(`
       UPDATE conversations
       SET last_message_at = ?, last_outbound_at = ?, updated_at = ?
@@ -284,6 +287,26 @@ function saoPauloHour(now = new Date()) {
   }).format(now));
 }
 
+function monthlyScheduleReached(now, localDate = saoPauloDay(now)) {
+  const localDay = Number(localDate.slice(-2));
+  const localHour = saoPauloHour(now);
+  return localDay > CONTADOR_MONTHLY_DAY
+    || (localDay === CONTADOR_MONTHLY_DAY && localHour >= CONTADOR_HEARTBEAT_HOUR);
+}
+
+function monthlySummaryOwnsHeartbeat(now, localDate) {
+  if (!monthlyScheduleReached(now, localDate)) return false;
+  const runMonth = localDate.slice(0, 7);
+  const row = db.prepare(`
+    SELECT status, attempts, updated_at FROM contador_monthly_runs WHERE run_month = ?
+  `).get(runMonth);
+  if (!row) return true;
+  if (row.status === 'failed') return Number(row.attempts || 0) < MAX_ATTEMPTS;
+  if (row.status === 'processing') return true;
+  if (!row.updated_at) return false;
+  return saoPauloDay(new Date(row.updated_at)) === localDate;
+}
+
 let heartbeatBusy = false;
 async function processHeartbeat(now = new Date()) {
   const localDate = saoPauloDay(now);
@@ -291,7 +314,7 @@ async function processHeartbeat(now = new Date()) {
     !configured()
     || heartbeatBusy
     || saoPauloHour(now) !== CONTADOR_HEARTBEAT_HOUR
-    || Number(localDate.slice(-2)) === CONTADOR_MONTHLY_DAY
+    || monthlySummaryOwnsHeartbeat(now, localDate)
   ) return;
   const runDate = localDate;
   const created = nowIso();
@@ -325,8 +348,7 @@ async function processHeartbeat(now = new Date()) {
 let monthlyBusy = false;
 async function processMonthlySummary(now = new Date()) {
   const localDate = saoPauloDay(now);
-  const localDay = Number(localDate.slice(-2));
-  if (!configured() || monthlyBusy || localDay !== CONTADOR_MONTHLY_DAY || saoPauloHour(now) !== CONTADOR_HEARTBEAT_HOUR) return;
+  if (!configured() || monthlyBusy || !monthlyScheduleReached(now, localDate)) return;
   const runMonth = localDate.slice(0, 7);
   const created = nowIso();
   let claim = db.prepare(`
@@ -408,4 +430,6 @@ module.exports = {
   resolveMediaPath,
   sendReply,
   _setContadorForTest,
+  _recordOutboundForTest: recordOutbound,
 };
+

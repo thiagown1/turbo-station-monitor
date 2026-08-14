@@ -12,9 +12,12 @@ The WhatsApp socket is entirely in this repository:
    conversation/message in SQLite. Only the configured accounting group is
    offered to the Contador router; other groups keep the existing suggestion
    flow.
-4. `contador-runtime.js` persists accepted work in `contador_jobs` before any
-   model or network call. The worker retries transient failures and recovers
-   jobs interrupted by a PM2 restart.
+4. Deterministically accepted work is persisted in `contador_jobs` before the
+   Contador model or Next call. For centrally classified media, the successful
+   `agent_media_analyses` row and its deferred `contador_jobs` row commit in the
+   same SQLite transaction; a cached classification can also recover a missing
+   job without another paid model call. The worker retries transient failures
+   and recovers jobs interrupted by a PM2 restart.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
@@ -85,16 +88,20 @@ monthly values into the workspace.
 - an image/PDF in the accounting group is classified exactly once by the
   central media router. For an energy photo, the configured vision provider
   receives the image and returns a minimal typed extraction; the raw image is
-  not forwarded to Next. Implausible fields fail closed at both boundaries;
+  not forwarded to Next. kWh and amount bounds match the ledger contract, and
+  implausible fields fail closed at both boundaries;
 - a quoted reply such as “é do Galois” can consult `estacoes` and submit one
-  exact `draftId + stationId`. Confirmed UC mappings are persisted and replaying
-  the reply does not duplicate the original entry;
+  exact `draftId + stationId` only when the quoted outbound message carries the
+  same draft prompt metadata. Quoting another Contador heartbeat, summary or
+  draft cannot authorize the write. Confirmed UC mappings are persisted and
+  replaying the reply does not duplicate the original entry;
 - natural-language questions use the read-only tool loop and Claude Opus in a
   persistent OpenClaw session;
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
-- on day 3, at the heartbeat hour, a separate once-per-month ledger closes the
-  previous month using `resumo_contabil`, `resumo_energia`, `pendencias` and
+- once the day-3 heartbeat schedule has passed, a separate once-per-month
+  ledger closes the previous month (including catch-up after a deploy/outage)
+  using `resumo_contabil`, `resumo_energia`, `pendencias` and
   `drafts_abertos`, enriched with `contas_a_vencer`; it replaces that day's
   ordinary heartbeat so the group receives at most one proactive summary and
   stays silent without trusted data;
@@ -144,3 +151,4 @@ Activation is a separate production change and requires explicit approval.
 Rollback: set `CONTADOR_ENABLED=false` and restart `support-copilot`. If the
 Next half must also stop, disable `feature_flags/energy_bill_intake`. Do not
 delete SQLite jobs or WhatsApp auth state during rollback.
+

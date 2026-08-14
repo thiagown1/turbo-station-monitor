@@ -50,6 +50,17 @@ test('normalizes energy invoice vision fields and rejects implausible tariffs', 
     kwhCompensado: null, tarifaScee: null, tarifaSemTributosNaoCompensada: 0.62,
     tarifaSemTributos: 0.774, totalCents: 13507,
   });
+  const bounded = extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      kwh_nao_compensado: 1_000_001,
+      kwh_compensado: 1_000_001,
+      total_brl: 'R$ 10.000.000,01',
+    },
+  });
+  assert.equal(bounded.kwhNaoCompensado, null);
+  assert.equal(bounded.kwhCompensado, null);
+  assert.equal(bounded.totalCents, null);
   assert.equal(extractEnergyBill({ kind: 'expense_receipt' }), undefined);
 });
 
@@ -168,11 +179,18 @@ test('defers an energy invoice to Contador with structured fields and no duplica
         const { db, nowIso } = require('./lib/db');
         const now = nowIso();
         const router = require('./lib/agent-router');
-        const result = await router.routeInboundMessage({ messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', body: 'conta de energia', receivedAt: now, deferEnergyInvoiceEvent: true });
+        const input = { messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', receivedAt: now, deferEnergyInvoiceEvent: true };
+        const result = await router.routeInboundMessage(input);
         await router.deliverDueEvents();
         const outbox = db.prepare('SELECT COUNT(*) count FROM agent_event_outbox').get();
+        const firstJob = db.prepare('SELECT message_id, kind, status FROM contador_jobs WHERE message_id = ?').get('energy-1');
         if (!result.eventDeferred || result.energyBill.kwhNaoCompensado !== 812) throw new Error('energy extraction not deferred');
+        if (!result.contadorJobPersisted || firstJob?.kind !== 'image' || firstJob?.status !== 'pending') throw new Error('contador job was not committed with analysis');
         if (outbox.count !== 0 || eventCalls !== 0) throw new Error('generic event was duplicated');
+        db.prepare('DELETE FROM contador_jobs WHERE message_id = ?').run('energy-1');
+        const replay = await router.routeInboundMessage(input);
+        const recovered = db.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get('energy-1');
+        if (!replay.duplicate || !replay.contadorJobPersisted || recovered.count !== 1) throw new Error('cached analysis did not recover contador job');
         console.log('energy-deferred-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -289,3 +307,4 @@ test('station requests use the tool-backed support suggestion and still require 
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed) process.exit(1);
+

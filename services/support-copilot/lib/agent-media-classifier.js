@@ -84,13 +84,16 @@ function extractEnergyBill(parsed) {
     uc: cleanString(source.uc, 64) || null,
     refPeriod,
     dueDate: /^\d{4}-\d{2}-\d{2}$/.test(String(source.due_date || '')) ? source.due_date : null,
-    kwhNaoCompensado: boundedPositive(source.kwh_nao_compensado, 100_000_000),
+    kwhNaoCompensado: boundedPositive(source.kwh_nao_compensado, 1_000_000),
     tarifaNaoCompensada: boundedPositive(source.tarifa_nao_compensada, 10),
-    kwhCompensado: boundedPositive(source.kwh_compensado, 100_000_000),
+    kwhCompensado: boundedPositive(source.kwh_compensado, 1_000_000),
     tarifaScee: boundedPositive(source.tarifa_scee, 10),
     tarifaSemTributosNaoCompensada: boundedPositive(source.tarifa_sem_tributos_nao_compensada, 10),
     tarifaSemTributos: boundedPositive(source.tarifa_sem_tributos, 10),
-    totalCents: parseAmountToCents(source.total_brl),
+    totalCents: (() => {
+      const cents = parseAmountToCents(source.total_brl);
+      return Number.isInteger(cents) && cents > 0 && cents <= 1_000_000_000 ? cents : null;
+    })(),
   };
 }
 
@@ -153,3 +156,4 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
 }
 
 module.exports = { classifyMessage, estimateCost, extractFinancialFields, extractEnergyBill };
+

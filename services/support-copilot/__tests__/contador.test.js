@@ -44,9 +44,9 @@ test('PDF intake forwards the original message id and sends the deterministic re
     readMedia: async () => Buffer.from('%PDF-test'),
     intake: async (payload) => {
       calls.push(['intake', payload]);
-      return { outcome: 'registered', replyMessage: 'Conta registrada para Galois.' };
+      return { outcome: 'unresolved_station', draftId: 'rcpt_energy_1', replyMessage: 'De qual estação é essa conta?' };
     },
-    sendReply: async (text) => calls.push(['reply', text]),
+    sendReply: async (text, event) => calls.push(['reply', text, event.contadorDraftId]),
     runAgent: async () => { throw new Error('agent should not run for PDF intake'); },
     queryTool: async () => { throw new Error('query tool should not run for PDF intake'); },
     loadContext: async () => [],
@@ -65,7 +65,7 @@ test('PDF intake forwards the original message id and sends the deterministic re
   assert.equal(calls[0][1].messageId, 'wamid-123');
   assert.equal(calls[0][1].groupConversationId, config.groupConversationId);
   assert.equal(calls[0][1].contentBase64, Buffer.from('%PDF-test').toString('base64'));
-  assert.deepEqual(calls[1], ['reply', 'Conta registrada para Galois.']);
+  assert.deepEqual(calls[1], ['reply', 'De qual estação é essa conta?', 'rcpt_energy_1']);
 });
 
 test('image bill forwards only the on-box extraction and never reads/sends image bytes', async () => {
@@ -173,6 +173,7 @@ test('a quoted operator answer resolves exactly the draft and station selected t
   const result = await contador.handle({
     kind: 'query', messageId: 'operator-reply-1', groupJid: config.groupConversationId,
     senderId: '5511999999999', body: 'é do Galois', replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
   });
 
   assert.equal(result.status, 'sent');
@@ -193,6 +194,22 @@ test('draft writes require a quoted reply even if the model asks to resolve', as
   });
   const result = await contador.handle({ kind: 'query', messageId: 'm', groupJid: config.groupConversationId, body: 'Galois' });
   assert.equal(result.reason, 'draft_reply_not_quoted');
+  assert.match(replies[0], /responda citando/i);
+});
+
+test('draft writes reject a quote that belongs to another Contador message', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config, readMedia: async () => Buffer.alloc(0), intake: async () => { throw new Error('must not write'); },
+    sendReply: async (text) => replies.push(text), loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', stationId: 'station-galois' }),
+  });
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm', groupJid: config.groupConversationId, body: 'Galois',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_other',
+  });
+  assert.equal(result.reason, 'draft_reply_mismatch');
   assert.match(replies[0], /responda citando/i);
 });
 
@@ -291,3 +308,4 @@ test('model context masks common PII formats', () => {
   if (failed) process.exit(1);
   console.log(`\n${tests.length} Contador tests passed.`);
 })();
+

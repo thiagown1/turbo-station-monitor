@@ -197,16 +197,23 @@ function quotedMessageId(message) {
 function quotedOutboundMessage(message, conversationId) {
   const stanzaId = quotedMessageId(message);
   if (!stanzaId) return null;
-  return db.prepare(`
-    SELECT body, source FROM messages
+  const row = db.prepare(`
+    SELECT body, source, media_json FROM messages
     WHERE conversation_id = ? AND external_message_id = ?
       AND direction = 'outbound' AND source IN ('contador', 'system')
     LIMIT 1
   `).get(conversationId, stanzaId) || null;
-}
-
-function isReplyToContador(message, conversationId) {
-  return quotedOutboundMessage(message, conversationId)?.source === 'contador';
+  if (!row) return null;
+  let draftId = null;
+  try {
+    const metadata = row.media_json ? JSON.parse(row.media_json) : null;
+    if (metadata?.contador?.kind === 'draft_prompt' && typeof metadata.contador.draftId === 'string') {
+      draftId = metadata.contador.draftId;
+    }
+  } catch (_) {
+    // Legacy or malformed metadata is never trusted to authorize a write.
+  }
+  return { ...row, draftId };
 }
 
 function recentConversationContext(conversationId) {
@@ -433,6 +440,7 @@ router.post('/', async (req, res) => {
     // Contador/group-suggestion behavior. A successful central classification
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
+      const quoted = quotedOutboundMessage(message, conversationId);
       const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
@@ -444,9 +452,9 @@ router.post('/', async (req, res) => {
         senderId,
         body,
         media,
-        replyToContador: isReplyToContador(message, conversationId),
+        replyToContador: quoted?.source === 'contador',
+        quotedContadorDraftId: quoted?.draftId || null,
       };
-      const quoted = quotedOutboundMessage(message, conversationId);
       if (quoted?.body && /\bEXP-[A-F0-9]{8}\b/i.test(quoted.body)) {
         const { routeExpenseDecisionReply } = require('../lib/agent-router');
         const decision = await routeExpenseDecisionReply({
@@ -466,7 +474,7 @@ router.post('/', async (req, res) => {
         const { routeInboundMessage } = require('../lib/agent-router');
         routeInboundMessage({
           messageId: msgId, externalMessageId, conversationId, brandId, groupJid,
-          senderId, body: groupBody, media, receivedAt: now,
+          instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
           deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
         }).then(result => {
           if (result?.skipped || result?.status === 'error') {
@@ -475,7 +483,9 @@ router.post('/', async (req, res) => {
               scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
             }
           } else if (result?.kind === 'energy_invoice' && result.eventDeferred) {
-            enqueueContadorMessage({ ...contadorEvent, visionExtraction: result.energyBill });
+            // The router committed the Contador job in the same SQLite
+            // transaction as the classification. Nothing remains to enqueue in
+            // this post-response callback.
           } else if (result?.kind === 'support_attention' || result?.kind === 'other') {
             // The normal support copilot adds a richer suggestion while the
             // central run keeps the classification/history/cost audit.
@@ -1000,3 +1010,4 @@ router.post('/', async (req, res) => {
 });
 
 module.exports = router;
+
