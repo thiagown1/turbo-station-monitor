@@ -131,6 +131,71 @@ test('classifies once, caches the receipt and durably delivers one event', () =>
   }
 });
 
+test('does not spend a model call on partner media from a non-allowlisted sender', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-sender-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        const calls = { model: 0 };
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) {
+            return { ok: true, json: async () => ({ config: {
+              enabled: true,
+              model: 'openai/gpt-4o-mini',
+              dailyGeneralAnalysisLimit: 100,
+              allowedPartnerReceiptSenderIds: ['5511999999999'],
+              accountingGroupConversationIds: [],
+              agents: { partnerReceipts: true, supportTriage: false },
+            } }) };
+          }
+          if (String(url).includes('openrouter.ai')) {
+            calls.model++;
+            return { ok: true, json: async () => ({
+              choices: [{ message: { content: JSON.stringify({
+                kind: 'partner_payment_receipt', summary: 'PIX', confidence: 0.99,
+                needs_attention: true, amount: 'R$ 10,00', transaction_id: 'E2E-SENDER',
+              }) } }],
+              usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.00001 },
+            }) };
+          }
+          if (String(url).includes('/api/agents/events')) {
+            return { ok: true, status: 202, text: async () => '{"ok":true}' };
+          }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        db.prepare("INSERT INTO conversations (id, brand_id, channel, customer_phone, status, created_at, updated_at) VALUES ('conv1','turbo_station','whatsapp-group','group@g.us','open',?,?)").run(now, now);
+        db.prepare("INSERT INTO group_partner_links (group_jid, partner_id, partner_user_id, enabled, linked_at) VALUES ('group@g.us','partner-1','partner-user-1',1,?)").run(now);
+        const router = require('./lib/agent-router');
+        const denied = await router.routeInboundMessage({
+          messageId: 'msg-denied', conversationId: 'conv1', brandId: 'turbo_station',
+          groupJid: 'group@g.us', senderId: '5511888888888', body: '[Outro]: [imagem]',
+          media: { media_type: 'image', url: '/api/support/media/not-read.jpg' }, receivedAt: now,
+        });
+        if (denied.skipped !== 'no_enabled_agent') throw new Error('non-allowlisted sender was not skipped');
+        if (calls.model !== 0) throw new Error('paid model called for non-allowlisted sender');
+        const allowed = await router.routeInboundMessage({
+          messageId: 'msg-allowed', conversationId: 'conv1', brandId: 'turbo_station',
+          groupJid: 'group@g.us', senderId: '5511999999999', body: '[Yves]: comprovante PIX',
+          media: null, receivedAt: now,
+        });
+        if (allowed.kind !== 'partner_payment_receipt' || calls.model !== 1) {
+          throw new Error('allowlisted sender was not classified exactly once');
+        }
+        console.log('agent-sender-filter-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-sender-filter-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
 test('station requests use the tool-backed support suggestion and still require central review', () => {
   const dbPath = path.join(os.tmpdir(), `agent-router-station-${process.pid}-${Date.now()}.sqlite`);
   try {

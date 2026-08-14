@@ -59,15 +59,21 @@ async function routeInboundMessage(input) {
   if (!config?.enabled) return { skipped: 'disabled' };
   const accountingPriority = (config.accountingGroupConversationIds || []).includes(input.conversationId);
   const partnerPriority = Boolean(input.groupJid && partnerForGroup(input.groupJid));
+  const partnerReceiptPriority = Boolean(
+    partnerPriority
+    && config.agents?.partnerReceipts
+    && input.senderId
+    && (config.allowedPartnerReceiptSenderIds || []).includes(input.senderId),
+  );
   const isMedia = Boolean(input.media);
   const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(input.body || '');
   const eligible =
     (accountingPriority && config.agents?.accounting) ||
-    (partnerPriority && config.agents?.partnerReceipts) ||
+    partnerReceiptPriority ||
     (stationRequest && partnerPriority && config.agents?.stationSupport) ||
     (isMedia && config.analyzeAllMedia && config.agents?.supportTriage);
   if (!eligible) return { skipped: 'no_enabled_agent' };
-  if (!accountingPriority && !partnerPriority && generalLimitReached(input.brandId, Number(config.dailyGeneralAnalysisLimit || 0))) {
+  if (!accountingPriority && !partnerReceiptPriority && generalLimitReached(input.brandId, Number(config.dailyGeneralAnalysisLimit || 0))) {
     return { skipped: 'daily_limit' };
   }
 
