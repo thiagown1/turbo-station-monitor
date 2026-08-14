@@ -119,12 +119,12 @@ function parseLiteralNumber(token) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function literalNumberVariants(token) {
-  const values = [];
-  const parsed = parseLiteralNumber(token);
-  if (parsed !== null) values.push(parsed);
-  if (/^\d{1,3}(?:\.\d{3})+$/.test(String(token || ''))) values.push(Number(String(token).replace(/\./g, '')));
-  return [...new Set(values)];
+function literalNumberVariants(token, { dottedThousands = false } = {}) {
+  const raw = String(token || '');
+  const parsed = dottedThousands && /^\d{1,3}(?:\.\d{3})+$/.test(raw)
+    ? Number(raw.replace(/\./g, ''))
+    : parseLiteralNumber(raw);
+  return parsed === null ? [] : [parsed];
 }
 
 function extractLabeledDraftNumbers(text) {
@@ -141,7 +141,7 @@ function extractLabeledDraftNumbers(text) {
     const kwhMatch = segment.match(new RegExp(`(${token})\\s*kwh`, 'i'))
       || segment.match(new RegExp(`kwh\\s*[:=-]?\\s*(${token})`, 'i'));
     if (kwhMatch && (utility || solar)) {
-      add(utility ? 'kwhNaoCompensado' : 'kwhCompensado', literalNumberVariants(kwhMatch[1]));
+      add(utility ? 'kwhNaoCompensado' : 'kwhCompensado', literalNumberVariants(kwhMatch[1], { dottedThousands: true }));
     }
 
     const tariffMatch = segment.match(new RegExp(`tarifa[^;\\n]{0,40}?(${token})`, 'i'))
@@ -158,7 +158,7 @@ function extractLabeledDraftNumbers(text) {
       const amountMatch = segment.match(new RegExp(`R\\$\\s*(${token})`, 'i'))
         || segment.match(new RegExp(`(?:total|valor\\s+(?:da\\s+)?(?:fatura|conta))\\s*[:=-]?\\s*(${token})`, 'i'));
       if (amountMatch) {
-        const values = literalNumberVariants(amountMatch[1]);
+        const values = literalNumberVariants(amountMatch[1], { dottedThousands: true });
         add('totalCents', /centavos?/i.test(segment) ? values : values.map((value) => Math.round(value * 100)));
       }
     }
@@ -168,40 +168,34 @@ function extractLabeledDraftNumbers(text) {
 
 function extractDraftReplyLiterals(body) {
   const text = String(body || '');
-  const numericTokens = text.match(/-?\d+(?:[.,]\d+)*/g) || [];
-  const numbers = numericTokens.flatMap((token) => {
-    const values = [];
-    const parsed = parseLiteralNumber(token);
-    if (parsed !== null) values.push(parsed);
-    if (/^\d{1,3}(?:\.\d{3})+$/.test(token)) values.push(Number(token.replace(/\./g, '')));
-    return values;
-  });
-  const ucCandidates = (text.match(/\d[\d.\s/-]{2,63}\d/g) || [])
-    .map((value) => value.replace(/\D/g, ''))
-    .filter((value) => value.length > 0 && value.length <= 40);
+  const segments = text.split(/(?:\r?\n|;|\s+e\s+)/i);
+  const ucCandidates = [];
+  for (const match of text.matchAll(/\b(?:uc|unidade\s+consumidora)\s*(?:n[º°o]\s*)?[:#=-]?\s*(\d[\d.\s/-]{1,62}\d)/gi)) {
+    const digits = match[1].replace(/\D/g, '');
+    if (digits.length > 0 && digits.length <= 40) ucCandidates.push(digits);
+  }
   const periods = [];
-  for (const match of text.matchAll(/\b(0?[1-9]|1[0-2])[/-](20\d{2})\b/g)) {
-    periods.push({ year: Number(match[2]), month: Number(match[1]) });
-  }
-  for (const match of text.matchAll(/\b(20\d{2})[/-](0?[1-9]|1[0-2])\b/g)) {
-    periods.push({ year: Number(match[1]), month: Number(match[2]) });
-  }
   const dates = new Set();
-  for (const match of text.matchAll(/\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g)) dates.add(match[0]);
-  for (const match of text.matchAll(/\b(0[1-9]|[12]\d|3[01])\/(0[1-9]|1[0-2])\/(20\d{2})\b/g)) {
-    dates.add(`${match[3]}-${match[2]}-${match[1]}`);
+  for (const segment of segments) {
+    if (/compet[eê]ncia|refer[eê]ncia|m[eê]s\s+de/i.test(segment)) {
+      for (const match of segment.matchAll(/\b(0?[1-9]|1[0-2])[/-](20\d{2})\b/g)) {
+        periods.push({ year: Number(match[2]), month: Number(match[1]) });
+      }
+      for (const match of segment.matchAll(/\b(20\d{2})[/-](0?[1-9]|1[0-2])\b/g)) {
+        periods.push({ year: Number(match[1]), month: Number(match[2]) });
+      }
+    }
+    if (/vencimento|vence\s+em|data\s+de\s+vencimento/i.test(segment)) {
+      for (const match of segment.matchAll(/\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g)) dates.add(match[0]);
+      for (const match of segment.matchAll(/\b(0[1-9]|[12]\d|3[01])\/(0[1-9]|1[0-2])\/(20\d{2})\b/g)) {
+        dates.add(`${match[3]}-${match[2]}-${match[1]}`);
+      }
+    }
   }
-  const brlMatch = text.match(/R\$\s*(-?\d{1,3}(?:\.\d{3})*(?:,\d{1,2})|-?\d+(?:,\d{1,2})?)/i);
-  const brlAmountCents = brlMatch
-    ? Math.round((parseLiteralNumber(brlMatch[1]) || 0) * 100)
-    : null;
   return {
     ucCandidates: [...new Set(ucCandidates)],
-    numericTokens,
-    numbers,
     periods,
     dates: [...dates],
-    brlAmountCents,
     numericFields: extractLabeledDraftNumbers(text),
   };
 }

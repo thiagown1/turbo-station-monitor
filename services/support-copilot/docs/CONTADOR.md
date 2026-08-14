@@ -109,12 +109,15 @@ monthly values into the workspace.
   Confirmed UC mappings are persisted and
   numeric corrections must be labeled by side/type (for example,
   `distribuidora: 812 kWh; solar: 650 kWh`); matching a number elsewhere in the
-  message is insufficient,
+  message is insufficient. Brazilian dotted kWh is normalized once as a
+  thousands value (`6.173 kWh` means `6173`, never both),
   replaying the reply does not duplicate the original entry. If OCR did not
   produce a stable UC, the operator may provide it literally in the quoted
   reply before registration. Literal UC/numeric/date values are extracted by
-  deterministic code and every model-proposed field must match the quoted text
-  before it can reach Next. If the Contador needs one more clarification, its
+  deterministic, field-labeled code; generic digit sequences are excluded from
+  the model prompt so redacted CPF/CNPJ/phone identifiers cannot be reconstructed.
+  Every model-proposed field must match the quoted text before it can reach Next.
+  If the Contador needs one more clarification, its
   next prompt keeps the same draft metadata so the following quoted answer can
   complete only that draft;
 - natural-language questions use the read-only tool loop and Claude Opus in a

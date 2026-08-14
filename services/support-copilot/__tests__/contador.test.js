@@ -343,6 +343,33 @@ test('quoted draft replies expose a literal UC and forward only the matching val
   assert.equal(calls[0].fields.uc, '439785001206');
 });
 
+test('quoted draft prompts do not reconstruct unrelated redacted identifiers', async () => {
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => ({ outcome: 'registered', replyMessage: 'Conta concluída.' }),
+    sendReply: async () => {},
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async (prompt) => {
+      assert.doesNotMatch(prompt, /123\.456\.789-09|12345678909/);
+      assert.doesNotMatch(prompt, /12\.345\.678\/0001-90|12345678000190/);
+      assert.doesNotMatch(prompt, /99999-9999|62999999999/);
+      assert.match(prompt, /439785001206/);
+      return JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', fields: { uc: '439785001206' } });
+    },
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-private-identifiers', groupJid: config.groupConversationId,
+    senderId: '5511999999999',
+    body: 'CPF 123.456.789-09; CNPJ 12.345.678/0001-90; telefone (62) 99999-9999; UC 4.397.850.012-06',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'sent');
+});
+
 test('draft resolution rejects model numbers that were not literal in the quoted reply', async () => {
   const replies = [];
   const contador = buildContador({
@@ -393,6 +420,54 @@ test('draft resolution binds each kWh literal to its labeled bill side', async (
   assert.equal(result.reason, 'draft_fields_not_literal');
   assert.equal(intakeCalls, 0);
   assert.match(replies[0].text, /confirmar esses valores/i);
+});
+
+test('dotted Brazilian kWh rejects the decimal interpretation', async () => {
+  let intakeCalls = 0;
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { intakeCalls += 1; return { replyMessage: 'não deveria registrar' }; },
+    sendReply: async () => {},
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft', draftId: 'rcpt_open', fields: { kwhNaoCompensado: 6.173 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-dotted-kwh-rejected', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'distribuidora: 6.173 kWh',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.reason, 'draft_fields_not_literal');
+  assert.equal(intakeCalls, 0);
+});
+
+test('dotted Brazilian kWh authorizes the normalized thousands value', async () => {
+  const calls = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async (payload) => { calls.push(payload); return { outcome: 'registered', replyMessage: 'Conta concluída.' }; },
+    sendReply: async () => {},
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft', draftId: 'rcpt_open', fields: { kwhNaoCompensado: 6173 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-dotted-kwh-accepted', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'distribuidora: 6.173 kWh',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(calls[0].fields.kwhNaoCompensado, 6173);
 });
 
 test('heartbeat stays silent without actionable items and sends once when action is needed', async () => {
