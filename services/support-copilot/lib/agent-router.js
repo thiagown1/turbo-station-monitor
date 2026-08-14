@@ -241,7 +241,33 @@ async function deliverSkippedMediaFallback(input) {
   const { enqueueContadorMessage } = require('./contador-runtime');
   const contadorRoute = enqueueContadorMessage(contadorEvent);
   if (contadorRoute.kind !== 'ignored') return { handled: true, contadorEnqueued: contadorRoute.enqueued === true };
-  if (!input.groupJid) return { handled: false, contadorEnqueued: false };
+  if (!input.groupJid) {
+    const rawUrl = String(input.media?.url || '');
+    const filename = path.basename(rawUrl);
+    const mediaRoot = path.resolve(MEDIA_DIR);
+    const mediaFilePath = path.resolve(mediaRoot, filename);
+    if (!filename || filename === '.' || !mediaFilePath.startsWith(`${mediaRoot}${path.sep}`)) {
+      throw new Error('durable_media_fallback_missing_file');
+    }
+    const { processMedia } = require('./media-processor');
+    const description = await processMedia(mediaFilePath, input.media?.media_type, {
+      conversationContext: recentContext(input.conversationId),
+    });
+    if (description) {
+      const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
+      if (!current) throw new Error('durable_media_fallback_message_missing');
+      db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+        .run(`${current.body} ${description}`, input.messageId);
+      const { emitEvent } = require('./sse');
+      emitEvent({
+        type: 'message_update',
+        conversationId: input.conversationId,
+        messageId: input.messageId,
+        brandId: input.brandId,
+      });
+    }
+    return { handled: true, contadorEnqueued: false };
+  }
   const { createGroupSuggestion } = require('./auto-suggest');
   await createGroupSuggestion(input.conversationId, input.brandId);
   return { handled: true, contadorEnqueued: false };

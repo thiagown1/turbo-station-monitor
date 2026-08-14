@@ -97,6 +97,9 @@ monthly values into the workspace.
   not forwarded to Next. kWh and amount bounds match the ledger contract, and
   literal zero consumption/tariffs remain valid while implausible fields fail
   closed at both boundaries;
+- when the central router skips a one-to-one image/document, the same durable
+  job runs the legacy media description before it can complete; restart or
+  fallback failure therefore retries instead of silently losing the attachment;
 - a quoted reply such as “é do Galois” must consult `estacoes` and can submit one
   exact `draftId + stationId` only when that station id appeared in the trusted
   tool result and the quoted outbound message carries the

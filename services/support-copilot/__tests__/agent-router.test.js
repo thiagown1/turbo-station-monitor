@@ -275,8 +275,16 @@ test('caps durable media retries and performs skipped fallback before completion
         process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
         process.env.AGENT_EVENT_SECRET = 'test-secret';
         let contadorCalls = 0;
+        let mediaCalls = 0;
+        let emitted = 0;
         require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
           enqueueContadorMessage: () => { contadorCalls++; return { kind: 'pdf', enqueued: true }; },
+        } };
+        require.cache[require.resolve('./lib/media-processor')] = { exports: {
+          processMedia: async () => { mediaCalls++; return '[descrição recuperada]'; },
+        } };
+        require.cache[require.resolve('./lib/sse')] = { exports: {
+          emitEvent: () => { emitted++; },
         } };
         global.fetch = async (url) => {
           if (String(url).includes('/api/agents/config')) throw new Error('permanent config failure');
@@ -304,6 +312,22 @@ test('caps durable media retries and performs skipped fallback before completion
         const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('media-skipped');
         if (!skipped.fallbackHandled || !skipped.contadorFallbackEnqueued || contadorCalls !== 1) throw new Error('skipped fallback was not delivered');
         if (completed.status !== 'completed') throw new Error('skipped media job was not completed after fallback');
+
+        const insertedAt = nowIso();
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-media', 'conv-direct', 'turbo_station', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct', ?)` + "`" + `).run(insertedAt);
+        const direct = await router.routeInboundMessageDurably({
+          messageId: 'direct-media', externalMessageId: 'wa-direct', conversationId: 'conv-direct', brandId: 'turbo_station',
+          senderId: '5511999999999', body: '[📷 Imagem]', receivedAt: insertedAt,
+          media: { media_type: 'image', url: '/api/support/media/direct.jpg' },
+        });
+        const directJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('direct-media');
+        const directMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
+        if (!direct.fallbackHandled || directJob.status !== 'completed') throw new Error('one-to-one durable fallback was not completed');
+        if (mediaCalls !== 1 || emitted !== 1 || !directMessage.body.includes('descrição recuperada')) {
+          throw new Error('one-to-one durable fallback did not enrich the message');
+        }
         console.log('agent-terminal-retry-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
