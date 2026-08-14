@@ -96,13 +96,17 @@ monthly values into the workspace.
   draft cannot authorize the write. Confirmed UC mappings are persisted and
   replaying the reply does not duplicate the original entry. If OCR did not
   produce a stable UC, the operator may provide it literally in the quoted
-  reply before registration;
+  reply before registration. If the Contador needs one more clarification, its
+  next prompt keeps the same draft metadata so the following quoted answer can
+  complete only that draft;
 - natural-language questions use the read-only tool loop and Claude Opus in a
   persistent OpenClaw session;
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
 - once the day-3 heartbeat schedule has passed, a separate once-per-month
-  ledger closes the previous month (including catch-up after a deploy/outage)
+  ledger closes the previous month. After a deploy or outage it walks every
+  missing monthly key in chronological order, so crossing a month boundary
+  cannot silently skip an older closing,
   using `resumo_contabil`, `resumo_energia`, `pendencias` and
   `drafts_abertos`, enriched with `contas_a_vencer`; it replaces that day's
   ordinary heartbeat so the group receives at most one proactive summary and

@@ -294,7 +294,39 @@ function monthlyScheduleReached(now, localDate = saoPauloDay(now)) {
     || (localDay === CONTADOR_MONTHLY_DAY && localHour >= CONTADOR_HEARTBEAT_HOUR);
 }
 
+function shiftMonth(runMonth, amount) {
+  const [year, month] = String(runMonth).split('-').map(Number);
+  const shifted = new Date(Date.UTC(year, month - 1 + amount, 1));
+  return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function monthlyRunDate(runMonth) {
+  const [year, month] = String(runMonth).split('-').map(Number);
+  // Sao Paulo has remained UTC-3 since 2019. This instant is the configured
+  // local schedule and makes monthlySummary close the month before runMonth.
+  return new Date(Date.UTC(year, month - 1, CONTADOR_MONTHLY_DAY, CONTADOR_HEARTBEAT_HOUR + 3));
+}
+
+function dueMonthlyRunMonths(now, localDate = saoPauloDay(now)) {
+  const currentMonth = localDate.slice(0, 7);
+  const scheduleReached = monthlyScheduleReached(now, localDate);
+  const rows = db.prepare(`
+    SELECT run_month, status, attempts FROM contador_monthly_runs ORDER BY run_month ASC
+  `).all();
+  if (!rows.length) return scheduleReached ? [currentMonth] : [];
+
+  const dueThrough = scheduleReached ? currentMonth : shiftMonth(currentMonth, -1);
+  const byMonth = new Map(rows.map((row) => [row.run_month, row]));
+  const due = [];
+  for (let runMonth = rows[0].run_month; runMonth <= dueThrough; runMonth = shiftMonth(runMonth, 1)) {
+    const row = byMonth.get(runMonth);
+    if (!row || (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS)) due.push(runMonth);
+  }
+  return due;
+}
+
 function monthlySummaryOwnsHeartbeat(now, localDate) {
+  if (dueMonthlyRunMonths(now, localDate).length > 0) return true;
   if (!monthlyScheduleReached(now, localDate)) return false;
   const runMonth = localDate.slice(0, 7);
   const row = db.prepare(`
@@ -348,31 +380,37 @@ async function processHeartbeat(now = new Date()) {
 let monthlyBusy = false;
 async function processMonthlySummary(now = new Date()) {
   const localDate = saoPauloDay(now);
-  if (!configured() || monthlyBusy || !monthlyScheduleReached(now, localDate)) return;
-  const runMonth = localDate.slice(0, 7);
-  const created = nowIso();
-  let claim = db.prepare(`
-    INSERT OR IGNORE INTO contador_monthly_runs (run_month, status, attempts, created_at, updated_at)
-    VALUES (?, 'processing', 1, ?, ?)
-  `).run(runMonth, created, created);
-  if (!claim.changes) {
-    claim = db.prepare(`
-      UPDATE contador_monthly_runs
-      SET status = 'processing', attempts = attempts + 1, updated_at = ?
-      WHERE run_month = ? AND status = 'failed' AND attempts < ?
-    `).run(created, runMonth, MAX_ATTEMPTS);
-  }
-  if (!claim.changes) return;
-
+  if (!configured() || monthlyBusy) return;
+  const runMonths = dueMonthlyRunMonths(now, localDate);
+  if (!runMonths.length) return;
   monthlyBusy = true;
   try {
-    const result = await contador.monthlySummary(now);
-    db.prepare(`UPDATE contador_monthly_runs SET status = ?, updated_at = ? WHERE run_month = ?`)
-      .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
-  } catch (err) {
-    db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE run_month = ?`)
-      .run(String(err.message || err).slice(0, 500), nowIso(), runMonth);
-    console.warn(`${LOG_TAG} [contador] monthly summary ${runMonth} failed:`, err.message);
+    for (const runMonth of runMonths) {
+      const created = nowIso();
+      let claim = db.prepare(`
+        INSERT OR IGNORE INTO contador_monthly_runs (run_month, status, attempts, created_at, updated_at)
+        VALUES (?, 'processing', 1, ?, ?)
+      `).run(runMonth, created, created);
+      if (!claim.changes) {
+        claim = db.prepare(`
+          UPDATE contador_monthly_runs
+          SET status = 'processing', attempts = attempts + 1, updated_at = ?
+          WHERE run_month = ? AND status = 'failed' AND attempts < ?
+        `).run(created, runMonth, MAX_ATTEMPTS);
+      }
+      if (!claim.changes) continue;
+
+      try {
+        const result = await contador.monthlySummary(monthlyRunDate(runMonth));
+        db.prepare(`UPDATE contador_monthly_runs SET status = ?, updated_at = ? WHERE run_month = ?`)
+          .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
+      } catch (err) {
+        db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', last_error = ?, updated_at = ? WHERE run_month = ?`)
+          .run(String(err.message || err).slice(0, 500), nowIso(), runMonth);
+        console.warn(`${LOG_TAG} [contador] monthly summary ${runMonth} failed:`, err.message);
+        break;
+      }
+    }
   } finally {
     monthlyBusy = false;
   }
@@ -432,4 +470,3 @@ module.exports = {
   _setContadorForTest,
   _recordOutboundForTest: recordOutbound,
 };
-

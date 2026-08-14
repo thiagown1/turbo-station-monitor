@@ -224,7 +224,10 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     if (instruction.action === 'silent') return { status: 'silent', toolCalls: calls };
     if (instruction.action !== 'reply') return { status: 'blocked', reason: 'invalid_agent_output', toolCalls: calls };
 
-    await sendReply(redactForModel(instruction.text), event);
+    await sendReply(redactForModel(instruction.text), {
+      ...event,
+      contadorDraftId: event.quotedContadorDraftId || undefined,
+    });
     return { status: 'sent', toolCalls: calls };
   }
 

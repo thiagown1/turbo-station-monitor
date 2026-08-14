@@ -8,6 +8,7 @@ const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
 const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${process.pid}-${Date.now()}.sqlite`);
+const backfillDbPath = `${dbPath}-backfill`;
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
@@ -94,7 +95,52 @@ try {
   assert.equal(monthly.calls, 1);
   assert.deepEqual(monthly.rows, [{ run_month: '2026-08', status: 'sent', attempts: 1 }]);
   console.log('PASS Contador monthly summary catches up after the schedule and stays idempotent');
-} finally {
-  for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${dbPath}${suffix}`, { force: true });
-}
 
+  const backfillOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      const calls = [];
+      db.prepare(` + "`" + `
+        INSERT INTO contador_monthly_runs (run_month, status, attempts, created_at, updated_at)
+        VALUES ('2026-07', 'sent', 1, '2026-07-03T11:00:00.000Z', '2026-07-03T11:00:00.000Z')
+      ` + "`" + `).run();
+      runtime._setContadorForTest({
+        heartbeat: async () => { throw new Error('daily heartbeat must not replace monthly backlog'); },
+        monthlySummary: async (runDate) => {
+          calls.push(runDate.toISOString().slice(0, 10));
+          return { status: 'sent' };
+        },
+      });
+      await runtime.processMonthlySummary(new Date('2026-09-04T11:00:00.000Z'));
+      const rows = db.prepare('SELECT run_month, status, attempts FROM contador_monthly_runs ORDER BY run_month').all();
+      process.stdout.write(JSON.stringify({ calls, rows }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: backfillDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const backfill = JSON.parse(backfillOutput.slice(backfillOutput.lastIndexOf('\n') + 1));
+  assert.deepEqual(backfill.calls, ['2026-08-03', '2026-09-03']);
+  assert.deepEqual(backfill.rows, [
+    { run_month: '2026-07', status: 'sent', attempts: 1 },
+    { run_month: '2026-08', status: 'sent', attempts: 1 },
+    { run_month: '2026-09', status: 'sent', attempts: 1 },
+  ]);
+  console.log('PASS Contador monthly summary backfills every missed run month in order');
+} finally {
+  for (const target of [dbPath, backfillDbPath]) {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
+  }
+}

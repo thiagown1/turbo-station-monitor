@@ -213,6 +213,34 @@ test('draft writes reject a quote that belongs to another Contador message', asy
   assert.match(replies[0], /responda citando/i);
 });
 
+test('a clarification reply preserves the quoted draft authorization for the next turn', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { throw new Error('must not write before clarification'); },
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'reply',
+      text: 'Esse valor de kWh pertence à distribuidora ou ao gerador solar?',
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query',
+    messageId: 'm-clarify',
+    groupJid: config.groupConversationId,
+    body: 'foram 812 kWh',
+    replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
+});
+
 test('heartbeat stays silent without actionable items and sends once when action is needed', async () => {
   const replies = [];
   const quiet = buildContador({
