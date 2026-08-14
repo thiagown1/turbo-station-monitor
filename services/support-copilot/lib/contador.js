@@ -21,6 +21,10 @@ const ALLOWED_TOOLS = new Set([
 
 const ACCOUNTING_TRIGGER = /\b(contador|contas?|faturas?|energia|tarifa|kwh|venc(?:e|imento|ida|idas)?|pend[eê]ncias?|lan[cç]amentos?|custos?|nfse|nfs-e)\b/i;
 
+function normalizedMime(value) {
+  return String(value || '').split(';', 1)[0].trim().toLowerCase();
+}
+
 function classifyInbound(event, config) {
   if (!config?.enabled) return { kind: 'ignored', reason: 'disabled' };
   if (event?.direction !== 'inbound') return { kind: 'ignored', reason: 'not_inbound' };
@@ -28,7 +32,7 @@ function classifyInbound(event, config) {
     return { kind: 'ignored', reason: 'group_not_allowed' };
   }
 
-  const mime = String(event.media?.mimetype || '').toLowerCase();
+  const mime = normalizedMime(event.media?.mimetype);
   const mediaType = String(event.media?.media_type || '').toLowerCase();
   const filename = String(event.media?.filename || '').toLowerCase();
   if (mime === 'application/pdf' || (mediaType === 'document' && filename.endsWith('.pdf'))) {
@@ -105,7 +109,80 @@ function contextBlock(messages) {
   }));
 }
 
+function parseLiteralNumber(token) {
+  const value = String(token || '').replace(/\s/g, '');
+  if (!value) return null;
+  const normalized = value.includes(',')
+    ? value.replace(/\./g, '').replace(',', '.')
+    : value;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function extractDraftReplyLiterals(body) {
+  const text = String(body || '');
+  const numericTokens = text.match(/-?\d+(?:[.,]\d+)*/g) || [];
+  const numbers = numericTokens.flatMap((token) => {
+    const values = [];
+    const parsed = parseLiteralNumber(token);
+    if (parsed !== null) values.push(parsed);
+    if (/^\d{1,3}(?:\.\d{3})+$/.test(token)) values.push(Number(token.replace(/\./g, '')));
+    return values;
+  });
+  const ucCandidates = (text.match(/\d[\d.\s/-]{2,63}\d/g) || [])
+    .map((value) => value.replace(/\D/g, ''))
+    .filter((value) => value.length > 0 && value.length <= 40);
+  const periods = [];
+  for (const match of text.matchAll(/\b(0?[1-9]|1[0-2])[/-](20\d{2})\b/g)) {
+    periods.push({ year: Number(match[2]), month: Number(match[1]) });
+  }
+  for (const match of text.matchAll(/\b(20\d{2})[/-](0?[1-9]|1[0-2])\b/g)) {
+    periods.push({ year: Number(match[1]), month: Number(match[2]) });
+  }
+  const dates = new Set();
+  for (const match of text.matchAll(/\b(20\d{2})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])\b/g)) dates.add(match[0]);
+  for (const match of text.matchAll(/\b(0[1-9]|[12]\d|3[01])\/(0[1-9]|1[0-2])\/(20\d{2})\b/g)) {
+    dates.add(`${match[3]}-${match[2]}-${match[1]}`);
+  }
+  const brlMatch = text.match(/R\$\s*(-?\d{1,3}(?:\.\d{3})*(?:,\d{1,2})|-?\d+(?:,\d{1,2})?)/i);
+  const brlAmountCents = brlMatch
+    ? Math.round((parseLiteralNumber(brlMatch[1]) || 0) * 100)
+    : null;
+  return {
+    ucCandidates: [...new Set(ucCandidates)],
+    numericTokens,
+    numbers,
+    periods,
+    dates: [...dates],
+    brlAmountCents,
+  };
+}
+
+function draftFieldsMatchReply(fields, body) {
+  if (!fields || Object.keys(fields).length === 0) return true;
+  const literals = extractDraftReplyLiterals(body);
+  const sameNumber = (value) => typeof value === 'number'
+    && Number.isFinite(value)
+    && literals.numbers.some((candidate) => Math.abs(candidate - value) <= 1e-9);
+  return Object.entries(fields).every(([key, value]) => {
+    if (key === 'uc') {
+      const digits = String(value || '').replace(/\D/g, '');
+      return Boolean(digits) && literals.ucCandidates.includes(digits);
+    }
+    if (key === 'refPeriod') {
+      return Boolean(value && typeof value === 'object'
+        && literals.periods.some((period) => period.year === Number(value.year) && period.month === Number(value.month)));
+    }
+    if (key === 'dueDate') return typeof value === 'string' && literals.dates.includes(value);
+    if (key === 'totalCents') return sameNumber(value) || literals.brlAmountCents === value;
+    return sameNumber(value);
+  });
+}
+
 function initialPrompt(event, messages, openDrafts) {
+  const authorizedLiterals = event.quotedContadorDraftId
+    ? extractDraftReplyLiterals(event.body)
+    : null;
   return [
     'Você é o Contador da Turbo Station no grupo Contas.',
     'Responda curto, direto e em português. Você apenas consulta e recomenda; nunca executa ação financeira.',
@@ -128,6 +205,7 @@ function initialPrompt(event, messages, openDrafts) {
     `Data atual: ${new Date().toISOString().slice(0, 10)}`,
     `Mensagem atual: ${redactForModel(event.body)}`,
     `Draft autorizado pela mensagem citada: ${event.quotedContadorDraftId || 'nenhum'}`,
+    `Literais autorizados da resposta citada (use somente para resolve_draft e nunca repita na resposta): ${JSON.stringify(authorizedLiterals)}`,
     `Últimas mensagens (máximo 30): ${JSON.stringify(contextBlock(messages))}`,
     `Drafts abertos (consulta confiável): ${JSON.stringify(openDrafts || { count: 0, drafts: [] })}`,
   ].join('\n');
@@ -206,6 +284,13 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
           reason: event.replyToContador ? 'draft_reply_mismatch' : 'draft_reply_not_quoted',
           toolCalls: calls,
         };
+      }
+      if (!draftFieldsMatchReply(instruction.fields, event.body)) {
+        await sendReply('Não consegui confirmar esses valores na sua mensagem. Informe novamente os números exatamente como aparecem no comprovante.', {
+          ...event,
+          contadorDraftId: event.quotedContadorDraftId || undefined,
+        });
+        return { status: 'blocked', reason: 'draft_fields_not_literal', toolCalls: calls };
       }
       const result = await intake({
         action: 'resolve_draft',
@@ -351,4 +436,6 @@ module.exports = {
   parseAgentInstruction,
   redactForModel,
   heartbeatHasActionable,
+  extractDraftReplyLiterals,
+  draftFieldsMatchReply,
 };

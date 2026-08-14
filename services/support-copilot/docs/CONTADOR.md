@@ -13,7 +13,9 @@ The WhatsApp socket is entirely in this repository:
    offered to the Contador router; other groups keep the existing suggestion
    flow.
 4. Deterministically accepted work is persisted in `contador_jobs` before the
-   Contador model or Next call. For centrally classified media, the successful
+   Contador model or Next call. Central media classification is first persisted
+   in `agent_media_jobs`, before the webhook is acknowledged, and is recovered
+   after a PM2 restart. The successful
    `agent_media_analyses` row and its deferred `contador_jobs` row commit in the
    same SQLite transaction; a cached classification can also recover a missing
    job without another paid model call. The worker retries transient failures
@@ -85,7 +87,8 @@ monthly values into the workspace.
 - ordinary group chatter is ignored without invoking Opus;
 - PDF bytes are read from the local media directory and forwarded to the Next
   intake; its `replyMessage` is sent verbatim;
-- an image/PDF in the accounting group is classified exactly once by the
+- an image/PDF in the accounting group is durably queued and classified exactly
+  once by the
   central media router. For an energy photo, the configured vision provider
   receives the image and returns a minimal typed extraction; the raw image is
   not forwarded to Next. kWh and amount bounds match the ledger contract, and
@@ -96,7 +99,9 @@ monthly values into the workspace.
   draft cannot authorize the write. Confirmed UC mappings are persisted and
   replaying the reply does not duplicate the original entry. If OCR did not
   produce a stable UC, the operator may provide it literally in the quoted
-  reply before registration. If the Contador needs one more clarification, its
+  reply before registration. Literal UC/numeric/date values are extracted by
+  deterministic code and every model-proposed field must match the quoted text
+  before it can reach Next. If the Contador needs one more clarification, its
   next prompt keeps the same draft metadata so the following quoted answer can
   complete only that draft;
 - natural-language questions use the read-only tool loop and Claude Opus in a

@@ -471,8 +471,8 @@ router.post('/', async (req, res) => {
       // they look like a request to inspect a charger.
       const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
       if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
-        const { routeInboundMessage } = require('../lib/agent-router');
-        routeInboundMessage({
+        const { routeInboundMessageDurably } = require('../lib/agent-router');
+        routeInboundMessageDurably({
           messageId: msgId, externalMessageId, conversationId, brandId, groupJid,
           instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
           deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
@@ -827,8 +827,8 @@ router.post('/', async (req, res) => {
   }
 
   if (media && direction === 'inbound' && ['image', 'document'].includes(media.media_type)) {
-    const { routeInboundMessage } = require('../lib/agent-router');
-    routeInboundMessage({
+    const { routeInboundMessageDurably } = require('../lib/agent-router');
+    routeInboundMessageDurably({
       messageId: msgId, externalMessageId, conversationId, brandId,
       senderId: normalizedPhone, body, media, receivedAt: now,
     }).then(result => {
@@ -1010,4 +1010,3 @@ router.post('/', async (req, res) => {
 });
 
 module.exports = router;
-

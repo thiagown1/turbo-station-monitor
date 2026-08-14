@@ -415,6 +415,19 @@ try {
     );
     CREATE INDEX IF NOT EXISTS idx_agent_media_brand_at ON agent_media_analyses(brand_id, analyzed_at DESC);
 
+    CREATE TABLE IF NOT EXISTS agent_media_jobs (
+      message_id TEXT PRIMARY KEY,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_media_jobs_due
+      ON agent_media_jobs(status, next_attempt_at, created_at);
+
     CREATE TABLE IF NOT EXISTS agent_event_outbox (
       id TEXT PRIMARY KEY,
       message_id TEXT NOT NULL,

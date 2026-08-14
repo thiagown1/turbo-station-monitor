@@ -7,6 +7,8 @@ const { parseExpenseDecision, parseExpenseBrlAmount } = require('./expense-decis
 const configCache = new Map();
 let worker = null;
 let delivering = false;
+let deliveringMediaJobs = false;
+let mediaJobsRecovered = false;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
@@ -52,9 +54,14 @@ function queueEvent(messageId, brandId, payload) {
   void deliverDueEvents();
 }
 
-function shouldDeferEnergyInvoice(input, result) {
-  const isPdf = String(input.media?.mimetype || '').toLowerCase() === 'application/pdf'
+function isPdfInput(input) {
+  const mime = String(input.media?.mimetype || '').split(';', 1)[0].trim().toLowerCase();
+  return mime === 'application/pdf'
     || String(input.media?.filename || '').toLowerCase().endsWith('.pdf');
+}
+
+function shouldDeferEnergyInvoice(input, result) {
+  const isPdf = isPdfInput(input);
   return input.deferEnergyInvoiceEvent === true
     && result.kind === 'energy_invoice'
     && (isPdf || Boolean(result.energyBill))
@@ -62,8 +69,7 @@ function shouldDeferEnergyInvoice(input, result) {
 }
 
 function deferredContadorJob(input, result) {
-  const isPdf = String(input.media?.mimetype || '').toLowerCase() === 'application/pdf'
-    || String(input.media?.filename || '').toLowerCase().endsWith('.pdf');
+  const isPdf = isPdfInput(input);
   const messageId = input.externalMessageId || input.messageId;
   const kind = isPdf ? 'pdf' : 'image';
   const payload = {
@@ -191,6 +197,58 @@ async function routeInboundMessage(input) {
   return { ...result, eventDeferred, contadorJobPersisted: eventDeferred };
 }
 
+function persistMediaJob(input) {
+  const now = nowIso();
+  db.prepare(`INSERT OR IGNORE INTO agent_media_jobs
+    (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
+    .run(input.messageId, JSON.stringify(input), now, now, now);
+}
+
+async function processMediaJob(messageId) {
+  const claimed = db.prepare(`UPDATE agent_media_jobs
+    SET status = 'processing', attempts = attempts + 1, updated_at = ?
+    WHERE message_id = ? AND status IN ('pending', 'retry')
+      AND datetime(next_attempt_at) <= datetime('now')`)
+    .run(nowIso(), messageId);
+  if (!claimed.changes) return { queued: true, duplicate: true };
+  const row = db.prepare('SELECT payload_json, attempts FROM agent_media_jobs WHERE message_id = ?').get(messageId);
+  try {
+    const result = await routeInboundMessage(JSON.parse(row.payload_json));
+    if (result?.status === 'error') throw new Error(result.error || 'media_classification_failed');
+    db.prepare("UPDATE agent_media_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE message_id = ?")
+      .run(nowIso(), messageId);
+    return result;
+  } catch (error) {
+    const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(Number(row.attempts || 1), 8)));
+    db.prepare(`UPDATE agent_media_jobs
+      SET status = 'retry', next_attempt_at = ?, last_error = ?, updated_at = ?
+      WHERE message_id = ?`)
+      .run(new Date(Date.now() + delayMs).toISOString(), String(error?.message || error).slice(0, 500), nowIso(), messageId);
+    throw error;
+  }
+}
+
+function routeInboundMessageDurably(input) {
+  persistMediaJob(input);
+  return processMediaJob(input.messageId);
+}
+
+async function deliverDueMediaJobs() {
+  if (deliveringMediaJobs) return;
+  deliveringMediaJobs = true;
+  try {
+    const due = db.prepare(`SELECT message_id FROM agent_media_jobs
+      WHERE status IN ('pending', 'retry') AND datetime(next_attempt_at) <= datetime('now')
+      ORDER BY datetime(created_at) ASC LIMIT 5`).all();
+    for (const row of due) {
+      try { await processMediaJob(row.message_id); } catch (_) { /* retry state persisted */ }
+    }
+  } finally {
+    deliveringMediaJobs = false;
+  }
+}
+
 async function routeExpenseDecisionReply(input) {
   const codeMatch = String(input.quotedBody || '').match(/\bEXP-([A-F0-9]{8})\b/i);
   const amountCents = parseExpenseBrlAmount(input.body);
@@ -261,18 +319,31 @@ async function deliverDueEvents() {
 
 function startAgentEventWorker() {
   if (worker) return;
-  worker = setInterval(() => { void deliverDueEvents(); }, 30_000);
+  if (!mediaJobsRecovered) {
+    const recoveredAt = nowIso();
+    db.prepare(`UPDATE agent_media_jobs
+      SET status = 'retry', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
+      WHERE status = 'processing'`).run(recoveredAt, recoveredAt);
+    mediaJobsRecovered = true;
+  }
+  worker = setInterval(() => {
+    void deliverDueEvents();
+    void deliverDueMediaJobs();
+  }, 30_000);
   worker.unref?.();
   void deliverDueEvents();
+  void deliverDueMediaJobs();
 }
 
 module.exports = {
   routeInboundMessage,
+  routeInboundMessageDurably,
   routeExpenseDecisionReply,
   parseExpenseDecision,
   deliverDueEvents,
+  deliverDueMediaJobs,
   startAgentEventWorker,
   loadConfig,
   shouldDeferEnergyInvoice,
+  isPdfInput,
 };
-

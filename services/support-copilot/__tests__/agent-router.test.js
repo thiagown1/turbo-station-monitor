@@ -182,13 +182,15 @@ test('defers an energy invoice to Contador with structured fields and no duplica
         const { db, nowIso } = require('./lib/db');
         const now = nowIso();
         const router = require('./lib/agent-router');
-        const input = { messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', receivedAt: now, deferEnergyInvoiceEvent: true };
-        const result = await router.routeInboundMessage(input);
+        const input = { messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', media: { media_type: 'document', mimetype: 'application/pdf; charset=binary' }, receivedAt: now, deferEnergyInvoiceEvent: true };
+        const result = await router.routeInboundMessageDurably(input);
         await router.deliverDueEvents();
         const outbox = db.prepare('SELECT COUNT(*) count FROM agent_event_outbox').get();
         const firstJob = db.prepare('SELECT message_id, kind, status FROM contador_jobs WHERE message_id = ?').get('energy-1');
+        const mediaJob = db.prepare('SELECT status, attempts FROM agent_media_jobs WHERE message_id = ?').get('energy-1');
         if (!result.eventDeferred || result.energyBill.kwhNaoCompensado !== 812) throw new Error('energy extraction not deferred');
-        if (!result.contadorJobPersisted || firstJob?.kind !== 'image' || firstJob?.status !== 'pending') throw new Error('contador job was not committed with analysis');
+        if (!result.contadorJobPersisted || firstJob?.kind !== 'pdf' || firstJob?.status !== 'pending') throw new Error('parameterized PDF was not committed as a PDF contador job');
+        if (mediaJob?.status !== 'completed' || mediaJob?.attempts !== 1) throw new Error('classification was not durably completed');
         if (outbox.count !== 0 || eventCalls !== 0) throw new Error('generic event was duplicated');
         db.prepare('DELETE FROM contador_jobs WHERE message_id = ?').run('energy-1');
         const replay = await router.routeInboundMessage(input);

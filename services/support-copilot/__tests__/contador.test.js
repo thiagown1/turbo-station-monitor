@@ -35,6 +35,12 @@ test('gate only accepts the configured group and ignores ordinary chatter', () =
     groupJid: config.groupConversationId,
     body: 'quais contas de energia faltam este mes?',
   }, config).kind, 'query');
+
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    media: { media_type: 'document', mimetype: 'application/pdf; charset=binary' },
+  }, config).kind, 'pdf');
 });
 
 test('PDF intake forwards the original message id and sends the deterministic reply', async () => {
@@ -238,6 +244,59 @@ test('a clarification reply preserves the quoted draft authorization for the nex
   });
 
   assert.equal(result.status, 'sent');
+  assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
+});
+
+test('quoted draft replies expose a literal UC and forward only the matching value', async () => {
+  const calls = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async (payload) => {
+      calls.push(payload);
+      return { outcome: 'registered', replyMessage: 'Conta concluída.' };
+    },
+    sendReply: async () => {},
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async (prompt) => {
+      assert.match(prompt, /439785001206/);
+      return JSON.stringify({ action: 'resolve_draft', draftId: 'rcpt_open', fields: { uc: '439785001206' } });
+    },
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-uc', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'UC 4.397.850.012-06', replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.status, 'sent');
+  assert.equal(calls[0].fields.uc, '439785001206');
+});
+
+test('draft resolution rejects model numbers that were not literal in the quoted reply', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { throw new Error('hallucinated value must not reach intake'); },
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft', draftId: 'rcpt_open', fields: { kwhNaoCompensado: 999 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-kwh', groupJid: config.groupConversationId,
+    senderId: '5511999999999', body: 'foram 812 kWh', replyToContador: true,
+    quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.reason, 'draft_fields_not_literal');
+  assert.match(replies[0].text, /confirmar esses valores/i);
   assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
 });
 
