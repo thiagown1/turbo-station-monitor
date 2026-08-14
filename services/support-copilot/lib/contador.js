@@ -65,7 +65,7 @@ function parseAgentInstruction(value) {
         ? parsed.fields
         : undefined;
       const allowedFieldNames = new Set([
-        'refPeriod', 'dueDate', 'kwhNaoCompensado', 'tarifaNaoCompensada', 'kwhCompensado',
+        'uc', 'refPeriod', 'dueDate', 'kwhNaoCompensado', 'tarifaNaoCompensada', 'kwhCompensado',
         'tarifaScee', 'tarifaSemTributosNaoCompensada', 'tarifaSemTributos', 'totalCents',
       ]);
       const safeFields = fields
@@ -117,7 +117,7 @@ function initialPrompt(event, messages, openDrafts) {
     'Para usá-las, retorne action=tool no JSON. Nunca responda que uma ferramenta permitida está indisponível.',
     'Ferramentas permitidas: pendencias, lancamentos, tarifa_efetiva, resumo_energia, drafts_abertos, estacoes, resumo_contabil, contas_a_vencer.',
     'Se esta mensagem for uma resposta citada a uma pergunta sua sobre um draft, consulte estacoes quando necessário e conclua SOMENTE o draft explícito.',
-    'Para concluir, use {"action":"resolve_draft","draftId":"...","stationId":"...","fields":{...}}. Só copie campos numéricos literalmente informados pelo operador; nunca derive valores. totalCents é inteiro em centavos; kWh e tarifas são números decimais nas unidades originais.',
+    'Para concluir, use {"action":"resolve_draft","draftId":"...","stationId":"...","fields":{...}}. Só copie UC e campos numéricos literalmente informados pelo operador; nunca derive valores. totalCents é inteiro em centavos; kWh e tarifas são números decimais nas unidades originais.',
     'Se um kWh ou tarifa puder pertencer tanto à distribuidora quanto ao gerador solar, faça uma pergunta objetiva; nunca escolha o lado por suposição.',
     'Responda SOMENTE JSON em um destes formatos:',
     '{"action":"tool","tool":"pendencias","params":{"year":2026,"month":8}}',
@@ -349,4 +349,3 @@ module.exports = {
   redactForModel,
   heartbeatHasActionable,
 };
-

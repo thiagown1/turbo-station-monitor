@@ -61,6 +61,9 @@ test('normalizes energy invoice vision fields and rejects implausible tariffs', 
   assert.equal(bounded.kwhNaoCompensado, null);
   assert.equal(bounded.kwhCompensado, null);
   assert.equal(bounded.totalCents, null);
+  assert.equal(extractEnergyBill({
+    kind: 'energy_invoice', energy_bill: { total_brl: 'R$ 0,00' },
+  }).totalCents, 0);
   assert.equal(extractEnergyBill({ kind: 'expense_receipt' }), undefined);
 });
 
@@ -307,4 +310,3 @@ test('station requests use the tool-backed support suggestion and still require 
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
 if (failed) process.exit(1);
-

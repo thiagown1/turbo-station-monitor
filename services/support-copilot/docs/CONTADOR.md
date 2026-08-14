@@ -94,7 +94,9 @@ monthly values into the workspace.
   exact `draftId + stationId` only when the quoted outbound message carries the
   same draft prompt metadata. Quoting another Contador heartbeat, summary or
   draft cannot authorize the write. Confirmed UC mappings are persisted and
-  replaying the reply does not duplicate the original entry;
+  replaying the reply does not duplicate the original entry. If OCR did not
+  produce a stable UC, the operator may provide it literally in the quoted
+  reply before registration;
 - natural-language questions use the read-only tool loop and Claude Opus in a
   persistent OpenClaw session;
 - daily heartbeat queries upcoming bills, open drafts and current-month
@@ -151,4 +153,3 @@ Activation is a separate production change and requires explicit approval.
 Rollback: set `CONTADOR_ENABLED=false` and restart `support-copilot`. If the
 Next half must also stop, disable `feature_flags/energy_bill_intake`. Do not
 delete SQLite jobs or WhatsApp auth state during rollback.
-

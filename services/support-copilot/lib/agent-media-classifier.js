@@ -92,7 +92,7 @@ function extractEnergyBill(parsed) {
     tarifaSemTributos: boundedPositive(source.tarifa_sem_tributos, 10),
     totalCents: (() => {
       const cents = parseAmountToCents(source.total_brl);
-      return Number.isInteger(cents) && cents > 0 && cents <= 1_000_000_000 ? cents : null;
+      return Number.isInteger(cents) && cents >= 0 && cents <= 1_000_000_000 ? cents : null;
     })(),
   };
 }
@@ -156,4 +156,3 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
 }
 
 module.exports = { classifyMessage, estimateCost, extractFinancialFields, extractEnergyBill };
-

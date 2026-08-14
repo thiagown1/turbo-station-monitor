@@ -282,8 +282,8 @@ test('agent instructions reject unknown tools and malformed replies', () => {
   assert.deepEqual(parseAgentInstruction('not json'), { action: 'invalid' });
   assert.deepEqual(parseAgentInstruction('{"action":"reply","text":"Tudo certo."}'), { action: 'reply', text: 'Tudo certo.' });
   assert.deepEqual(
-    parseAgentInstruction('{"action":"resolve_draft","draftId":"rcpt_1","stationId":"S1","fields":{"kwhNaoCompensado":812,"hack":true}}'),
-    { action: 'resolve_draft', draftId: 'rcpt_1', stationId: 'S1', fields: { kwhNaoCompensado: 812 } },
+    parseAgentInstruction('{"action":"resolve_draft","draftId":"rcpt_1","stationId":"S1","fields":{"uc":"439785001206","kwhNaoCompensado":812,"hack":true}}'),
+    { action: 'resolve_draft', draftId: 'rcpt_1', stationId: 'S1', fields: { uc: '439785001206', kwhNaoCompensado: 812 } },
   );
 });
 
@@ -308,4 +308,3 @@ test('model context masks common PII formats', () => {
   if (failed) process.exit(1);
   console.log(`\n${tests.length} Contador tests passed.`);
 })();
-
