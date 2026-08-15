@@ -360,16 +360,50 @@ router.post('/', async (req, res) => {
       fetchGroupName(instance, groupJid, conversationId);
     }
 
-    // Dedup by external_message_id
+    const groupBody = direction === 'inbound' ? `[${senderName}]: ${body}` : body;
+
+    // Dedup by external_message_id. If a crash happened after the inbound
+    // message commit but before durable media routing, the provider replay is
+    // also the recovery path for the missing media/Contador job.
     if (externalMessageId) {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
-      if (dup) return res.json({ id: dup.id, conversationId, duplicate: true });
+      if (dup) {
+        if (direction === 'inbound' && media && ['image', 'document'].includes(media.media_type)) {
+          const quoted = quotedOutboundMessage(message, conversationId);
+          const contadorEvent = {
+            messageId: externalMessageId,
+            conversationId,
+            brandId,
+            groupJid,
+            instance,
+            direction,
+            sender: senderName,
+            senderId,
+            body,
+            media,
+            replyToContador: quoted?.source === 'contador',
+            quotedContadorDraftId: quoted?.draftId || null,
+          };
+          if (isQuotedContadorDraftReply(contadorEvent)) {
+            enqueueContadorMessage(contadorEvent);
+          } else {
+            const { routeInboundMessageDurably } = require('../lib/agent-router');
+            routeInboundMessageDurably({
+              messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
+              instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+              replyToContador: contadorEvent.replyToContador,
+              quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+              deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+            }).catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
+          }
+        }
+        return res.json({ id: dup.id, conversationId, duplicate: true });
+      }
     }
 
     // Insert message — prefix body with sender name for group context
     const msgId = randomId('msg');
     const mediaJson = media ? JSON.stringify(media) : null;
-    const groupBody = direction === 'inbound' ? `[${senderName}]: ${body}` : body;
 
     db.transaction(() => {
       db.prepare(`

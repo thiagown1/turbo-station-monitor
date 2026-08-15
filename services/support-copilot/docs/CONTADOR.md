@@ -22,7 +22,10 @@ The WhatsApp socket is entirely in this repository:
    failures remain retryable; they do not create an extraction-less Contador
    job. Media work stops after five failed attempts. Explicitly skipped work
    completes only after the Contador or suggestion fallback has run. The worker
-   recovers jobs interrupted by a PM2 restart.
+   recovers jobs interrupted by a PM2 restart. If the process stops after the
+   inbound message commit but before that durable media job is created, the
+   provider's duplicate webhook replays the idempotent routing step instead of
+   discarding the attachment as an already-seen message.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
@@ -136,6 +139,12 @@ monthly values into the workspace.
 - a failed monthly closing persists its next attempt and retries after 1h, 4h,
   12h and 24h before exhausting the bounded five-attempt budget; the 15-minute
   scheduler therefore cannot consume every attempt during a short outage;
+- immediately before the external WhatsApp request, the monthly ledger moves
+  from `processing` to `sending`. If the process stops or the request result is
+  ambiguous after that fence, startup records `delivery_unknown`, does not
+  automatically resend, and does not overtake it with later months. An operator
+  must reconcile that run before retrying, which prefers a visible missing
+  closing over a duplicate message;
 - failed model/API work is visible in `contador_jobs` with attempts and a
   redacted error, and transient failures use bounded backoff.
 

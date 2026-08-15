@@ -11,6 +11,7 @@ const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${proces
 const backfillDbPath = `${dbPath}-backfill`;
 const baselineDbPath = `${dbPath}-baseline`;
 const retryDbPath = `${dbPath}-retry`;
+const deliveryDbPath = `${dbPath}-delivery`;
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
@@ -78,7 +79,11 @@ try {
       let calls = 0;
       runtime._setContadorForTest({
         heartbeat: async () => { throw new Error('daily heartbeat must be replaced on monthly day'); },
-        monthlySummary: async () => { calls++; return { status: 'sent' }; },
+        monthlySummary: async (_runDate, hooks) => {
+          calls++;
+          await hooks.beforeSend();
+          return { status: 'sent' };
+        },
       });
       const beforeSchedule = new Date('2026-08-03T10:59:00.000Z');
       const afterMissedWindow = new Date('2026-08-04T11:00:00.000Z');
@@ -162,8 +167,9 @@ try {
       ` + "`" + `).run();
       runtime._setContadorForTest({
         heartbeat: async () => { throw new Error('daily heartbeat must not replace monthly backlog'); },
-        monthlySummary: async (runDate) => {
+        monthlySummary: async (runDate, hooks) => {
           calls.push(runDate.toISOString().slice(0, 10));
+          await hooks.beforeSend();
           return { status: 'sent' };
         },
       });
@@ -202,8 +208,9 @@ try {
       const calls = [];
       runtime._setContadorForTest({
         heartbeat: async () => { throw new Error('daily heartbeat must not replace monthly backlog'); },
-        monthlySummary: async (runDate) => {
+        monthlySummary: async (runDate, hooks) => {
           calls.push(runDate.toISOString().slice(0, 10));
+          await hooks.beforeSend();
           return { status: 'sent' };
         },
       });
@@ -234,8 +241,56 @@ try {
     { run_month: '2026-09', status: 'sent', attempts: 1 },
   ]);
   console.log('PASS Contador monthly summary seeds an empty ledger before the first schedule');
+
+  const deliveryOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      let calls = 0;
+      db.prepare(` + "`" + `
+        INSERT INTO contador_monthly_runs
+          (run_month, status, attempts, created_at, updated_at)
+        VALUES ('2026-08', 'sending', 1, '2026-08-03T11:00:00.000Z', '2026-08-03T11:00:00.000Z')
+      ` + "`" + `).run();
+      runtime._setContadorForTest({
+        heartbeat: async () => ({ status: 'silent' }),
+        monthlySummary: async () => { calls += 1; return { status: 'sent' }; },
+      });
+      runtime._recoverInterruptedContadorWorkForTest('2026-08-03T11:01:00.000Z');
+      await runtime.processMonthlySummary(new Date('2026-09-04T11:00:00.000Z'));
+      const rows = db.prepare(` + "`" + `
+        SELECT run_month, status, attempts, next_attempt_at, last_error
+        FROM contador_monthly_runs ORDER BY run_month
+      ` + "`" + `).all();
+      process.stdout.write(JSON.stringify({ calls, rows }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: deliveryDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const delivery = JSON.parse(deliveryOutput.slice(deliveryOutput.lastIndexOf('\n') + 1));
+  assert.equal(delivery.calls, 0);
+  assert.deepEqual(delivery.rows, [{
+    run_month: '2026-08',
+    status: 'delivery_unknown',
+    attempts: 1,
+    next_attempt_at: null,
+    last_error: 'interrupted_during_send',
+  }]);
+  console.log('PASS Contador monthly recovery fails closed after an ambiguous send');
 } finally {
-  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath]) {
+  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, deliveryDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }

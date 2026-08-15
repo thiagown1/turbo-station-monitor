@@ -347,6 +347,9 @@ function dueMonthlyRunMonths(now, localDate = saoPauloDay(now)) {
       due.push(runMonth);
       continue;
     }
+    if (row.status === 'delivery_unknown') {
+      break; // An operator must reconcile the ambiguous delivery before later closings proceed.
+    }
     if (row.status === 'failed' && Number(row.attempts || 0) < MAX_ATTEMPTS) {
       if (retryDue) due.push(runMonth);
       else break; // Never overtake an older closing that is waiting for retry.
@@ -435,14 +438,29 @@ async function processMonthlySummary(now = new Date()) {
       if (!claim.changes) continue;
 
       try {
-        const result = await contador.monthlySummary(monthlyRunDate(runMonth));
+        const result = await contador.monthlySummary(monthlyRunDate(runMonth), {
+          beforeSend: async () => {
+            const fenced = db.prepare(`
+              UPDATE contador_monthly_runs
+              SET status = 'sending', updated_at = ?
+              WHERE run_month = ? AND status = 'processing'
+            `).run(nowIso(), runMonth);
+            if (!fenced.changes) throw new Error('monthly_send_fence_lost');
+          },
+        });
+        const current = db.prepare('SELECT status FROM contador_monthly_runs WHERE run_month = ?').get(runMonth);
+        if (result.status === 'sent' && current?.status !== 'sending') {
+          throw new Error('monthly_send_was_not_fenced');
+        }
         db.prepare(`UPDATE contador_monthly_runs SET status = ?, next_attempt_at = NULL, updated_at = ? WHERE run_month = ?`)
           .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
       } catch (err) {
-        const attempt = db.prepare('SELECT attempts FROM contador_monthly_runs WHERE run_month = ?').get(runMonth);
-        db.prepare(`UPDATE contador_monthly_runs SET status = 'failed', next_attempt_at = ?, last_error = ?, updated_at = ? WHERE run_month = ?`)
+        const attempt = db.prepare('SELECT status, attempts FROM contador_monthly_runs WHERE run_month = ?').get(runMonth);
+        const deliveryUnknown = attempt?.status === 'sending';
+        db.prepare(`UPDATE contador_monthly_runs SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE run_month = ?`)
           .run(
-            monthlyRetryIso(attempt?.attempts, now),
+            deliveryUnknown ? 'delivery_unknown' : 'failed',
+            deliveryUnknown ? null : monthlyRetryIso(attempt?.attempts, now),
             String(err.message || err).slice(0, 500),
             nowIso(),
             runMonth
@@ -456,16 +474,7 @@ async function processMonthlySummary(now = new Date()) {
   }
 }
 
-function startContadorRuntime() {
-  if (!config.enabled) {
-    console.log(`${LOG_TAG} [contador] disabled (CONTADOR_ENABLED is not true)`);
-    return { started: false, reason: 'disabled' };
-  }
-  if (!configured()) {
-    console.warn(`${LOG_TAG} [contador] fail-closed: missing group, Next URL or secret`);
-    return { started: false, reason: 'incomplete_config' };
-  }
-  const recoveredAt = nowIso();
+function recoverInterruptedContadorWork(recoveredAt = nowIso()) {
   db.prepare(`
     UPDATE contador_jobs
     SET status = 'retry', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
@@ -481,6 +490,23 @@ function startContadorRuntime() {
     SET status = 'failed', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
     WHERE status = 'processing'
   `).run(recoveredAt, recoveredAt);
+  db.prepare(`
+    UPDATE contador_monthly_runs
+    SET status = 'delivery_unknown', next_attempt_at = NULL, last_error = 'interrupted_during_send', updated_at = ?
+    WHERE status = 'sending'
+  `).run(recoveredAt);
+}
+
+function startContadorRuntime() {
+  if (!config.enabled) {
+    console.log(`${LOG_TAG} [contador] disabled (CONTADOR_ENABLED is not true)`);
+    return { started: false, reason: 'disabled' };
+  }
+  if (!configured()) {
+    console.warn(`${LOG_TAG} [contador] fail-closed: missing group, Next URL or secret`);
+    return { started: false, reason: 'incomplete_config' };
+  }
+  recoverInterruptedContadorWork();
   runtimeStarted = true;
   console.log(`${LOG_TAG} [contador] runtime enabled for configured group; heartbeat hour=${CONTADOR_HEARTBEAT_HOUR}, monthly day=${CONTADOR_MONTHLY_DAY} America/Sao_Paulo`);
   processPendingJobs().catch((err) => console.warn(`${LOG_TAG} [contador] initial worker failed:`, err.message));
@@ -510,4 +536,5 @@ module.exports = {
   sendReply,
   _setContadorForTest,
   _recordOutboundForTest: recordOutbound,
+  _recoverInterruptedContadorWorkForTest: recoverInterruptedContadorWork,
 };

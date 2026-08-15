@@ -442,7 +442,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     return { status: 'sent' };
   }
 
-  async function monthlySummary(now = new Date()) {
+  async function monthlySummary(now = new Date(), hooks = {}) {
     const current = periodInSaoPaulo(now);
     const period = current.month === 1
       ? { year: current.year - 1, month: 12 }
@@ -484,7 +484,9 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     ].join('\n');
     const instruction = parseAgentInstruction(await runAgent(prompt));
     if (instruction.action !== 'reply') return { status: 'silent', period };
-    await sendReply(redactForModel(instruction.text), { kind: 'monthly_summary', groupJid: config.groupConversationId });
+    const replyText = redactForModel(instruction.text);
+    if (typeof hooks.beforeSend === 'function') await hooks.beforeSend({ text: replyText, period });
+    await sendReply(replyText, { kind: 'monthly_summary', groupJid: config.groupConversationId });
     return { status: 'sent', period };
   }
 
