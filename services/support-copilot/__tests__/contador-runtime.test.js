@@ -13,6 +13,7 @@ const baselineDbPath = `${dbPath}-baseline`;
 const retryDbPath = `${dbPath}-retry`;
 const sendFailureDbPath = `${dbPath}-send-failure`;
 const deliveryDbPath = `${dbPath}-delivery`;
+const replyDbPath = `${dbPath}-reply`;
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
@@ -353,8 +354,84 @@ try {
     last_error: 'interrupted_during_send',
   }]);
   console.log('PASS Contador monthly recovery fails closed after an ambiguous send');
+
+  const replyOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      let sends = 0;
+      const evolutionPath = require.resolve('./lib/evolution-client');
+      require.cache[evolutionPath] = {
+        id: evolutionPath, filename: evolutionPath, loaded: true,
+        exports: { sendText: async () => { sends += 1; return { key: { id: 'wamid-reply-1' } }; } },
+      };
+      const runtime = require('./lib/contador-runtime');
+      const { db, nowIso } = require('./lib/db');
+      const now = nowIso();
+      db.prepare(` + "`" + `
+        INSERT INTO conversations (id, brand_id, channel, customer_phone, status, created_at, updated_at)
+        VALUES ('conv-reply', 'turbo_station', 'whatsapp-group', 'contas@g.us', 'open', ?, ?)
+      ` + "`" + `).run(now, now);
+      runtime.enqueueContadorMessage({
+        messageId: 'invoice-reply-1', conversationId: 'conv-reply', brandId: 'turbo_station',
+        groupJid: 'contas@g.us', instance: 'turbostation', direction: 'inbound',
+        body: '[documento]', media: { media_type: 'document', mimetype: 'application/pdf' },
+      });
+      const job = db.prepare('SELECT id FROM contador_jobs WHERE message_id = ?').get('invoice-reply-1');
+      db.prepare("UPDATE contador_jobs SET status = 'processing' WHERE id = ?").run(job.id);
+      const event = {
+        contadorJobId: job.id, conversationId: 'conv-reply', brandId: 'turbo_station',
+        groupJid: 'contas@g.us', instance: 'turbostation',
+      };
+      await runtime.sendReply('Conta registrada.', event);
+      await runtime.sendReply('Conta registrada.', event);
+      const sent = db.prepare(` + "`" + `
+        SELECT reply_status, reply_external_message_id FROM contador_jobs WHERE id = ?
+      ` + "`" + `).get(job.id);
+      const outboundCount = db.prepare("SELECT COUNT(*) count FROM messages WHERE source = 'contador'").get().count;
+
+      db.prepare(` + "`" + `
+        INSERT INTO contador_jobs
+          (id, message_id, conversation_id, brand_id, group_jid, instance, kind, payload_json,
+           status, attempts, reply_status, created_at, updated_at)
+        VALUES ('job-ambiguous', 'invoice-reply-2', 'conv-reply', 'turbo_station', 'contas@g.us',
+                'turbostation', 'pdf', '{}', 'processing', 1, 'sending', ?, ?)
+      ` + "`" + `).run(now, now);
+      runtime._recoverInterruptedContadorWorkForTest('2026-08-03T11:01:00.000Z');
+      const ambiguous = db.prepare(` + "`" + `
+        SELECT status, reply_status, next_attempt_at, last_error FROM contador_jobs WHERE id = 'job-ambiguous'
+      ` + "`" + `).get();
+
+      let replayedHandleCalls = 0;
+      runtime._setContadorForTest({ handle: async () => { replayedHandleCalls += 1; return { status: 'sent' }; } });
+      await runtime.processPendingJobs();
+      const recoveredSent = db.prepare('SELECT status, reply_status FROM contador_jobs WHERE id = ?').get(job.id);
+      process.stdout.write(JSON.stringify({ sends, sent, outboundCount, ambiguous, replayedHandleCalls, recoveredSent }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: replyDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+    },
+    encoding: 'utf8',
+  });
+  const reply = JSON.parse(replyOutput.slice(replyOutput.lastIndexOf('\n') + 1));
+  assert.equal(reply.sends, 1);
+  assert.deepEqual(reply.sent, { reply_status: 'sent', reply_external_message_id: 'wamid-reply-1' });
+  assert.equal(reply.outboundCount, 1);
+  assert.deepEqual(reply.ambiguous, {
+    status: 'delivery_unknown', reply_status: 'delivery_unknown', next_attempt_at: null,
+    last_error: 'interrupted_during_reply_send',
+  });
+  assert.equal(reply.replayedHandleCalls, 0);
+  assert.deepEqual(reply.recoveredSent, { status: 'completed', reply_status: 'sent' });
+  console.log('PASS Contador reply delivery is checkpointed and recovery never duplicates an ambiguous send');
 } finally {
-  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath]) {
+  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath, replyDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }

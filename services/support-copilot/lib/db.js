@@ -374,6 +374,8 @@ try {
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at TEXT,
       last_error TEXT,
+      reply_status TEXT,
+      reply_external_message_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -402,6 +404,8 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} contador migrations:`, err.message);
 }
+safeAddColumn('contador_jobs', 'reply_status', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_jobs', 'reply_external_message_id', 'TEXT DEFAULT NULL');
 safeAddColumn('contador_monthly_runs', 'next_attempt_at', 'TEXT DEFAULT NULL');
 try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contador_monthly_runs_due

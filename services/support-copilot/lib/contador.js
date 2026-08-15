@@ -194,7 +194,7 @@ function extractDraftReplyLiterals(body) {
   }
   return {
     ucCandidates: [...new Set(ucCandidates)],
-    periods,
+    periods: [...new Map(periods.map((period) => [`${period.year}-${period.month}`, period])).values()],
     dates: [...dates],
     numericFields: extractLabeledDraftNumbers(text),
   };
@@ -205,17 +205,20 @@ function draftFieldsMatchReply(fields, body) {
   const literals = extractDraftReplyLiterals(body);
   const sameLabeledNumber = (key, value) => typeof value === 'number'
     && Number.isFinite(value)
-    && (literals.numericFields[key] || []).some((candidate) => Math.abs(candidate - value) <= 1e-9);
+    && (literals.numericFields[key] || []).length === 1
+    && Math.abs(literals.numericFields[key][0] - value) <= 1e-9;
   return Object.entries(fields).every(([key, value]) => {
     if (key === 'uc') {
       const digits = String(value || '').replace(/\D/g, '');
-      return Boolean(digits) && literals.ucCandidates.includes(digits);
+      return Boolean(digits) && literals.ucCandidates.length === 1 && literals.ucCandidates[0] === digits;
     }
     if (key === 'refPeriod') {
       return Boolean(value && typeof value === 'object'
-        && literals.periods.some((period) => period.year === Number(value.year) && period.month === Number(value.month)));
+        && literals.periods.length === 1
+        && literals.periods[0].year === Number(value.year)
+        && literals.periods[0].month === Number(value.month));
     }
-    if (key === 'dueDate') return typeof value === 'string' && literals.dates.includes(value);
+    if (key === 'dueDate') return typeof value === 'string' && literals.dates.length === 1 && literals.dates[0] === value;
     return sameLabeledNumber(key, value);
   });
 }

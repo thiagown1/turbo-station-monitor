@@ -422,6 +422,34 @@ test('draft resolution binds each kWh literal to its labeled bill side', async (
   assert.match(replies[0].text, /confirmar esses valores/i);
 });
 
+test('draft resolution fails closed when one field has contradictory labeled values', async () => {
+  let intakeCalls = 0;
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => { intakeCalls += 1; return { replyMessage: 'não deveria registrar' }; },
+    sendReply: async (text, event) => replies.push({ text, event }),
+    loadContext: async () => [],
+    queryTool: async () => ({ count: 1, drafts: [{ draftId: 'rcpt_open' }] }),
+    runAgent: async () => JSON.stringify({
+      action: 'resolve_draft', draftId: 'rcpt_open', fields: { kwhNaoCompensado: 812 },
+    }),
+  });
+
+  const result = await contador.handle({
+    kind: 'query', messageId: 'm-contradictory-kwh', groupJid: config.groupConversationId,
+    senderId: '5511999999999',
+    body: 'distribuidora incorreta: 812 kWh; distribuidora correta: 650 kWh',
+    replyToContador: true, quotedContadorDraftId: 'rcpt_open',
+  });
+
+  assert.equal(result.reason, 'draft_fields_not_literal');
+  assert.equal(intakeCalls, 0);
+  assert.match(replies[0].text, /confirmar esses valores/i);
+  assert.equal(replies[0].event.contadorDraftId, 'rcpt_open');
+});
+
 test('dotted Brazilian kWh rejects the decimal interpretation', async () => {
   let intakeCalls = 0;
   const contador = buildContador({

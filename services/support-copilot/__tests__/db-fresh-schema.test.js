@@ -260,7 +260,7 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
           if (!tables.includes(expected)) throw new Error(expected + ' table missing: ' + tables.join(','));
         }
         const jobCols = check.prepare("PRAGMA table_info('contador_jobs')").all().map(r => r.name);
-        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json']) {
+        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json', 'reply_status', 'reply_external_message_id']) {
           if (!jobCols.includes(expected)) throw new Error('contador_jobs.' + expected + ' column missing');
         }
         const monthlyCols = check.prepare("PRAGMA table_info('contador_monthly_runs')").all().map(r => r.name);

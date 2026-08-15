@@ -137,7 +137,7 @@ function loadContext(conversationId, limit = 30) {
   `).all(conversationId, Math.min(30, Math.max(1, limit))).reverse();
 }
 
-function recordOutbound(text, event, externalMessageId) {
+function recordOutbound(text, event, externalMessageId, contadorJobId = null) {
   const now = nowIso();
   const messageId = randomId('msg');
   const metadata = event.contadorDraftId
@@ -154,6 +154,13 @@ function recordOutbound(text, event, externalMessageId) {
       SET last_message_at = ?, last_outbound_at = ?, updated_at = ?
       WHERE id = ?
     `).run(now, now, now, event.conversationId);
+    if (contadorJobId) {
+      db.prepare(`
+        UPDATE contador_jobs
+        SET reply_status = 'sent', reply_external_message_id = ?, updated_at = ?
+        WHERE id = ? AND reply_status = 'sending'
+      `).run(externalMessageId || null, now, contadorJobId);
+    }
   })();
   emitEvent({
     type: 'message',
@@ -178,7 +185,50 @@ function recordOutbound(text, event, externalMessageId) {
 async function sendReply(text, event) {
   const groupJid = event.groupJid || config.groupConversationId;
   const instance = event.instance || config.instance;
-  const result = await sendText(instance, groupJid, text);
+  const contadorJobId = event.contadorJobId || null;
+  if (contadorJobId) {
+    const prior = db.prepare(`
+      SELECT reply_status, reply_external_message_id FROM contador_jobs WHERE id = ?
+    `).get(contadorJobId);
+    if (prior?.reply_status === 'sent') {
+      return { key: { id: prior.reply_external_message_id || null }, duplicate: true };
+    }
+    if (prior?.reply_status === 'sending' || prior?.reply_status === 'delivery_unknown') {
+      const err = new Error('Contador reply delivery is ambiguous and requires operator reconciliation');
+      err.retryable = false;
+      err.deliveryUnknown = true;
+      throw err;
+    }
+    const fenced = db.prepare(`
+      UPDATE contador_jobs SET reply_status = 'sending', updated_at = ?
+      WHERE id = ? AND reply_status IS NULL
+    `).run(nowIso(), contadorJobId);
+    if (!fenced.changes) throw new Error('Contador reply send fence could not be acquired');
+  }
+
+  let result;
+  try {
+    result = await sendText(instance, groupJid, text);
+  } catch (err) {
+    if (contadorJobId) {
+      const definitive = isDefinitiveEvolutionRejection(err);
+      db.prepare(`
+        UPDATE contador_jobs
+        SET reply_status = ?, last_error = ?, updated_at = ?
+        WHERE id = ? AND reply_status = 'sending'
+      `).run(
+        definitive ? null : 'delivery_unknown',
+        String(err.message || err).slice(0, 500),
+        nowIso(),
+        contadorJobId
+      );
+      if (!definitive) {
+        err.retryable = false;
+        err.deliveryUnknown = true;
+      }
+    }
+    throw err;
+  }
   let resolvedEvent = event;
   if (!event.conversationId || !event.brandId) {
     const conversation = db.prepare(`
@@ -189,7 +239,13 @@ async function sendReply(text, event) {
     if (conversation) resolvedEvent = { ...event, conversationId: conversation.id, brandId: conversation.brand_id };
   }
   if (resolvedEvent.conversationId && resolvedEvent.brandId) {
-    recordOutbound(text, resolvedEvent, result?.key?.id);
+    recordOutbound(text, resolvedEvent, result?.key?.id, contadorJobId);
+  } else if (contadorJobId) {
+    db.prepare(`
+      UPDATE contador_jobs
+      SET reply_status = 'sent', reply_external_message_id = ?, updated_at = ?
+      WHERE id = ? AND reply_status = 'sending'
+    `).run(result?.key?.id || null, nowIso(), contadorJobId);
   }
   return result;
 }
@@ -270,19 +326,26 @@ async function processPendingJobs() {
       `).run(nowIso(), job.id);
       if (!claimed.changes) continue;
       try {
-        const result = await contador.handle(JSON.parse(job.payload_json));
+        if (job.reply_status === 'sent') {
+          db.prepare(`UPDATE contador_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE id = ?`)
+            .run(nowIso(), job.id);
+          continue;
+        }
+        const result = await contador.handle({ ...JSON.parse(job.payload_json), contadorJobId: job.id });
         const status = result.status === 'blocked' ? 'blocked' : 'completed';
         db.prepare(`UPDATE contador_jobs SET status = ?, last_error = ?, updated_at = ? WHERE id = ?`)
           .run(status, result.reason || null, nowIso(), job.id);
       } catch (err) {
         const attempts = job.attempts + 1;
-        const retryable = err.retryable !== false && attempts < MAX_ATTEMPTS;
+        const deliveryUnknown = Boolean(err.deliveryUnknown)
+          || db.prepare('SELECT reply_status FROM contador_jobs WHERE id = ?').get(job.id)?.reply_status === 'delivery_unknown';
+        const retryable = !deliveryUnknown && err.retryable !== false && attempts < MAX_ATTEMPTS;
         db.prepare(`
           UPDATE contador_jobs
           SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
           WHERE id = ?
         `).run(
-          retryable ? 'retry' : 'failed',
+          deliveryUnknown ? 'delivery_unknown' : (retryable ? 'retry' : 'failed'),
           retryable ? nextRetryIso(attempts - 1) : null,
           String(err.message || err).slice(0, 500), nowIso(), job.id
         );
@@ -482,8 +545,14 @@ async function processMonthlySummary(now = new Date()) {
 function recoverInterruptedContadorWork(recoveredAt = nowIso()) {
   db.prepare(`
     UPDATE contador_jobs
+    SET status = 'delivery_unknown', reply_status = 'delivery_unknown', next_attempt_at = NULL,
+        last_error = 'interrupted_during_reply_send', updated_at = ?
+    WHERE status = 'processing' AND reply_status = 'sending'
+  `).run(recoveredAt);
+  db.prepare(`
+    UPDATE contador_jobs
     SET status = 'retry', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
-    WHERE status = 'processing'
+    WHERE status = 'processing' AND (reply_status IS NULL OR reply_status = 'sent')
   `).run(recoveredAt, recoveredAt);
   db.prepare(`
     UPDATE contador_daily_runs

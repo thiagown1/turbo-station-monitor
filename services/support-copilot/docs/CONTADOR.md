@@ -160,7 +160,11 @@ monthly values into the workspace.
   must reconcile that run before retrying, which prefers a visible missing
   closing over a duplicate message;
 - failed model/API work is visible in `contador_jobs` with attempts and a
-  redacted error, and transient failures use bounded backoff.
+  redacted error, and transient failures use bounded backoff. Each job fences
+  its WhatsApp reply before delivery and checkpoints the accepted external
+  message id. A recovered `sent` reply completes without another send; an
+  interruption while `sending` becomes `delivery_unknown` for operator
+  reconciliation instead of risking a duplicate accounting confirmation.
 
 ## Expense receipts and recurrence
 
