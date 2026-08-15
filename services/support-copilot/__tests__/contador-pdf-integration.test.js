@@ -12,6 +12,7 @@ const SERVICE_DIR = path.join(__dirname, '..');
 const GROUP_JID = 'contas-test@g.us';
 const MESSAGE_ID = `wamid-contador-pdf-${process.pid}-${Date.now()}`;
 const RECOVERY_MESSAGE_ID = `${MESSAGE_ID}-recovery`;
+const DIRECT_RECOVERY_MESSAGE_ID = `${MESSAGE_ID}-direct-recovery`;
 const DB_PATH = path.join(os.tmpdir(), `contador-pdf-integration-${process.pid}-${Date.now()}.sqlite`);
 const MEDIA_DIR = path.join(os.tmpdir(), `contador-media-${process.pid}-${Date.now()}`);
 const WEBHOOK_SECRET = 'integration-webhook-secret-not-real';
@@ -183,13 +184,56 @@ function jsonServer(handler) {
     assert.equal((await recovery.json()).duplicate, true);
     await waitUntil(() => intakeCount === 2 && gatewayCount === 2, 8_000);
 
+    const directBootstrap = new Database(DB_PATH);
+    const directNow = new Date().toISOString();
+    directBootstrap.prepare(`
+      INSERT INTO conversations
+        (id, brand_id, channel, customer_phone, status, created_at, updated_at)
+      VALUES ('conv-direct-recovery', 'turbo_station', 'whatsapp', '5511999999999', 'open', ?, ?)
+    `).run(directNow, directNow);
+    directBootstrap.prepare(`
+      INSERT INTO messages
+        (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, sender_id, sender_name, created_at)
+      VALUES ('msg-direct-recovery', 'conv-direct-recovery', 'turbo_station', 'inbound', 'evolution', '[📷 Imagem]', ?, NULL, '5511999999999', 'Cliente', ?)
+    `).run(DIRECT_RECOVERY_MESSAGE_ID, directNow);
+    directBootstrap.close();
+
+    const directPayload = {
+      event: 'messages.upsert',
+      instance: 'turbostation',
+      data: {
+        key: { remoteJid: '5511999999999@s.whatsapp.net', fromMe: false, id: DIRECT_RECOVERY_MESSAGE_ID },
+        pushName: 'Cliente',
+        messageType: 'imageMessage',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: { imageMessage: { caption: 'imagem', mimetype: 'image/jpeg' } },
+        mediaBase64: Buffer.from('direct image fixture').toString('base64'),
+        mediaMimetype: 'image/jpeg',
+      },
+    };
+    const directRecovery = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(directPayload),
+    });
+    assert.equal(directRecovery.status, 200);
+    assert.equal((await directRecovery.json()).duplicate, true);
+    await waitUntil(() => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      const row = probe.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('msg-direct-recovery');
+      probe.close();
+      return row;
+    }, 8_000);
+
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare('SELECT status, attempts FROM contador_jobs WHERE message_id = ?').get(MESSAGE_ID);
     const recoveredJob = database.prepare('SELECT status, attempts FROM contador_jobs WHERE message_id = ?').get(RECOVERY_MESSAGE_ID);
+    const directRecoveryJob = database.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('msg-direct-recovery');
     const outbound = database.prepare("SELECT body, source, delivery_status FROM messages WHERE external_message_id = 'contador-outbound-test-1'").get();
     database.close();
     assert.deepEqual(job, { status: 'completed', attempts: 1 });
     assert.deepEqual(recoveredJob, { status: 'completed', attempts: 1 });
+    assert.ok(directRecoveryJob, 'duplicate one-to-one webhook should recreate its durable media job');
     assert.deepEqual(outbound, { body: 'Conta registrada para a estação teste.', source: 'contador', delivery_status: 'sent' });
     console.log('PASS PDF webhook and duplicate replay both recover durable Contador work');
   } finally {

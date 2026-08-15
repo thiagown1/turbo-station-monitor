@@ -24,8 +24,10 @@ The WhatsApp socket is entirely in this repository:
    completes only after the Contador or suggestion fallback has run. The worker
    recovers jobs interrupted by a PM2 restart. If the process stops after the
    inbound message commit but before that durable media job is created, the
-   provider's duplicate webhook replays the idempotent routing step instead of
-   discarding the attachment as an already-seen message.
+   provider's duplicate webhook replays the idempotent routing step for both
+   groups and one-to-one conversations instead of discarding the attachment as
+   an already-seen message. A one-to-one legacy fallback that returns no
+   description stays retryable rather than completing silently.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.
 6. Outbound replies return through the local gateway and are persisted with
@@ -123,6 +125,9 @@ monthly values into the workspace.
   If the Contador needs one more clarification, its
   next prompt keeps the same draft metadata so the following quoted answer can
   complete only that draft;
+- quoted `EXP-...` expense decisions contain configuration/API failures inside
+  the decision flow and answer with a safe retry instruction; a temporary
+  config outage does not escape the webhook after the inbound message commit;
 - natural-language questions use the read-only tool loop and Claude Opus in a
   persistent OpenClaw session;
 - daily heartbeat queries upcoming bills, open drafts and current-month

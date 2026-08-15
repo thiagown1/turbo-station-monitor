@@ -751,6 +751,19 @@ router.post('/', async (req, res) => {
   if (externalMessageId) {
     const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
     if (dup) {
+      if (direction === 'inbound' && media && ['image', 'document'].includes(media.media_type)) {
+        const { routeInboundMessageDurably } = require('../lib/agent-router');
+        routeInboundMessageDurably({
+          messageId: dup.id,
+          externalMessageId,
+          conversationId,
+          brandId,
+          senderId: normalizedPhone,
+          body,
+          media,
+          receivedAt: now,
+        }).catch(err => console.warn(`${LOG_TAG} duplicate direct media recovery failed for ${dup.id}:`, err.message));
+      }
       return res.json({ id: dup.id, conversationId, duplicate: true });
     }
 

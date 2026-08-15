@@ -253,19 +253,18 @@ async function deliverSkippedMediaFallback(input) {
     const description = await processMedia(mediaFilePath, input.media?.media_type, {
       conversationContext: recentContext(input.conversationId),
     });
-    if (description) {
-      const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
-      if (!current) throw new Error('durable_media_fallback_message_missing');
-      db.prepare('UPDATE messages SET body = ? WHERE id = ?')
-        .run(`${current.body} ${description}`, input.messageId);
-      const { emitEvent } = require('./sse');
-      emitEvent({
-        type: 'message_update',
-        conversationId: input.conversationId,
-        messageId: input.messageId,
-        brandId: input.brandId,
-      });
-    }
+    if (!description) throw new Error('durable_media_fallback_empty_result');
+    const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
+    if (!current) throw new Error('durable_media_fallback_message_missing');
+    db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+      .run(`${current.body} ${description}`, input.messageId);
+    const { emitEvent } = require('./sse');
+    emitEvent({
+      type: 'message_update',
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      brandId: input.brandId,
+    });
     return { handled: true, contadorEnqueued: false };
   }
   const { createGroupSuggestion } = require('./auto-suggest');
@@ -327,15 +326,15 @@ async function routeExpenseDecisionReply(input) {
   const amountCents = parseExpenseBrlAmount(input.body);
   const action = amountCents ? 'set_brl_amount' : parseExpenseDecision(input.body);
   if (!codeMatch || !action) return { handled: false };
-  const config = await loadConfig(input.brandId);
-  if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
-    return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
-  }
-  if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
-    || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
-    return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
-  }
   try {
+    const config = await loadConfig(input.brandId);
+    if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
+      return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
+    }
+    if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
+      || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
+      return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
+    }
     const res = await fetch(`${baseUrl()}/api/agents/expense-decisions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },

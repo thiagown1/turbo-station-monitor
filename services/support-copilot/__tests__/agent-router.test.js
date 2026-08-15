@@ -111,9 +111,15 @@ test('requires the cited expense code and an allowlisted sender before posting a
         const missingQuote = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'sem codigo', messageId: 'm1' });
         const denied = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511888888888', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm2' });
         const allowed = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: 'registrar recorrente', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm3' });
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) throw new Error('temporary config timeout');
+          throw new Error('unexpected URL ' + url);
+        };
+        const unavailable = await router.routeExpenseDecisionReply({ brandId: 'uncached_brand', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm4' });
         if (missingQuote.handled) throw new Error('uncited reply was handled');
         if (!denied.handled || !denied.reply.includes('não está autorizado')) throw new Error('unauthorized sender not blocked');
         if (!allowed.handled || decisionCalls !== 1) throw new Error('allowed decision not posted exactly once');
+        if (!unavailable.handled || !unavailable.reply.includes('Tente novamente')) throw new Error('config outage escaped the decision flow');
         console.log('agent-decision-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -277,6 +283,7 @@ test('caps durable media retries and performs skipped fallback before completion
         let contadorCalls = 0;
         let mediaCalls = 0;
         let emitted = 0;
+        let mediaDescription = '[descrição recuperada]';
         require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
           enqueueContadorMessage: (event) => {
             if (!event.groupJid) return { kind: 'ignored', enqueued: false };
@@ -285,7 +292,7 @@ test('caps durable media retries and performs skipped fallback before completion
           },
         } };
         require.cache[require.resolve('./lib/media-processor')] = { exports: {
-          processMedia: async () => { mediaCalls++; return '[descrição recuperada]'; },
+          processMedia: async () => { mediaCalls++; return mediaDescription; },
         } };
         require.cache[require.resolve('./lib/sse')] = { exports: {
           emitEvent: () => { emitted++; },
@@ -331,6 +338,23 @@ test('caps durable media retries and performs skipped fallback before completion
         if (!direct.fallbackHandled || directJob.status !== 'completed') throw new Error('one-to-one durable fallback was not completed');
         if (mediaCalls !== 1 || emitted !== 1 || !directMessage.body.includes('descrição recuperada')) {
           throw new Error('one-to-one durable fallback did not enrich the message');
+        }
+
+        mediaDescription = null;
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-empty', 'conv-direct', 'turbo_station', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct-empty', ?)` + "`" + `).run(nowIso());
+        let emptyFailed = false;
+        try {
+          await router.routeInboundMessageDurably({
+            messageId: 'direct-empty', externalMessageId: 'wa-direct-empty', conversationId: 'conv-direct', brandId: 'turbo_station',
+            senderId: '5511999999999', body: '[📷 Imagem]', receivedAt: nowIso(),
+            media: { media_type: 'image', url: '/api/support/media/direct-empty.jpg' },
+          });
+        } catch (_) { emptyFailed = true; }
+        const emptyJob = db.prepare('SELECT status, attempts, last_error FROM agent_media_jobs WHERE message_id = ?').get('direct-empty');
+        if (!emptyFailed || emptyJob.status !== 'retry' || emptyJob.attempts !== 1 || !emptyJob.last_error.includes('empty_result')) {
+          throw new Error('empty one-to-one fallback was not kept retryable');
         }
         console.log('agent-terminal-retry-ok');
       })().catch(e => { console.error(e); process.exit(1); });
