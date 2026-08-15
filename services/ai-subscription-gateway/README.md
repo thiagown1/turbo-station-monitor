@@ -17,9 +17,13 @@ ChatGPT subscription (via the `codex` runtime):
 - `codex-5-6-terra` -> `ai_dashboard_codex` -> GPT-5.6 Terra;
 - `codex-5-6-luna` -> `ai_dashboard_codex` -> GPT-5.6 Luna.
 
-> **Status (2026-08-15).** The Claude path is verified working on the VPS: a
-> gateway agent turn with `claude-cli/claude-sonnet-4-6` returns
-> `provider: claude-cli` and reports real subscription usage. The Codex path is
+> **Status (2026-08-15).** The Claude path is verified working on the VPS.
+> Gateway agent turns with `claude-cli/claude-sonnet-4-6`,
+> `claude-cli/claude-opus-4-8`, and `claude-cli/claude-opus-4-6` all return
+> `provider: claude-cli` and report real subscription usage.
+> `claude-cli/claude-sonnet-5` and `claude-cli/claude-opus-4-7` are outside the
+> *configured* catalog on this box, so they resolve only for an agent whose
+> definition lists them explicitly — see the `models` map below. The Codex path is
 > **not** verified. Two open items block it:
 >
 > 1. The ChatGPT plan hit its usage limit on 2026-08-15 and does not reset
@@ -87,9 +91,18 @@ boundary.
         name: "Dashboard Claude Read Only",
         workspace: "/home/openclaw/.openclaw/workspace/turbo_station",
         model: { primary: "claude-cli/claude-sonnet-4-6" },
-        // Every model the dashboard picker can select must be pinned to the
-        // claude-cli runtime, or the override falls back to the metered
-        // anthropic/* API instead of the Max subscription.
+        // REQUIRED, not decorative. An agent with no explicit model allowlist
+        // falls back to `allowAny`, whose allowed set is the *configured*
+        // catalog only. On this VPS that covers sonnet-4-6, opus-4-8, and
+        // opus-4-6 but NOT sonnet-5 or opus-4-7, so two of the five picker
+        // options would fail with:
+        //   Model override "claude-cli/claude-sonnet-5" is not allowed for agent ...
+        // Listing them here fixes that: buildAllowedModelSet treats explicit
+        // allowlist entries as always trusted, even when the bundled catalog
+        // is stale (src/agents/model-selection.ts).
+        //
+        // Pinning agentRuntime to claude-cli also keeps each model on the Max
+        // subscription; an anthropic/* slug would bill the metered API.
         models: {
           "claude-cli/claude-sonnet-4-6": { agentRuntime: { id: "claude-cli" } },
           "claude-cli/claude-sonnet-5": { agentRuntime: { id: "claude-cli" } },
