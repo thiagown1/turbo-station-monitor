@@ -9,6 +9,12 @@ const allowedAgentIds = new Set(
     .map((value) => value.trim())
     .filter(Boolean),
 );
+const allowedModels = new Set(
+  String(process.env.AI_SUBSCRIPTION_ALLOWED_MODELS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean),
+);
 
 let input = '';
 for await (const chunk of process.stdin) {
@@ -18,6 +24,7 @@ for await (const chunk of process.stdin) {
 
 const payload = JSON.parse(input || '{}');
 if (!allowedAgentIds.has(payload.agentId)) throw new Error('agent id not allowed');
+if (!allowedModels.has(payload.model)) throw new Error('model not allowed');
 if (typeof payload.message !== 'string' || !payload.message.trim()) throw new Error('empty message');
 
 const gatewayModule = pathToFileURL(`${sourceRoot}/src/gateway/call.ts`).href;
@@ -28,6 +35,7 @@ const response = await callGateway({
   params: {
     message: payload.message,
     agentId: payload.agentId,
+    model: payload.model,
     sessionId: payload.sessionId,
     idempotencyKey: payload.sessionId,
     timeout: Math.ceil(timeoutMs / 1000),
@@ -37,4 +45,3 @@ const response = await callGateway({
 });
 
 process.stdout.write(JSON.stringify(response));
-
