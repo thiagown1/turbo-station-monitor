@@ -368,7 +368,7 @@ router.post('/', async (req, res) => {
     if (externalMessageId) {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
-        if (direction === 'inbound' && media && ['image', 'document'].includes(media.media_type)) {
+        if (direction === 'inbound') {
           const quoted = quotedOutboundMessage(message, conversationId);
           const contadorEvent = {
             messageId: externalMessageId,
@@ -386,7 +386,7 @@ router.post('/', async (req, res) => {
           };
           if (isQuotedContadorDraftReply(contadorEvent)) {
             enqueueContadorMessage(contadorEvent);
-          } else {
+          } else if (media && ['image', 'document'].includes(media.media_type)) {
             const { routeInboundMessageDurably } = require('../lib/agent-router');
             routeInboundMessageDurably({
               messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
@@ -535,10 +535,6 @@ router.post('/', async (req, res) => {
             // The router committed the Contador job in the same SQLite
             // transaction as the classification. Nothing remains to enqueue in
             // this post-response callback.
-          } else if (result?.kind === 'support_attention' || result?.kind === 'other') {
-            // The normal support copilot adds a richer suggestion while the
-            // central run keeps the classification/history/cost audit.
-            scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
           }
         }).catch(err => {
           console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message);

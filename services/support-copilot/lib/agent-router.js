@@ -272,6 +272,15 @@ async function deliverSkippedMediaFallback(input) {
   return { handled: true, contadorEnqueued: false };
 }
 
+async function deliverSuccessfulGroupHandoff(input, result) {
+  if (!input.groupJid || !['support_attention', 'other'].includes(result?.kind)) {
+    return { handled: false };
+  }
+  const { createGroupSuggestion } = require('./auto-suggest');
+  await createGroupSuggestion(input.conversationId, input.brandId);
+  return { handled: true };
+}
+
 async function processMediaJob(messageId) {
   const claimed = db.prepare(`UPDATE agent_media_jobs
     SET status = 'processing', attempts = attempts + 1, updated_at = ?
@@ -285,9 +294,17 @@ async function processMediaJob(messageId) {
     const result = await routeInboundMessage(input);
     if (result?.status === 'error') throw new Error(result.error || 'media_classification_failed');
     const fallback = result?.skipped ? await deliverSkippedMediaFallback(input) : { handled: false };
+    const supportHandoff = result?.skipped
+      ? { handled: false }
+      : await deliverSuccessfulGroupHandoff(input, result);
     db.prepare("UPDATE agent_media_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE message_id = ?")
       .run(nowIso(), messageId);
-    return { ...result, fallbackHandled: fallback.handled === true, contadorFallbackEnqueued: fallback.contadorEnqueued === true };
+    return {
+      ...result,
+      fallbackHandled: fallback.handled === true,
+      contadorFallbackEnqueued: fallback.contadorEnqueued === true,
+      supportHandoffHandled: supportHandoff.handled === true,
+    };
   } catch (error) {
     const attempts = Number(row.attempts || 1);
     const retryable = attempts < MEDIA_JOB_MAX_ATTEMPTS;

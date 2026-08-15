@@ -21,12 +21,15 @@ The WhatsApp socket is entirely in this repository:
    job without another paid model call. Configuration fetch failures and model
    failures remain retryable; they do not create an extraction-less Contador
    job. Media work stops after five failed attempts. Explicitly skipped work
-   completes only after the Contador or suggestion fallback has run. The worker
-   recovers jobs interrupted by a PM2 restart. If the process stops after the
+   completes only after the Contador or suggestion fallback has run. Successful
+   `support_attention`/`other` group work also completes only after its richer
+   support suggestion handoff has run. The worker recovers jobs interrupted by
+   a PM2 restart. If the process stops after the
    inbound message commit but before that durable media job is created, the
    provider's duplicate webhook replays the idempotent routing step for both
-   groups and one-to-one conversations instead of discarding the attachment as
-   an already-seen message. A one-to-one legacy fallback that returns no
+   groups and one-to-one conversations instead of discarding the attachment or
+   a quoted Contador draft correction as an already-seen message. A one-to-one
+   legacy fallback that returns no
    description stays retryable rather than completing silently.
 5. PDF/structured-photo registration, draft completion and all accounting reads go through the Turbo Station Next
    APIs. The VPS never reads or writes Firestore directly.

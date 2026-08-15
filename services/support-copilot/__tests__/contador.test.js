@@ -534,6 +534,28 @@ test('monthly summary closes the previous month and stays silent without trusted
   assert.equal((await quiet.monthlySummary(new Date('2026-01-03T12:00:00Z'))).status, 'silent');
 });
 
+test('monthly summary accepts only explicit silence and retries malformed model output', async () => {
+  const buildMonthly = (agentOutput) => buildContador({
+    config, readMedia: async () => Buffer.alloc(0), intake: async () => ({}), loadContext: async () => [],
+    sendReply: async () => { throw new Error('must not send'); },
+    runAgent: async () => agentOutput,
+    queryTool: async (tool) => {
+      if (tool === 'resumo_contabil') return { totalRevenueCents: 100000 };
+      if (tool === 'drafts_abertos') return { count: 0, drafts: [] };
+      return {};
+    },
+  });
+
+  const explicitSilent = buildMonthly(JSON.stringify({ action: 'silent' }));
+  assert.equal((await explicitSilent.monthlySummary(new Date('2026-08-03T12:00:00Z'))).status, 'silent');
+
+  const malformed = buildMonthly('not valid JSON');
+  await assert.rejects(
+    malformed.monthlySummary(new Date('2026-08-03T12:00:00Z')),
+    /monthly.*invalid/i,
+  );
+});
+
 test('agent instructions reject unknown tools and malformed replies', () => {
   assert.deepEqual(parseAgentInstruction('{"action":"tool","tool":"drop_database","params":{}}'), { action: 'invalid' });
   assert.deepEqual(parseAgentInstruction('not json'), { action: 'invalid' });

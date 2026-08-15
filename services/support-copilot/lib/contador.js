@@ -483,7 +483,8 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       JSON.stringify(results),
     ].join('\n');
     const instruction = parseAgentInstruction(await runAgent(prompt));
-    if (instruction.action !== 'reply') return { status: 'silent', period };
+    if (instruction.action === 'silent') return { status: 'silent', period };
+    if (instruction.action !== 'reply') throw new Error('contador_monthly_invalid_instruction');
     const replyText = redactForModel(instruction.text);
     if (typeof hooks.beforeSend === 'function') await hooks.beforeSend({ text: replyText, period });
     await sendReply(replyText, { kind: 'monthly_summary', groupJid: config.groupConversationId });

@@ -13,6 +13,8 @@ const GROUP_JID = 'contas-test@g.us';
 const MESSAGE_ID = `wamid-contador-pdf-${process.pid}-${Date.now()}`;
 const RECOVERY_MESSAGE_ID = `${MESSAGE_ID}-recovery`;
 const DIRECT_RECOVERY_MESSAGE_ID = `${MESSAGE_ID}-direct-recovery`;
+const DRAFT_RECOVERY_MESSAGE_ID = `${MESSAGE_ID}-draft-recovery`;
+const DRAFT_PROMPT_EXTERNAL_ID = `${MESSAGE_ID}-draft-prompt`;
 const DB_PATH = path.join(os.tmpdir(), `contador-pdf-integration-${process.pid}-${Date.now()}.sqlite`);
 const MEDIA_DIR = path.join(os.tmpdir(), `contador-media-${process.pid}-${Date.now()}`);
 const WEBHOOK_SECRET = 'integration-webhook-secret-not-real';
@@ -225,14 +227,72 @@ function jsonServer(handler) {
       return row;
     }, 8_000);
 
+    const draftBootstrap = new Database(DB_PATH);
+    const draftNow = new Date().toISOString();
+    draftBootstrap.prepare(`
+      INSERT INTO messages
+        (id, conversation_id, brand_id, direction, source, body, external_message_id, media_json, delivery_status, created_at)
+      VALUES (?, ?, ?, 'outbound', 'contador', ?, ?, ?, 'sent', ?)
+    `).run(
+      `msg-draft-prompt-${Date.now()}`,
+      original.conversation_id,
+      original.brand_id,
+      'De qual estação é essa conta?',
+      DRAFT_PROMPT_EXTERNAL_ID,
+      JSON.stringify({ contador: { kind: 'draft_prompt', draftId: 'rcpt_recovery_test' } }),
+      draftNow,
+    );
+    draftBootstrap.prepare(`
+      INSERT INTO messages
+        (id, conversation_id, brand_id, direction, source, body, external_message_id, sender_id, sender_name, created_at)
+      VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?)
+    `).run(
+      `msg-draft-recovery-${Date.now()}`,
+      original.conversation_id,
+      original.brand_id,
+      '[Financeiro]: é do Galois',
+      DRAFT_RECOVERY_MESSAGE_ID,
+      '556299999999',
+      'Financeiro',
+      draftNow,
+    );
+    draftBootstrap.close();
+
+    const draftRecoveryPayload = {
+      event: 'messages.upsert',
+      instance: 'turbostation',
+      data: {
+        key: { remoteJid: GROUP_JID, fromMe: false, id: DRAFT_RECOVERY_MESSAGE_ID, participant: '556299999999@s.whatsapp.net' },
+        pushName: 'Financeiro',
+        messageType: 'extendedTextMessage',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: { extendedTextMessage: { text: 'é do Galois', contextInfo: { stanzaId: DRAFT_PROMPT_EXTERNAL_ID } } },
+      },
+    };
+    const draftRecovery = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(draftRecoveryPayload),
+    });
+    assert.equal(draftRecovery.status, 200);
+    assert.equal((await draftRecovery.json()).duplicate, true);
+    await waitUntil(() => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      const row = probe.prepare('SELECT status FROM contador_jobs WHERE message_id = ?').get(DRAFT_RECOVERY_MESSAGE_ID);
+      probe.close();
+      return row;
+    }, 8_000);
+
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare('SELECT status, attempts FROM contador_jobs WHERE message_id = ?').get(MESSAGE_ID);
     const recoveredJob = database.prepare('SELECT status, attempts FROM contador_jobs WHERE message_id = ?').get(RECOVERY_MESSAGE_ID);
+    const recoveredDraftJob = database.prepare('SELECT kind FROM contador_jobs WHERE message_id = ?').get(DRAFT_RECOVERY_MESSAGE_ID);
     const directRecoveryJob = database.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('msg-direct-recovery');
     const outbound = database.prepare("SELECT body, source, delivery_status FROM messages WHERE external_message_id = 'contador-outbound-test-1'").get();
     database.close();
     assert.deepEqual(job, { status: 'completed', attempts: 1 });
     assert.deepEqual(recoveredJob, { status: 'completed', attempts: 1 });
+    assert.deepEqual(recoveredDraftJob, { kind: 'query' });
     assert.ok(directRecoveryJob, 'duplicate one-to-one webhook should recreate its durable media job');
     assert.deepEqual(outbound, { body: 'Conta registrada para a estação teste.', source: 'contador', delivery_status: 'sent' });
     console.log('PASS PDF webhook and duplicate replay both recover durable Contador work');

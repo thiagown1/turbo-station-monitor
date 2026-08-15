@@ -284,6 +284,13 @@ test('caps durable media retries and performs skipped fallback before completion
         let mediaCalls = 0;
         let emitted = 0;
         let mediaDescription = '[descrição recuperada]';
+        let suggestionCalls = 0;
+        require.cache[require.resolve('./lib/agent-media-classifier')] = { exports: {
+          classifyMessage: async () => ({ status: 'ok', kind: 'support_attention', summary: 'revisar com suporte', confidence: 0.9 }),
+        } };
+        require.cache[require.resolve('./lib/auto-suggest')] = { exports: {
+          createGroupSuggestion: async () => { suggestionCalls++; return { text: 'sugestão recuperada' }; },
+        } };
         require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
           enqueueContadorMessage: (event) => {
             if (!event.groupJid) return { kind: 'ignored', enqueued: false };
@@ -323,6 +330,30 @@ test('caps durable media retries and performs skipped fallback before completion
         const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('media-skipped');
         if (!skipped.fallbackHandled || !skipped.contadorFallbackEnqueued || contadorCalls !== 1) throw new Error('skipped fallback was not delivered');
         if (completed.status !== 'completed') throw new Error('skipped media job was not completed after fallback');
+
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: {
+            enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv-recovery'],
+            agents: { accounting: true },
+          } }) };
+          if (String(url).includes('/api/agents/events')) return { ok: true, status: 202, text: async () => '{}' };
+          throw new Error('unexpected URL ' + url);
+        };
+        const recoveryInput = {
+          messageId: 'media-success-recovery', externalMessageId: 'wa-success-recovery',
+          conversationId: 'conv-recovery', brandId: 'recovery_brand', groupJid: 'grupo-recovery@g.us',
+          body: '[📷 Imagem]', receivedAt: nowIso(), media: { media_type: 'image', url: '/api/support/media/recovery.jpg' },
+        };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 1, ?, ?, ?)` + "`" + `).run(
+            recoveryInput.messageId, JSON.stringify(recoveryInput), nowIso(), nowIso(), nowIso(),
+          );
+        await router.deliverDueMediaJobs();
+        const recovered = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(recoveryInput.messageId);
+        if (recovered.status !== 'completed' || suggestionCalls !== 1) {
+          throw new Error('successful recovered group media did not complete its support handoff');
+        }
 
         const insertedAt = nowIso();
         db.prepare(` + "`" + `INSERT INTO messages
