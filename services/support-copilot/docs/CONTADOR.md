@@ -147,7 +147,10 @@ monthly values into the workspace.
 - immediately before the external WhatsApp request, the monthly ledger moves
   from `processing` to `sending`. If the process stops or the request result is
   ambiguous after that fence, startup records `delivery_unknown`, does not
-  automatically resend, and does not overtake it with later months. An operator
+  automatically resend, and does not overtake it with later months. An HTTP 4xx
+  response from Evolution is a definitive rejection before acceptance, so the
+  run returns to `failed` and follows the persisted retry backoff. Missing HTTP
+  responses and transport interruptions remain `delivery_unknown`; an operator
   must reconcile that run before retrying, which prefers a visible missing
   closing over a duplicate message;
 - failed model/API work is visible in `contador_jobs` with attempts and a

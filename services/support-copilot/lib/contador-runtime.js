@@ -245,6 +245,11 @@ function monthlyRetryIso(attempts, now = new Date()) {
   return new Date(now.getTime() + hours * 60 * 60_000).toISOString();
 }
 
+function isDefinitiveEvolutionRejection(err) {
+  const statusCode = Number(err?.statusCode);
+  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode < 500;
+}
+
 let workerBusy = false;
 async function processPendingJobs() {
   if (!configured() || workerBusy) return;
@@ -456,7 +461,7 @@ async function processMonthlySummary(now = new Date()) {
           .run(result.status === 'sent' ? 'sent' : 'silent', nowIso(), runMonth);
       } catch (err) {
         const attempt = db.prepare('SELECT status, attempts FROM contador_monthly_runs WHERE run_month = ?').get(runMonth);
-        const deliveryUnknown = attempt?.status === 'sending';
+        const deliveryUnknown = attempt?.status === 'sending' && !isDefinitiveEvolutionRejection(err);
         db.prepare(`UPDATE contador_monthly_runs SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ? WHERE run_month = ?`)
           .run(
             deliveryUnknown ? 'delivery_unknown' : 'failed',

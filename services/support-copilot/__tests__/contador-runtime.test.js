@@ -11,6 +11,7 @@ const dbPath = path.join(os.tmpdir(), `support-copilot-contador-runtime-${proces
 const backfillDbPath = `${dbPath}-backfill`;
 const baselineDbPath = `${dbPath}-baseline`;
 const retryDbPath = `${dbPath}-retry`;
+const sendFailureDbPath = `${dbPath}-send-failure`;
 const deliveryDbPath = `${dbPath}-delivery`;
 
 try {
@@ -156,6 +157,69 @@ try {
   });
   console.log('PASS Contador monthly retries respect persisted backoff');
 
+  const sendFailureOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      let calls = 0;
+      runtime._setContadorForTest({
+        heartbeat: async () => ({ status: 'silent' }),
+        monthlySummary: async (_runDate, hooks) => {
+          calls += 1;
+          await hooks.beforeSend();
+          if (calls === 1) {
+            const rejected = new Error('Evolution rejected the request');
+            rejected.statusCode = 401;
+            throw rejected;
+          }
+          throw new Error('socket closed without a response');
+        },
+      });
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:00:00.000Z'));
+      const rejected = db.prepare(` + "`" + `
+        SELECT status, attempts, next_attempt_at, last_error
+        FROM contador_monthly_runs WHERE run_month = '2026-08'
+      ` + "`" + `).get();
+      await runtime.processMonthlySummary(new Date('2026-08-03T11:15:00.000Z'));
+      await runtime.processMonthlySummary(new Date('2026-08-03T12:00:00.000Z'));
+      const ambiguous = db.prepare(` + "`" + `
+        SELECT status, attempts, next_attempt_at, last_error
+        FROM contador_monthly_runs WHERE run_month = '2026-08'
+      ` + "`" + `).get();
+      await runtime.processMonthlySummary(new Date('2026-08-03T16:00:00.000Z'));
+      process.stdout.write(JSON.stringify({ calls, rejected, ambiguous }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: sendFailureDbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_HEARTBEAT_HOUR: '8',
+      CONTADOR_MONTHLY_DAY: '3',
+    },
+    encoding: 'utf8',
+  });
+  const sendFailure = JSON.parse(sendFailureOutput.slice(sendFailureOutput.lastIndexOf('\n') + 1));
+  assert.deepEqual(sendFailure.rejected, {
+    status: 'failed',
+    attempts: 1,
+    next_attempt_at: '2026-08-03T12:00:00.000Z',
+    last_error: 'Evolution rejected the request',
+  });
+  assert.deepEqual(sendFailure.ambiguous, {
+    status: 'delivery_unknown',
+    attempts: 2,
+    next_attempt_at: null,
+    last_error: 'socket closed without a response',
+  });
+  assert.equal(sendFailure.calls, 2);
+  console.log('PASS Contador retries definitive monthly send rejections and fences ambiguous transport failures');
+
   const backfillOutput = execFileSync(process.execPath, ['-e', `
     (async () => {
       const runtime = require('./lib/contador-runtime');
@@ -290,7 +354,7 @@ try {
   }]);
   console.log('PASS Contador monthly recovery fails closed after an ambiguous send');
 } finally {
-  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, deliveryDbPath]) {
+  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }
