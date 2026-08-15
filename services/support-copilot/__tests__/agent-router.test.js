@@ -285,11 +285,18 @@ test('caps durable media retries and performs skipped fallback before completion
         let emitted = 0;
         let mediaDescription = '[descrição recuperada]';
         let suggestionCalls = 0;
+        const suggestionSources = new Set();
         require.cache[require.resolve('./lib/agent-media-classifier')] = { exports: {
           classifyMessage: async () => ({ status: 'ok', kind: 'support_attention', summary: 'revisar com suporte', confidence: 0.9 }),
         } };
         require.cache[require.resolve('./lib/auto-suggest')] = { exports: {
-          createGroupSuggestion: async () => { suggestionCalls++; return { text: 'sugestão recuperada' }; },
+          createGroupSuggestion: async (_conversationId, _brandId, options = {}) => {
+            if (!options.sourceMessageId) throw new Error('durable suggestion source id missing');
+            if (suggestionSources.has(options.sourceMessageId)) return { text: 'sugestão recuperada', duplicate: true };
+            suggestionSources.add(options.sourceMessageId);
+            suggestionCalls++;
+            return { text: 'sugestão recuperada' };
+          },
         } };
         require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
           enqueueContadorMessage: (event) => {
@@ -354,6 +361,10 @@ test('caps durable media retries and performs skipped fallback before completion
         if (recovered.status !== 'completed' || suggestionCalls !== 1) {
           throw new Error('successful recovered group media did not complete its support handoff');
         }
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), recoveryInput.messageId);
+        await router.deliverDueMediaJobs();
+        if (suggestionCalls !== 1) throw new Error('recovered group handoff was not idempotent');
 
         const directSuccessAt = nowIso();
         db.prepare(` + "`" + `INSERT INTO messages
@@ -394,11 +405,20 @@ test('caps durable media retries and performs skipped fallback before completion
           senderId: '5511999999999', body: '[📷 Imagem]', receivedAt: insertedAt,
           media: { media_type: 'image', url: '/api/support/media/direct.jpg' },
         });
-        const directJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('direct-media');
+        const directJob = db.prepare('SELECT status, fallback_applied_at FROM agent_media_jobs WHERE message_id = ?').get('direct-media');
         const directMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
-        if (!direct.fallbackHandled || directJob.status !== 'completed') throw new Error('one-to-one durable fallback was not completed');
+        if (!direct.fallbackHandled || directJob.status !== 'completed' || !directJob.fallback_applied_at) throw new Error('one-to-one durable fallback was not completed');
         if (mediaCalls !== 1 || emitted !== emittedAfterDirectSuccess + 1 || !directMessage.body.includes('descrição recuperada')) {
           throw new Error('one-to-one durable fallback did not enrich the message');
+        }
+        const emittedAfterDirectFallback = emitted;
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), 'direct-media');
+        await router.deliverDueMediaJobs();
+        const replayedDirectMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
+        if (mediaCalls !== 1 || emitted !== emittedAfterDirectFallback
+          || replayedDirectMessage.body.split('descrição recuperada').length - 1 !== 1) {
+          throw new Error('one-to-one skipped fallback was not idempotent');
         }
 
         mediaDescription = null;
@@ -421,6 +441,40 @@ test('caps durable media retries and performs skipped fallback before completion
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     assert.ok(output.includes('agent-terminal-retry-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('deduplicates group suggestions by durable source message id', () => {
+  const dbPath = path.join(os.tmpdir(), `group-suggestion-source-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        let modelCalls = 0;
+        require.cache[require.resolve('./lib/copilot')] = { exports: {
+          generateSuggestion: async () => {
+            modelCalls++;
+            return { text: 'Sugestão única', model: 'test-model' };
+          },
+        } };
+        require.cache[require.resolve('./lib/sse')] = { exports: { emitEvent: () => {} } };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        db.prepare("INSERT INTO conversations (id, brand_id, channel, customer_phone, status, created_at, updated_at) VALUES ('conv-source','turbo_station','whatsapp-group','group@g.us','open',?,?)").run(now, now);
+        db.prepare("INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at) VALUES ('msg-source','conv-source','turbo_station','inbound','evolution','ajuda','wa-source',?)").run(now);
+        const { createGroupSuggestion } = require('./lib/auto-suggest');
+        const first = await createGroupSuggestion('conv-source', 'turbo_station', { sourceMessageId: 'msg-source' });
+        const second = await createGroupSuggestion('conv-source', 'turbo_station', { sourceMessageId: 'msg-source' });
+        const rows = db.prepare('SELECT id, source_message_id FROM suggestions WHERE source_message_id = ?').all('msg-source');
+        if (!first?.suggestionId || !second?.duplicate || rows.length !== 1 || modelCalls !== 1) {
+          throw new Error('group suggestion source dedup failed');
+        }
+        console.log('group-suggestion-source-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('group-suggestion-source-ok'));
   } finally {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
   }

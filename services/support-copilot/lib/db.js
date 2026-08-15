@@ -72,6 +72,7 @@ try {
       status TEXT NOT NULL DEFAULT 'pending',
       suggestion_text TEXT NOT NULL,
       model_name TEXT,
+      source_message_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       decided_by TEXT,
@@ -121,6 +122,12 @@ safeAddColumn('conversations', 'escalated_at', 'TEXT DEFAULT NULL');
 safeAddColumn('conversations', 'escalated_to', 'TEXT DEFAULT NULL');
 // Learning from edits
 safeAddColumn('suggestions', 'edited_text', 'TEXT DEFAULT NULL');
+safeAddColumn('suggestions', 'source_message_id', 'TEXT DEFAULT NULL');
+try {
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestions_source_message ON suggestions(source_message_id) WHERE source_message_id IS NOT NULL');
+} catch (err) {
+  console.warn(`${LOG_TAG} suggestions source-message migration:`, err.message);
+}
 
 // Session context tracking — remembers what was sent to the agent to avoid repeating
 try {
@@ -430,6 +437,7 @@ try {
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at TEXT NOT NULL,
       last_error TEXT,
+      fallback_applied_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -456,6 +464,7 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} agent router migration:`, err.message);
 }
+safeAddColumn('agent_media_jobs', 'fallback_applied_at', 'TEXT DEFAULT NULL');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

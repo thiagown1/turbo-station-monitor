@@ -265,6 +265,10 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         }
         const monthlyCols = check.prepare("PRAGMA table_info('contador_monthly_runs')").all().map(r => r.name);
         if (!monthlyCols.includes('next_attempt_at')) throw new Error('contador_monthly_runs.next_attempt_at column missing');
+        const mediaJobCols = check.prepare("PRAGMA table_info('agent_media_jobs')").all().map(r => r.name);
+        if (!mediaJobCols.includes('fallback_applied_at')) throw new Error('agent_media_jobs.fallback_applied_at column missing');
+        const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
+        if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
         `,
       ],
       {

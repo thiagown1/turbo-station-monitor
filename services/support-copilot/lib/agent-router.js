@@ -242,6 +242,8 @@ async function deliverSkippedMediaFallback(input) {
   const contadorRoute = enqueueContadorMessage(contadorEvent);
   if (contadorRoute.kind !== 'ignored') return { handled: true, contadorEnqueued: contadorRoute.enqueued === true };
   if (!input.groupJid) {
+    const checkpoint = db.prepare('SELECT fallback_applied_at FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+    if (checkpoint?.fallback_applied_at) return { handled: true, contadorEnqueued: false };
     const rawUrl = String(input.media?.url || '');
     const filename = path.basename(rawUrl);
     const mediaRoot = path.resolve(MEDIA_DIR);
@@ -256,8 +258,13 @@ async function deliverSkippedMediaFallback(input) {
     if (!description) throw new Error('durable_media_fallback_empty_result');
     const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
     if (!current) throw new Error('durable_media_fallback_message_missing');
-    db.prepare('UPDATE messages SET body = ? WHERE id = ?')
-      .run(`${current.body} ${description}`, input.messageId);
+    const appliedAt = nowIso();
+    db.transaction(() => {
+      db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+        .run(`${current.body} ${description}`, input.messageId);
+      db.prepare('UPDATE agent_media_jobs SET fallback_applied_at = ?, updated_at = ? WHERE message_id = ?')
+        .run(appliedAt, appliedAt, input.messageId);
+    })();
     const { emitEvent } = require('./sse');
     emitEvent({
       type: 'message_update',
@@ -268,7 +275,7 @@ async function deliverSkippedMediaFallback(input) {
     return { handled: true, contadorEnqueued: false };
   }
   const { createGroupSuggestion } = require('./auto-suggest');
-  await createGroupSuggestion(input.conversationId, input.brandId);
+  await createGroupSuggestion(input.conversationId, input.brandId, { sourceMessageId: input.messageId });
   return { handled: true, contadorEnqueued: false };
 }
 
@@ -277,7 +284,7 @@ async function deliverSuccessfulGroupHandoff(input, result) {
     return { handled: false };
   }
   const { createGroupSuggestion } = require('./auto-suggest');
-  await createGroupSuggestion(input.conversationId, input.brandId);
+  await createGroupSuggestion(input.conversationId, input.brandId, { sourceMessageId: input.messageId });
   return { handled: true };
 }
 
