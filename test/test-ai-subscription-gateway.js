@@ -38,13 +38,34 @@ function post(baseUrl, body, token = 'test-secret') {
 
 test('curated profiles pin the only permitted OpenClaw agents and upstream models', () => {
   assert.deepEqual(Object.keys(CURATED_PROFILES).sort(), [
+    'claude-opus-4-6',
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-sonnet-5',
     'claude-subscription',
     'codex-5-6-luna',
     'codex-5-6-sol',
     'codex-5-6-terra',
   ]);
-  assert.equal(CURATED_PROFILES['claude-subscription'].agentId, 'ai_dashboard_claude');
-  assert.equal(CURATED_PROFILES['claude-subscription'].model, 'claude-cli/claude-sonnet-4-6');
+  assert.deepEqual(
+    [
+      'claude-subscription',
+      'claude-sonnet-5',
+      'claude-opus-4-8',
+      'claude-opus-4-7',
+      'claude-opus-4-6',
+    ].map((profile) => ({
+      agentId: CURATED_PROFILES[profile].agentId,
+      model: CURATED_PROFILES[profile].model,
+    })),
+    [
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-sonnet-4-6' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-sonnet-5' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-8' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-7' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-6' },
+    ],
+  );
   assert.deepEqual(
     ['codex-5-6-sol', 'codex-5-6-terra', 'codex-5-6-luna'].map((profile) => ({
       agentId: CURATED_PROFILES[profile].agentId,
@@ -56,6 +77,23 @@ test('curated profiles pin the only permitted OpenClaw agents and upstream model
       { agentId: 'ai_dashboard_codex', model: 'openai/gpt-5.6-luna' },
     ],
   );
+});
+
+test('every Claude profile routes to the claude-cli subscription provider', () => {
+  // The Claude Max subscription is reachable only through OpenClaw's
+  // `claude-cli/*` provider. An `anthropic/*` slug here would silently bill
+  // the metered API instead of the subscription we already pay for.
+  const claudeProfiles = Object.entries(CURATED_PROFILES).filter(([name]) =>
+    name.startsWith('claude-'),
+  );
+  assert.equal(claudeProfiles.length, 5);
+  for (const [name, profile] of claudeProfiles) {
+    assert.ok(
+      profile.model.startsWith('claude-cli/'),
+      `${name} must use the claude-cli provider, got ${profile.model}`,
+    );
+    assert.equal(profile.agentId, 'ai_dashboard_claude');
+  }
 });
 
 test('flattenMessages keeps history and separates the current question', () => {

@@ -10,10 +10,34 @@ const MAX_BODY_BYTES = 256 * 1024;
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 110_000;
 
+// Claude profiles route through OpenClaw's `claude-cli` provider, which is
+// backed by the Claude Max subscription. Verified on the VPS: a gateway agent
+// turn with `claude-cli/claude-sonnet-4-6` returns `provider: claude-cli` and
+// reports real subscription usage.
+//
+// Codex profiles route through the `codex` runtime (ChatGPT subscription).
+// That plan hit its usage limit on 2026-08-15 and does not reset until
+// 2026-08-20, so the Claude profiles are the working path meanwhile.
 const CURATED_PROFILES = Object.freeze({
   'claude-subscription': Object.freeze({
     agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
     model: 'claude-cli/claude-sonnet-4-6',
+  }),
+  'claude-sonnet-5': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-sonnet-5',
+  }),
+  'claude-opus-4-8': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-opus-4-8',
+  }),
+  'claude-opus-4-7': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-opus-4-7',
+  }),
+  'claude-opus-4-6': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-opus-4-6',
   }),
   'codex-5-6-sol': Object.freeze({
     agentId: process.env.AI_SUBSCRIPTION_CODEX_AGENT_ID || 'ai_dashboard_codex',
