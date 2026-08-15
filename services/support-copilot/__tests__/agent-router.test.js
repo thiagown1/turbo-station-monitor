@@ -333,7 +333,7 @@ test('caps durable media retries and performs skipped fallback before completion
 
         global.fetch = async (url) => {
           if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: {
-            enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv-recovery'],
+            enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv-recovery', 'conv-direct-success'],
             agents: { accounting: true },
           } }) };
           if (String(url).includes('/api/agents/events')) return { ok: true, status: 202, text: async () => '{}' };
@@ -355,6 +355,36 @@ test('caps durable media retries and performs skipped fallback before completion
           throw new Error('successful recovered group media did not complete its support handoff');
         }
 
+        const directSuccessAt = nowIso();
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-success-recovery', 'conv-direct-success', 'direct_recovery_brand', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct-success', ?)` + "`" + `).run(directSuccessAt);
+        const directSuccessInput = {
+          messageId: 'direct-success-recovery', externalMessageId: 'wa-direct-success',
+          conversationId: 'conv-direct-success', brandId: 'direct_recovery_brand',
+          body: '[📷 Imagem]', receivedAt: directSuccessAt,
+          media: { media_type: 'image', url: '/api/support/media/direct-success.jpg' },
+        };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 1, ?, ?, ?)` + "`" + `).run(
+            directSuccessInput.messageId, JSON.stringify(directSuccessInput), nowIso(), nowIso(), nowIso(),
+          );
+        await router.deliverDueMediaJobs();
+        const directSuccessJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(directSuccessInput.messageId);
+        let directSuccessMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get(directSuccessInput.messageId);
+        if (directSuccessJob.status !== 'completed' || !directSuccessMessage.body.includes('[Análise automática]: revisar com suporte') || emitted !== 1) {
+          throw new Error('successful recovered direct media did not enrich the stored message');
+        }
+        const emittedAfterDirectSuccess = emitted;
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), directSuccessInput.messageId);
+        await router.deliverDueMediaJobs();
+        directSuccessMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get(directSuccessInput.messageId);
+        if ((directSuccessMessage.body.match(/\\[Análise automática\\]:/g) || []).length !== 1 || emitted !== emittedAfterDirectSuccess) {
+          throw new Error('recovered direct media enrichment was not idempotent');
+        }
+
         const insertedAt = nowIso();
         db.prepare(` + "`" + `INSERT INTO messages
           (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
@@ -367,7 +397,7 @@ test('caps durable media retries and performs skipped fallback before completion
         const directJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('direct-media');
         const directMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
         if (!direct.fallbackHandled || directJob.status !== 'completed') throw new Error('one-to-one durable fallback was not completed');
-        if (mediaCalls !== 1 || emitted !== 1 || !directMessage.body.includes('descrição recuperada')) {
+        if (mediaCalls !== 1 || emitted !== emittedAfterDirectSuccess + 1 || !directMessage.body.includes('descrição recuperada')) {
           throw new Error('one-to-one durable fallback did not enrich the message');
         }
 

@@ -281,6 +281,27 @@ async function deliverSuccessfulGroupHandoff(input, result) {
   return { handled: true };
 }
 
+async function enrichSuccessfulDirectMedia(input, result) {
+  if (input.groupJid || result?.status !== 'ok' || !result?.summary) {
+    return { handled: false };
+  }
+  const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
+  if (!current) throw new Error('durable_media_enrichment_message_missing');
+  const marker = '[Análise automática]:';
+  if (!String(current.body || '').includes(marker)) {
+    db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+      .run(`${current.body || input.body || ''} ${marker} ${result.summary}`.trim(), input.messageId);
+    const { emitEvent } = require('./sse');
+    emitEvent({
+      type: 'message_update',
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      brandId: input.brandId,
+    });
+  }
+  return { handled: true };
+}
+
 async function processMediaJob(messageId) {
   const claimed = db.prepare(`UPDATE agent_media_jobs
     SET status = 'processing', attempts = attempts + 1, updated_at = ?
@@ -297,6 +318,9 @@ async function processMediaJob(messageId) {
     const supportHandoff = result?.skipped
       ? { handled: false }
       : await deliverSuccessfulGroupHandoff(input, result);
+    const directEnrichment = result?.skipped
+      ? { handled: false }
+      : await enrichSuccessfulDirectMedia(input, result);
     db.prepare("UPDATE agent_media_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE message_id = ?")
       .run(nowIso(), messageId);
     return {
@@ -304,6 +328,7 @@ async function processMediaJob(messageId) {
       fallbackHandled: fallback.handled === true,
       contadorFallbackEnqueued: fallback.contadorEnqueued === true,
       supportHandoffHandled: supportHandoff.handled === true,
+      directEnrichmentHandled: directEnrichment.handled === true,
     };
   } catch (error) {
     const attempts = Number(row.attempts || 1);

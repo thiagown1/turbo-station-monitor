@@ -888,24 +888,6 @@ router.post('/', async (req, res) => {
     routeInboundMessageDurably({
       messageId: msgId, externalMessageId, conversationId, brandId,
       senderId: normalizedPhone, body, media, receivedAt: now,
-    }).then(result => {
-      if (result?.status === 'ok' && result.summary) {
-        const enrichedBody = `${body} [Análise automática]: ${result.summary}`;
-        db.prepare('UPDATE messages SET body = ? WHERE id = ?').run(enrichedBody, msgId);
-        emitEvent({ type: 'message_update', conversationId, messageId: msgId, brandId });
-      } else if (result?.skipped && !result?.fallbackHandled && media.url) {
-        // Router off/no eligible agent: preserve the existing support image
-        // description instead of silently degrading the atendimento screen.
-        const { processMedia } = require('../lib/media-processor');
-        const mediaFilePath = path.join(MEDIA_DIR, path.basename(media.url));
-        processMedia(mediaFilePath, media.media_type, { conversationContext: recentConversationContext(conversationId) })
-          .then(description => {
-            if (!description) return;
-            db.prepare('UPDATE messages SET body = ? WHERE id = ?').run(`${body} ${description}`, msgId);
-            emitEvent({ type: 'message_update', conversationId, messageId: msgId, brandId });
-          })
-          .catch(err => console.warn(`${LOG_TAG} fallback media processing failed for ${msgId}:`, err.message));
-      }
     }).catch(err => console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message));
   }
 

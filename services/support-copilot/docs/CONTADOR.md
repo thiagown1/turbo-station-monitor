@@ -23,8 +23,9 @@ The WhatsApp socket is entirely in this repository:
    job. Media work stops after five failed attempts. Explicitly skipped work
    completes only after the Contador or suggestion fallback has run. Successful
    `support_attention`/`other` group work also completes only after its richer
-   support suggestion handoff has run. The worker recovers jobs interrupted by
-   a PM2 restart. If the process stops after the
+   support suggestion handoff has run. Successful one-to-one media work appends
+   its analysis to the stored message idempotently before completion. The worker
+   recovers jobs interrupted by a PM2 restart. If the process stops after the
    inbound message commit but before that durable media job is created, the
    provider's duplicate webhook replays the idempotent routing step for both
    groups and one-to-one conversations instead of discarding the attachment or
