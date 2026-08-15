@@ -23,9 +23,17 @@ const CURATED_PROFILES = Object.freeze({
     agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
     model: 'claude-cli/claude-sonnet-4-6',
   }),
+  'claude-opus-5': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-opus-5',
+  }),
   'claude-sonnet-5': Object.freeze({
     agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
     model: 'claude-cli/claude-sonnet-5',
+  }),
+  'claude-fable-5': Object.freeze({
+    agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',
+    model: 'claude-cli/claude-fable-5',
   }),
   'claude-opus-4-8': Object.freeze({
     agentId: process.env.AI_SUBSCRIPTION_CLAUDE_AGENT_ID || 'ai_dashboard_claude',

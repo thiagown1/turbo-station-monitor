@@ -38,9 +38,11 @@ function post(baseUrl, body, token = 'test-secret') {
 
 test('curated profiles pin the only permitted OpenClaw agents and upstream models', () => {
   assert.deepEqual(Object.keys(CURATED_PROFILES).sort(), [
+    'claude-fable-5',
     'claude-opus-4-6',
     'claude-opus-4-7',
     'claude-opus-4-8',
+    'claude-opus-5',
     'claude-sonnet-5',
     'claude-subscription',
     'codex-5-6-luna',
@@ -50,7 +52,9 @@ test('curated profiles pin the only permitted OpenClaw agents and upstream model
   assert.deepEqual(
     [
       'claude-subscription',
+      'claude-opus-5',
       'claude-sonnet-5',
+      'claude-fable-5',
       'claude-opus-4-8',
       'claude-opus-4-7',
       'claude-opus-4-6',
@@ -60,7 +64,9 @@ test('curated profiles pin the only permitted OpenClaw agents and upstream model
     })),
     [
       { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-sonnet-4-6' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-5' },
       { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-sonnet-5' },
+      { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-fable-5' },
       { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-8' },
       { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-7' },
       { agentId: 'ai_dashboard_claude', model: 'claude-cli/claude-opus-4-6' },
@@ -86,7 +92,7 @@ test('every Claude profile routes to the claude-cli subscription provider', () =
   const claudeProfiles = Object.entries(CURATED_PROFILES).filter(([name]) =>
     name.startsWith('claude-'),
   );
-  assert.equal(claudeProfiles.length, 5);
+  assert.equal(claudeProfiles.length, 7);
   for (const [name, profile] of claudeProfiles) {
     assert.ok(
       profile.model.startsWith('claude-cli/'),
