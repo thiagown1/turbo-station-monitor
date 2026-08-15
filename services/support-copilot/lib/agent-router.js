@@ -157,7 +157,9 @@ async function routeInboundMessage(input) {
   if (result.status === 'ok' && result.kind === 'station_support' && config.agents?.stationSupport) {
     try {
       const { createGroupSuggestion } = require('./auto-suggest');
-      const suggestion = await createGroupSuggestion(input.conversationId, input.brandId);
+      const suggestion = await createGroupSuggestion(input.conversationId, input.brandId, {
+        sourceMessageId: input.messageId,
+      });
       if (suggestion?.text) result.suggestedReply = suggestion.text;
       if (suggestion?.model) result.supportModel = suggestion.model;
     } catch (error) {

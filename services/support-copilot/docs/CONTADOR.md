@@ -22,9 +22,9 @@ The WhatsApp socket is entirely in this repository:
    failures remain retryable; they do not create an extraction-less Contador
    job. Media work stops after five failed attempts. Explicitly skipped work
    completes only after the Contador or suggestion fallback has run. Successful
-   `support_attention`/`other` group work also completes only after its richer
-   support suggestion handoff has run; the source message uniquely identifies
-   that suggestion across recovery. One-to-one fallback enrichment stores a
+   `station_support`, `support_attention` and `other` group work uses the source
+   message as the unique identity for its richer support suggestion across
+   recovery. One-to-one fallback enrichment stores a
    checkpoint in the same transaction as the message update, while successful
    media analysis appends its summary idempotently before completion. The worker
    recovers jobs interrupted by a PM2 restart. If the process stops after the

@@ -576,6 +576,7 @@ test('station requests use the tool-backed support suggestion and still require 
         const suggestion = db.prepare("SELECT * FROM suggestions WHERE conversation_id = 'conv1'").get();
         if (result.suggestedReply !== 'Diagnóstico confirmado pelas ferramentas.') throw new Error('deep result missing');
         if (!suggestion || suggestion.status !== 'pending') throw new Error('human support suggestion missing');
+        if (suggestion.source_message_id !== 'msg1') throw new Error('station support suggestion is not durably keyed to its source message');
         console.log('agent-station-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
