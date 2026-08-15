@@ -78,6 +78,42 @@ const DEBOUNCE_WINDOW = 60 * 60 * 1000; // 1 hour
 const QUERY_WINDOW = 5 * 60 * 1000; // Last 5 minutes
 const CORRELATION_WINDOW = 30 * 1000; // ±30 seconds for correlation
 
+/** Strip query/hash noise so grouping and debounce operate on the actual route. */
+function normalizeEndpoint(endpoint) {
+    if (endpoint == null) return null;
+    const raw = String(endpoint).trim();
+    if (!raw) return null;
+    try {
+        if (/^https?:\/\//i.test(raw)) return new URL(raw).pathname || '/';
+    } catch (_) {
+        // Fall through to the safe relative-path handling below.
+    }
+    return raw.split(/[?#]/, 1)[0] || null;
+}
+
+function groupByNormalizedEndpoint(rows) {
+    return rows.reduce((groups, row) => {
+        const endpoint = normalizeEndpoint(row.endpoint);
+        if (!endpoint || endpoint === 'null') return groups;
+        if (!groups[endpoint]) groups[endpoint] = [];
+        groups[endpoint].push(row);
+        return groups;
+    }, {});
+}
+
+/** Observability reads are useful warnings, but not one-message-per-error incidents. */
+function getVercel5xxAlertPolicy(endpoint, count) {
+    const isLogsRead = /^\/api\/ocpp-logs(?:-dev)?(?:\/|$)/.test(endpoint || '');
+    if (isLogsRead) {
+        return {
+            shouldAlert: count >= 3,
+            severity: 'warning',
+            title: 'Instabilidade no serviço de logs',
+        };
+    }
+    return { shouldAlert: true, severity: 'critical', title: null };
+}
+
 /**
  * Return the newest row received by the OCPP collector. `ocpp_events` is
  * filtered/throttled and may remain unchanged while raw charger logs continue,
@@ -533,18 +569,15 @@ class AlertEngine {
         if (errors.length === 0) return [];
 
         // Group by endpoint to avoid spam
-        const groupedByEndpoint = errors.reduce((acc, err) => {
-            if (!acc[err.endpoint]) {
-                acc[err.endpoint] = [];
-            }
-            acc[err.endpoint].push(err);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(errors);
 
         const alerts = [];
         for (const [endpoint, errs] of Object.entries(groupedByEndpoint)) {
             const firstError = errs[0];
             const count = errs.length;
+            const policy = getVercel5xxAlertPolicy(endpoint, count);
+
+            if (!policy.shouldAlert) continue;
 
             if (!this.shouldSendAlert('vercel_5xx', endpoint)) {
                 continue;
@@ -552,10 +585,11 @@ class AlertEngine {
 
             const alert = {
                 type: 'vercel_5xx',
-                severity: 'critical',
-                title: `Erro ${firstError.status_code} no backend`,
+                severity: policy.severity,
+                title: policy.title || `Erro ${firstError.status_code} no backend`,
                 description: `${count} erro(s) 5xx em ${endpoint} nos últimos 5 minutos`,
                 endpoint: endpoint,
+                sample_endpoint: firstError.endpoint,
                 status_code: firstError.status_code,
                 count: count,
                 vercel_log_ids: JSON.stringify(errs.map(e => e.id)),
@@ -590,13 +624,7 @@ class AlertEngine {
 
         if (timeouts.length === 0) return [];
 
-        const groupedByEndpoint = timeouts.reduce((acc, timeout) => {
-            if (!acc[timeout.endpoint]) {
-                acc[timeout.endpoint] = [];
-            }
-            acc[timeout.endpoint].push(timeout);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(timeouts);
 
         const alerts = [];
         for (const [endpoint, tmouts] of Object.entries(groupedByEndpoint)) {
@@ -654,13 +682,7 @@ class AlertEngine {
 
         if (slowRequests.length < 5) return []; // Only alert if multiple slow requests
 
-        const groupedByEndpoint = slowRequests.reduce((acc, req) => {
-            if (!acc[req.endpoint]) {
-                acc[req.endpoint] = [];
-            }
-            acc[req.endpoint].push(req);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(slowRequests);
 
         const alerts = [];
         for (const [endpoint, reqs] of Object.entries(groupedByEndpoint)) {
@@ -1730,3 +1752,6 @@ module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
 module.exports.deliveryPollScheduleMs = deliveryPollScheduleMs;
 module.exports.UNSENT_RETRY_WINDOW_MS = UNSENT_RETRY_WINDOW_MS;
 module.exports.getLatestOcppIngestTimestamp = getLatestOcppIngestTimestamp;
+module.exports.normalizeEndpoint = normalizeEndpoint;
+module.exports.groupByNormalizedEndpoint = groupByNormalizedEndpoint;
+module.exports.getVercel5xxAlertPolicy = getVercel5xxAlertPolicy;
