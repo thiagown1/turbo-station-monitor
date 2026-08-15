@@ -36,13 +36,26 @@ function post(baseUrl, body, token = 'test-secret') {
   });
 }
 
-test('curated profiles pin the only two permitted OpenClaw agent ids', () => {
+test('curated profiles pin the only permitted OpenClaw agents and upstream models', () => {
   assert.deepEqual(Object.keys(CURATED_PROFILES).sort(), [
     'claude-subscription',
-    'codex-subscription',
+    'codex-5-6-luna',
+    'codex-5-6-sol',
+    'codex-5-6-terra',
   ]);
   assert.equal(CURATED_PROFILES['claude-subscription'].agentId, 'ai_dashboard_claude');
-  assert.equal(CURATED_PROFILES['codex-subscription'].agentId, 'ai_dashboard_codex');
+  assert.equal(CURATED_PROFILES['claude-subscription'].model, 'claude-cli/claude-sonnet-4-6');
+  assert.deepEqual(
+    ['codex-5-6-sol', 'codex-5-6-terra', 'codex-5-6-luna'].map((profile) => ({
+      agentId: CURATED_PROFILES[profile].agentId,
+      model: CURATED_PROFILES[profile].model,
+    })),
+    [
+      { agentId: 'ai_dashboard_codex', model: 'openai/gpt-5.6-sol' },
+      { agentId: 'ai_dashboard_codex', model: 'openai/gpt-5.6-terra' },
+      { agentId: 'ai_dashboard_codex', model: 'openai/gpt-5.6-luna' },
+    ],
+  );
 });
 
 test('flattenMessages keeps history and separates the current question', () => {
@@ -74,7 +87,7 @@ test('rejects missing authentication before invoking a subscription', async () =
   });
   await withServer(handler, async (baseUrl) => {
     const response = await post(baseUrl, {
-      agentProfile: 'codex-subscription',
+      agentProfile: 'codex-5-6-sol',
       messages: [{ role: 'user', content: 'oi' }],
     }, 'wrong');
     assert.equal(response.status, 401);
@@ -122,8 +135,9 @@ test('runs a curated profile and returns the dashboard NDJSON contract', async (
   });
   await withServer(handler, async (baseUrl) => {
     const response = await post(baseUrl, {
-      agentProfile: 'codex-subscription',
+      agentProfile: 'codex-5-6-sol',
       agentId: 'ops',
+      model: 'openai/not-allowed',
       systemPrompt: 'somente leitura',
       messages: [{ role: 'user', content: 'onde fica X?' }],
     });
@@ -135,8 +149,9 @@ test('runs a curated profile and returns the dashboard NDJSON contract', async (
       { type: 'done' },
     ]);
   });
-  assert.equal(received.agentProfile, 'codex-subscription');
+  assert.equal(received.agentProfile, 'codex-5-6-sol');
   assert.equal(received.agentId, 'ai_dashboard_codex');
+  assert.equal(received.model, 'openai/gpt-5.6-sol');
   assert.equal(received.systemPrompt, 'somente leitura');
   assert.equal(received.prompt, 'onde fica X?');
 });
@@ -179,6 +194,7 @@ test('the OpenClaw runner receives prompts on stdin, never in process arguments'
   const text = await runOpenclawProfile(
     {
       agentId: 'ai_dashboard_codex',
+      model: 'openai/gpt-5.6-terra',
       prompt: 'PROMPT_PRIVADO',
       systemPrompt: 'somente leitura',
       signal: new AbortController().signal,
@@ -196,4 +212,5 @@ test('the OpenClaw runner receives prompts on stdin, never in process arguments'
   assert.equal(spawned.options.cwd, '/openclaw/source');
   assert.equal(spawned.args.join(' ').includes('PROMPT_PRIVADO'), false);
   assert.match(JSON.parse(stdin).message, /PROMPT_PRIVADO/);
+  assert.equal(JSON.parse(stdin).model, 'openai/gpt-5.6-terra');
 });

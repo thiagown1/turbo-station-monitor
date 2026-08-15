@@ -1,14 +1,15 @@
 # AI subscription gateway
 
-Private, loopback-only bridge used by the Turbo Station dashboard to reach two
+Private, loopback-only bridge used by the Turbo Station dashboard to reach
 subscription-backed OpenClaw agents:
 
 - `claude-subscription` -> `ai_dashboard_claude` -> Claude Sonnet 4.6;
-- `codex-subscription` -> `ai_dashboard_codex` -> GPT-5.4 through the official
-  Codex app-server harness.
+- `codex-5-6-sol` -> `ai_dashboard_codex` -> GPT-5.6 Sol;
+- `codex-5-6-terra` -> `ai_dashboard_codex` -> GPT-5.6 Terra;
+- `codex-5-6-luna` -> `ai_dashboard_codex` -> GPT-5.6 Luna.
 
 The browser sends only the curated profile name. The gateway maps that profile
-to a fixed OpenClaw agent id, authenticates the request with
+to a fixed OpenClaw agent id and upstream model, authenticates the request with
 `OPENCLAW_AGENT_TOKEN`, limits input/output/time, and returns the existing
 NDJSON `delta | error | done` contract. Prompts are sent to the local runner on
 stdin and are not logged.
@@ -73,9 +74,11 @@ boundary.
         id: "ai_dashboard_codex",
         name: "Dashboard Codex Read Only",
         workspace: "/home/openclaw/.openclaw/workspace/turbo_station",
-        model: { primary: "openai/gpt-5.4" },
+        model: { primary: "openai/gpt-5.6-terra" },
         models: {
-          "openai/gpt-5.4": { agentRuntime: { id: "codex" } }
+          "openai/gpt-5.6-sol": { agentRuntime: { id: "codex" } },
+          "openai/gpt-5.6-terra": { agentRuntime: { id: "codex" } },
+          "openai/gpt-5.6-luna": { agentRuntime: { id: "codex" } }
         },
         sandbox: { mode: "all", scope: "session", workspaceAccess: "ro" },
         tools: {
