@@ -9,9 +9,10 @@ The Alert Engine is a proactive monitoring system that queries the unified SQLit
 ### Detection Queries
 
 1. **Vercel 5xx Errors** (`vercel_5xx`)
-   - Detects HTTP 500-599 errors on OCPP webhook endpoints
-   - Groups by endpoint to avoid spam
-   - Severity: **critical**
+   - Detects HTTP 500-599 errors on backend endpoints
+   - Strips query strings before grouping and applying the 1-hour debounce
+   - Ordinary backend errors remain **critical** from the first occurrence
+   - Read-only `/api/ocpp-logs/*` failures require ≥3 occurrences in 5 minutes and are **warning** severity
 
 2. **Vercel Timeouts** (`vercel_timeout`)
    - Detects requests with NULL/0 status and duration >10s
@@ -133,6 +134,7 @@ drift-warning comments on `isCableTheftSuspectFault` / `isHighTempFault`).
 
 - **Query window:** Last 5 minutes (300,000ms)
 - **Query efficiency:** Uses indexes on `timestamp`, `status_code`, `endpoint`
+- **Grouping key:** Normalized route pathname (query parameters do not create new alert keys)
 - **Correlation window:** ±30 seconds
 - **Execution:** ~50-200ms per detection run
 - **PM2 schedule:** Every 2 minutes via `cron_restart`
