@@ -7,9 +7,19 @@ const { parseExpenseDecision, parseExpenseBrlAmount } = require('./expense-decis
 const configCache = new Map();
 let worker = null;
 let delivering = false;
+let deliveringMediaJobs = false;
+let mediaJobsRecovered = false;
+const MEDIA_JOB_MAX_ATTEMPTS = 5;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
+
+class AgentConfigUnavailableError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'AgentConfigUnavailableError';
+  }
+}
 
 async function loadConfig(brandId) {
   const cached = configCache.get(brandId);
@@ -19,11 +29,13 @@ async function loadConfig(brandId) {
     const res = await fetch(`${baseUrl()}/api/agents/config?brandId=${encodeURIComponent(brandId)}`, {
       headers: { Authorization: `Bearer ${secret()}` }, signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return null;
+    if (!res.ok) throw new Error(`config_http_${res.status}`);
     const value = (await res.json()).config;
     configCache.set(brandId, { value, expiresAt: Date.now() + 60_000 });
     return value;
-  } catch (_) { return null; }
+  } catch (error) {
+    throw new AgentConfigUnavailableError(`agent_config_unavailable: ${String(error?.message || error)}`);
+  }
 }
 
 function recentContext(conversationId) {
@@ -52,9 +64,66 @@ function queueEvent(messageId, brandId, payload) {
   void deliverDueEvents();
 }
 
+function isPdfInput(input) {
+  const mime = String(input.media?.mimetype || '').split(';', 1)[0].trim().toLowerCase();
+  return mime === 'application/pdf'
+    || String(input.media?.filename || '').toLowerCase().endsWith('.pdf');
+}
+
+function shouldDeferEnergyInvoice(input, result) {
+  const isPdf = isPdfInput(input);
+  return input.deferEnergyInvoiceEvent === true
+    && result.kind === 'energy_invoice'
+    && (isPdf || Boolean(result.energyBill))
+    && (isPdf || Number(result.confidence || 0) >= 0.85);
+}
+
+function deferredContadorJob(input, result) {
+  const isPdf = isPdfInput(input);
+  const messageId = input.externalMessageId || input.messageId;
+  const kind = isPdf ? 'pdf' : 'image';
+  const payload = {
+    messageId,
+    conversationId: input.conversationId,
+    brandId: input.brandId,
+    groupJid: input.groupJid,
+    instance: input.instance,
+    direction: 'inbound',
+    sender: input.sender,
+    senderId: input.senderId,
+    body: input.body,
+    media: input.media,
+    receivedAt: input.receivedAt,
+    visionExtraction: isPdf ? undefined : result.energyBill,
+    kind,
+  };
+  const now = nowIso();
+  return db.prepare(`
+    INSERT INTO contador_jobs
+      (id, message_id, conversation_id, brand_id, group_jid, instance, kind, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?)
+    ON CONFLICT(message_id) DO UPDATE SET
+      payload_json = excluded.payload_json,
+      status = 'pending',
+      attempts = 0,
+      next_attempt_at = excluded.next_attempt_at,
+      updated_at = excluded.updated_at
+    WHERE contador_jobs.status = 'blocked' AND excluded.kind = 'image'
+  `).run(
+    randomId('contador_job'), messageId, input.conversationId, input.brandId,
+    input.groupJid, input.instance || '', kind, JSON.stringify(payload), now, now, now,
+  );
+}
+
 async function routeInboundMessage(input) {
-  const existing = db.prepare('SELECT status, attempts FROM agent_media_analyses WHERE message_id = ?').get(input.messageId);
-  if (existing && existing.status !== 'error') return { duplicate: true };
+  const existing = db.prepare('SELECT status, attempts, kind, result_json FROM agent_media_analyses WHERE message_id = ?').get(input.messageId);
+  if (existing && existing.status !== 'error') {
+    let cached = {};
+    try { cached = JSON.parse(existing.result_json || '{}'); } catch (_) { cached = {}; }
+    const eventDeferred = shouldDeferEnergyInvoice(input, cached);
+    if (eventDeferred) deferredContadorJob(input, cached);
+    return { ...cached, duplicate: true, eventDeferred, contadorJobPersisted: eventDeferred };
+  }
   const config = await loadConfig(input.brandId);
   if (!config?.enabled) return { skipped: 'disabled' };
   const accountingPriority = (config.accountingGroupConversationIds || []).includes(input.conversationId);
@@ -88,7 +157,9 @@ async function routeInboundMessage(input) {
   if (result.status === 'ok' && result.kind === 'station_support' && config.agents?.stationSupport) {
     try {
       const { createGroupSuggestion } = require('./auto-suggest');
-      const suggestion = await createGroupSuggestion(input.conversationId, input.brandId);
+      const suggestion = await createGroupSuggestion(input.conversationId, input.brandId, {
+        sourceMessageId: input.messageId,
+      });
       if (suggestion?.text) result.suggestedReply = suggestion.text;
       if (suggestion?.model) result.supportModel = suggestion.model;
     } catch (error) {
@@ -99,11 +170,15 @@ async function routeInboundMessage(input) {
   }
   const now = nowIso();
   const attempts = Number(existing?.attempts || 0) + 1;
-  db.prepare(`INSERT INTO agent_media_analyses
-    (message_id, conversation_id, brand_id, kind, status, result_json, model, input_tokens, output_tokens, estimated_cost_usd, attempts, analyzed_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,result_json=excluded.result_json,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,estimated_cost_usd=excluded.estimated_cost_usd,attempts=excluded.attempts,analyzed_at=excluded.analyzed_at`)
-    .run(input.messageId, input.conversationId, input.brandId, result.kind || 'other', result.status, JSON.stringify(result), result.cost?.model || null, result.cost?.inputTokens || 0, result.cost?.outputTokens || 0, result.cost?.estimatedCostUsd || 0, attempts, now);
+  const eventDeferred = shouldDeferEnergyInvoice(input, result);
+  db.transaction(() => {
+    db.prepare(`INSERT INTO agent_media_analyses
+      (message_id, conversation_id, brand_id, kind, status, result_json, model, input_tokens, output_tokens, estimated_cost_usd, attempts, analyzed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,result_json=excluded.result_json,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,estimated_cost_usd=excluded.estimated_cost_usd,attempts=excluded.attempts,analyzed_at=excluded.analyzed_at`)
+      .run(input.messageId, input.conversationId, input.brandId, result.kind || 'other', result.status, JSON.stringify(result), result.cost?.model || null, result.cost?.inputTokens || 0, result.cost?.outputTokens || 0, result.cost?.estimatedCostUsd || 0, attempts, now);
+    if (eventDeferred) deferredContadorJob(input, result);
+  })();
   if (result.status !== 'ok') return result;
 
   // Populate the legacy receipt cache too, so the manual sweep remains a free,
@@ -114,7 +189,7 @@ async function routeInboundMessage(input) {
       .run(input.messageId, input.conversationId, result.amountCents ? 'ok' : 'error', result.amountCents || null, result.receiptRef || null, result.cost?.model || null, now);
   }
   const partnerId = input.groupJid ? partnerForGroup(input.groupJid) : undefined;
-  queueEvent(input.messageId, input.brandId, {
+  const eventPayload = {
     brandId: input.brandId,
     kind: result.kind,
     sourceMessageId: input.externalMessageId || input.messageId,
@@ -136,8 +211,165 @@ async function routeInboundMessage(input) {
     suggestedReply: result.suggestedReply,
     partnerId,
     cost: result.cost,
-  });
-  return result;
+  };
+  if (!eventDeferred) queueEvent(input.messageId, input.brandId, eventPayload);
+  return { ...result, eventDeferred, contadorJobPersisted: eventDeferred };
+}
+
+function persistMediaJob(input) {
+  const now = nowIso();
+  db.prepare(`INSERT OR IGNORE INTO agent_media_jobs
+    (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
+    .run(input.messageId, JSON.stringify(input), now, now, now);
+}
+
+async function deliverSkippedMediaFallback(input) {
+  const contadorEvent = {
+    messageId: input.externalMessageId || input.messageId,
+    conversationId: input.conversationId,
+    brandId: input.brandId,
+    groupJid: input.groupJid,
+    instance: input.instance,
+    direction: 'inbound',
+    sender: input.sender,
+    senderId: input.senderId,
+    body: input.body,
+    media: input.media,
+    receivedAt: input.receivedAt,
+    replyToContador: input.replyToContador,
+    quotedContadorDraftId: input.quotedContadorDraftId,
+  };
+  const { enqueueContadorMessage } = require('./contador-runtime');
+  const contadorRoute = enqueueContadorMessage(contadorEvent);
+  if (contadorRoute.kind !== 'ignored') return { handled: true, contadorEnqueued: contadorRoute.enqueued === true };
+  if (!input.groupJid) {
+    const checkpoint = db.prepare('SELECT fallback_applied_at FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+    if (checkpoint?.fallback_applied_at) return { handled: true, contadorEnqueued: false };
+    const rawUrl = String(input.media?.url || '');
+    const filename = path.basename(rawUrl);
+    const mediaRoot = path.resolve(MEDIA_DIR);
+    const mediaFilePath = path.resolve(mediaRoot, filename);
+    if (!filename || filename === '.' || !mediaFilePath.startsWith(`${mediaRoot}${path.sep}`)) {
+      throw new Error('durable_media_fallback_missing_file');
+    }
+    const { processMedia } = require('./media-processor');
+    const description = await processMedia(mediaFilePath, input.media?.media_type, {
+      conversationContext: recentContext(input.conversationId),
+    });
+    if (!description) throw new Error('durable_media_fallback_empty_result');
+    const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
+    if (!current) throw new Error('durable_media_fallback_message_missing');
+    const appliedAt = nowIso();
+    db.transaction(() => {
+      db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+        .run(`${current.body} ${description}`, input.messageId);
+      db.prepare('UPDATE agent_media_jobs SET fallback_applied_at = ?, updated_at = ? WHERE message_id = ?')
+        .run(appliedAt, appliedAt, input.messageId);
+    })();
+    const { emitEvent } = require('./sse');
+    emitEvent({
+      type: 'message_update',
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      brandId: input.brandId,
+    });
+    return { handled: true, contadorEnqueued: false };
+  }
+  const { createGroupSuggestion } = require('./auto-suggest');
+  await createGroupSuggestion(input.conversationId, input.brandId, { sourceMessageId: input.messageId });
+  return { handled: true, contadorEnqueued: false };
+}
+
+async function deliverSuccessfulGroupHandoff(input, result) {
+  if (!input.groupJid || !['support_attention', 'other'].includes(result?.kind)) {
+    return { handled: false };
+  }
+  const { createGroupSuggestion } = require('./auto-suggest');
+  await createGroupSuggestion(input.conversationId, input.brandId, { sourceMessageId: input.messageId });
+  return { handled: true };
+}
+
+async function enrichSuccessfulDirectMedia(input, result) {
+  if (input.groupJid || result?.status !== 'ok' || !result?.summary) {
+    return { handled: false };
+  }
+  const current = db.prepare('SELECT body FROM messages WHERE id = ?').get(input.messageId);
+  if (!current) throw new Error('durable_media_enrichment_message_missing');
+  const marker = '[Análise automática]:';
+  if (!String(current.body || '').includes(marker)) {
+    db.prepare('UPDATE messages SET body = ? WHERE id = ?')
+      .run(`${current.body || input.body || ''} ${marker} ${result.summary}`.trim(), input.messageId);
+    const { emitEvent } = require('./sse');
+    emitEvent({
+      type: 'message_update',
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      brandId: input.brandId,
+    });
+  }
+  return { handled: true };
+}
+
+async function processMediaJob(messageId) {
+  const claimed = db.prepare(`UPDATE agent_media_jobs
+    SET status = 'processing', attempts = attempts + 1, updated_at = ?
+    WHERE message_id = ? AND status IN ('pending', 'retry')
+      AND datetime(next_attempt_at) <= datetime('now')`)
+    .run(nowIso(), messageId);
+  if (!claimed.changes) return { queued: true, duplicate: true };
+  const row = db.prepare('SELECT payload_json, attempts FROM agent_media_jobs WHERE message_id = ?').get(messageId);
+  try {
+    const input = JSON.parse(row.payload_json);
+    const result = await routeInboundMessage(input);
+    if (result?.status === 'error') throw new Error(result.error || 'media_classification_failed');
+    const fallback = result?.skipped ? await deliverSkippedMediaFallback(input) : { handled: false };
+    const supportHandoff = result?.skipped
+      ? { handled: false }
+      : await deliverSuccessfulGroupHandoff(input, result);
+    const directEnrichment = result?.skipped
+      ? { handled: false }
+      : await enrichSuccessfulDirectMedia(input, result);
+    db.prepare("UPDATE agent_media_jobs SET status = 'completed', last_error = NULL, updated_at = ? WHERE message_id = ?")
+      .run(nowIso(), messageId);
+    return {
+      ...result,
+      fallbackHandled: fallback.handled === true,
+      contadorFallbackEnqueued: fallback.contadorEnqueued === true,
+      supportHandoffHandled: supportHandoff.handled === true,
+      directEnrichmentHandled: directEnrichment.handled === true,
+    };
+  } catch (error) {
+    const attempts = Number(row.attempts || 1);
+    const retryable = attempts < MEDIA_JOB_MAX_ATTEMPTS;
+    const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts, 8)));
+    const updatedAt = nowIso();
+    db.prepare(`UPDATE agent_media_jobs
+      SET status = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+      WHERE message_id = ?`)
+      .run(retryable ? 'retry' : 'failed', retryable ? new Date(Date.now() + delayMs).toISOString() : updatedAt, String(error?.message || error).slice(0, 500), updatedAt, messageId);
+    throw error;
+  }
+}
+
+function routeInboundMessageDurably(input) {
+  persistMediaJob(input);
+  return processMediaJob(input.messageId);
+}
+
+async function deliverDueMediaJobs() {
+  if (deliveringMediaJobs) return;
+  deliveringMediaJobs = true;
+  try {
+    const due = db.prepare(`SELECT message_id FROM agent_media_jobs
+      WHERE status IN ('pending', 'retry') AND datetime(next_attempt_at) <= datetime('now')
+      ORDER BY datetime(created_at) ASC LIMIT 5`).all();
+    for (const row of due) {
+      try { await processMediaJob(row.message_id); } catch (_) { /* retry state persisted */ }
+    }
+  } finally {
+    deliveringMediaJobs = false;
+  }
 }
 
 async function routeExpenseDecisionReply(input) {
@@ -145,15 +377,15 @@ async function routeExpenseDecisionReply(input) {
   const amountCents = parseExpenseBrlAmount(input.body);
   const action = amountCents ? 'set_brl_amount' : parseExpenseDecision(input.body);
   if (!codeMatch || !action) return { handled: false };
-  const config = await loadConfig(input.brandId);
-  if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
-    return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
-  }
-  if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
-    || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
-    return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
-  }
   try {
+    const config = await loadConfig(input.brandId);
+    if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
+      return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
+    }
+    if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
+      || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
+      return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
+    }
     const res = await fetch(`${baseUrl()}/api/agents/expense-decisions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },
@@ -210,9 +442,31 @@ async function deliverDueEvents() {
 
 function startAgentEventWorker() {
   if (worker) return;
-  worker = setInterval(() => { void deliverDueEvents(); }, 30_000);
+  if (!mediaJobsRecovered) {
+    const recoveredAt = nowIso();
+    db.prepare(`UPDATE agent_media_jobs
+      SET status = 'retry', next_attempt_at = ?, last_error = 'interrupted_process', updated_at = ?
+      WHERE status = 'processing'`).run(recoveredAt, recoveredAt);
+    mediaJobsRecovered = true;
+  }
+  worker = setInterval(() => {
+    void deliverDueEvents();
+    void deliverDueMediaJobs();
+  }, 30_000);
   worker.unref?.();
   void deliverDueEvents();
+  void deliverDueMediaJobs();
 }
 
-module.exports = { routeInboundMessage, routeExpenseDecisionReply, parseExpenseDecision, deliverDueEvents, startAgentEventWorker, loadConfig };
+module.exports = {
+  routeInboundMessage,
+  routeInboundMessageDurably,
+  routeExpenseDecisionReply,
+  parseExpenseDecision,
+  deliverDueEvents,
+  deliverDueMediaJobs,
+  startAgentEventWorker,
+  loadConfig,
+  shouldDeferEnergyInvoice,
+  isPdfInput,
+};

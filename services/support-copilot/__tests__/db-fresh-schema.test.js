@@ -256,13 +256,19 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         const Database = require('better-sqlite3');
         const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
         const tables = check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
-        for (const expected of ['contador_jobs', 'contador_daily_runs']) {
+        for (const expected of ['contador_jobs', 'contador_daily_runs', 'contador_monthly_runs', 'agent_media_jobs']) {
           if (!tables.includes(expected)) throw new Error(expected + ' table missing: ' + tables.join(','));
         }
         const jobCols = check.prepare("PRAGMA table_info('contador_jobs')").all().map(r => r.name);
-        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json']) {
+        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json', 'reply_status', 'reply_external_message_id']) {
           if (!jobCols.includes(expected)) throw new Error('contador_jobs.' + expected + ' column missing');
         }
+        const monthlyCols = check.prepare("PRAGMA table_info('contador_monthly_runs')").all().map(r => r.name);
+        if (!monthlyCols.includes('next_attempt_at')) throw new Error('contador_monthly_runs.next_attempt_at column missing');
+        const mediaJobCols = check.prepare("PRAGMA table_info('agent_media_jobs')").all().map(r => r.name);
+        if (!mediaJobCols.includes('fallback_applied_at')) throw new Error('agent_media_jobs.fallback_applied_at column missing');
+        const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
+        if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
         `,
       ],
       {

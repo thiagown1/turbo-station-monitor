@@ -22,15 +22,32 @@ const { LOG_TAG } = require('./constants');
 const { emitEvent } = require('./sse');
 
 /**
- * Schedule a debounced, pre-generated copilot suggestion for a group convo.
+ * Create a copilot suggestion for a group conversation.
  * @param {string} conversationId
  * @param {string} brandId
- * @param {{ media?: boolean }} opts
+ * @param {{ sourceMessageId?: string | null }} opts
  */
-async function createGroupSuggestion(conversationId, brandId) {
+async function createGroupSuggestion(conversationId, brandId, { sourceMessageId = null } = {}) {
   if (global._copilotDebounceTimers) {
     clearTimeout(global._copilotDebounceTimers[conversationId]);
     delete global._copilotDebounceTimers[conversationId];
+  }
+
+  const durableSourceId = typeof sourceMessageId === 'string' && sourceMessageId.trim()
+    ? sourceMessageId.trim()
+    : null;
+  if (durableSourceId) {
+    const existing = db.prepare(`
+      SELECT id, suggestion_text, model_name FROM suggestions WHERE source_message_id = ? LIMIT 1
+    `).get(durableSourceId);
+    if (existing) {
+      return {
+        text: existing.suggestion_text,
+        model: existing.model_name,
+        suggestionId: existing.id,
+        duplicate: true,
+      };
+    }
   }
 
   const conv = stmts.getConversation.get(conversationId);
@@ -63,10 +80,28 @@ async function createGroupSuggestion(conversationId, brandId) {
 
   const sugId = randomId('sug');
   const sugNow = nowIso();
-  db.prepare(`
-    INSERT INTO suggestions (id, conversation_id, brand_id, status, suggestion_text, model_name, created_at, updated_at, decided_by, decided_at)
-    VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, NULL, NULL)
-  `).run(sugId, conversationId, brandId, result.text, result.model, sugNow, sugNow);
+  const inserted = db.prepare(`
+    INSERT OR IGNORE INTO suggestions
+      (id, conversation_id, brand_id, status, suggestion_text, model_name, source_message_id, created_at, updated_at, decided_by, decided_at)
+    VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, NULL, NULL)
+  `).run(sugId, conversationId, brandId, result.text, result.model, durableSourceId, sugNow, sugNow);
+
+  if (!inserted.changes) {
+    if (durableSourceId) {
+      const existing = db.prepare(`
+        SELECT id, suggestion_text, model_name FROM suggestions WHERE source_message_id = ? LIMIT 1
+      `).get(durableSourceId);
+      if (existing) {
+        return {
+          text: existing.suggestion_text,
+          model: existing.model_name,
+          suggestionId: existing.id,
+          duplicate: true,
+        };
+      }
+    }
+    throw new Error('group_suggestion_source_conflict');
+  }
 
   console.log(`${LOG_TAG} [group-suggest] ${conversationId}: "${result.text.substring(0, 60)}..."`);
 

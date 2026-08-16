@@ -72,6 +72,7 @@ try {
       status TEXT NOT NULL DEFAULT 'pending',
       suggestion_text TEXT NOT NULL,
       model_name TEXT,
+      source_message_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       decided_by TEXT,
@@ -121,6 +122,12 @@ safeAddColumn('conversations', 'escalated_at', 'TEXT DEFAULT NULL');
 safeAddColumn('conversations', 'escalated_to', 'TEXT DEFAULT NULL');
 // Learning from edits
 safeAddColumn('suggestions', 'edited_text', 'TEXT DEFAULT NULL');
+safeAddColumn('suggestions', 'source_message_id', 'TEXT DEFAULT NULL');
+try {
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestions_source_message ON suggestions(source_message_id) WHERE source_message_id IS NOT NULL');
+} catch (err) {
+  console.warn(`${LOG_TAG} suggestions source-message migration:`, err.message);
+}
 
 // Session context tracking — remembers what was sent to the agent to avoid repeating
 try {
@@ -367,6 +374,8 @@ try {
       attempts INTEGER NOT NULL DEFAULT 0,
       next_attempt_at TEXT,
       last_error TEXT,
+      reply_status TEXT,
+      reply_external_message_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -381,9 +390,28 @@ try {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS contador_monthly_runs (
+      run_month TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 } catch (err) {
   console.warn(`${LOG_TAG} contador migrations:`, err.message);
+}
+safeAddColumn('contador_jobs', 'reply_status', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_jobs', 'reply_external_message_id', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_monthly_runs', 'next_attempt_at', 'TEXT DEFAULT NULL');
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contador_monthly_runs_due
+    ON contador_monthly_runs(status, next_attempt_at, run_month);`);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador monthly retry index migration:`, err.message);
 }
 
 // One paid media classification per inbound message, plus a durable delivery
@@ -406,6 +434,20 @@ try {
     );
     CREATE INDEX IF NOT EXISTS idx_agent_media_brand_at ON agent_media_analyses(brand_id, analyzed_at DESC);
 
+    CREATE TABLE IF NOT EXISTS agent_media_jobs (
+      message_id TEXT PRIMARY KEY,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      fallback_applied_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_media_jobs_due
+      ON agent_media_jobs(status, next_attempt_at, created_at);
+
     CREATE TABLE IF NOT EXISTS agent_event_outbox (
       id TEXT PRIMARY KEY,
       message_id TEXT NOT NULL,
@@ -426,6 +468,7 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} agent router migration:`, err.message);
 }
+safeAddColumn('agent_media_jobs', 'fallback_applied_at', 'TEXT DEFAULT NULL');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

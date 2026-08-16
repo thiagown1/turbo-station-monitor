@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { estimateCost, extractFinancialFields } = require('../lib/agent-media-classifier');
+const { estimateCost, extractFinancialFields, extractEnergyBill } = require('../lib/agent-media-classifier');
 const { parseExpenseDecision, parseExpenseBrlAmount } = require('../lib/expense-decision');
 
 let passed = 0;
@@ -33,6 +33,55 @@ test('does not invent a BRL value for a foreign-currency charge', () => {
     currency: 'USD', originalAmountMinor: 20000, amountCents: undefined,
   });
   assert.equal(extractFinancialFields({ currency: 'USD', original_amount: 'US$ 200.00', settled_brl_amount: 'R$ 1.120,35' }).amountCents, 112035);
+});
+
+test('normalizes energy invoice vision fields and rejects implausible tariffs', () => {
+  assert.deepEqual(extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      distributor: 'equatorial_go', uc: '4.397.850.012-06', ref_period: { year: 2026, month: 5 },
+      due_date: '2026-05-28', kwh_nao_compensado: '6.173', tarifa_nao_compensada: '0,774023',
+      kwh_compensado: null, tarifa_scee: 99, tarifa_sem_tributos_nao_compensada: '0,62',
+      tarifa_sem_tributos: '0.774', total_brl: 'R$ 135,07',
+    },
+  }), {
+    distributor: 'equatorial_go', uc: '4.397.850.012-06', refPeriod: { year: 2026, month: 5 },
+    dueDate: '2026-05-28', kwhNaoCompensado: 6173, tarifaNaoCompensada: 0.774023,
+    kwhCompensado: null, tarifaScee: null, tarifaSemTributosNaoCompensada: 0.62,
+    tarifaSemTributos: 0.774, totalCents: 13507,
+  });
+  const bounded = extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      kwh_nao_compensado: 1_000_001,
+      kwh_compensado: 1_000_001,
+      total_brl: 'R$ 10.000.000,01',
+    },
+  });
+  assert.equal(bounded.kwhNaoCompensado, null);
+  assert.equal(bounded.kwhCompensado, null);
+  assert.equal(bounded.totalCents, null);
+  const zeroed = extractEnergyBill({
+    kind: 'energy_invoice',
+    energy_bill: {
+      kwh_nao_compensado: 0,
+      tarifa_nao_compensada: '0,00',
+      kwh_compensado: '0',
+      tarifa_scee: 0,
+      tarifa_sem_tributos_nao_compensada: 0,
+      tarifa_sem_tributos: '0',
+    },
+  });
+  assert.equal(zeroed.kwhNaoCompensado, 0);
+  assert.equal(zeroed.tarifaNaoCompensada, 0);
+  assert.equal(zeroed.kwhCompensado, 0);
+  assert.equal(zeroed.tarifaScee, 0);
+  assert.equal(zeroed.tarifaSemTributosNaoCompensada, 0);
+  assert.equal(zeroed.tarifaSemTributos, 0);
+  assert.equal(extractEnergyBill({
+    kind: 'energy_invoice', energy_bill: { total_brl: 'R$ 0,00' },
+  }).totalCents, 0);
+  assert.equal(extractEnergyBill({ kind: 'expense_receipt' }), undefined);
 });
 
 test('parses only explicit expense decisions and gives recurrence precedence', () => {
@@ -62,9 +111,15 @@ test('requires the cited expense code and an allowlisted sender before posting a
         const missingQuote = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'sem codigo', messageId: 'm1' });
         const denied = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511888888888', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm2' });
         const allowed = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv1', senderId: '5511999999999', body: 'registrar recorrente', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm3' });
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) throw new Error('temporary config timeout');
+          throw new Error('unexpected URL ' + url);
+        };
+        const unavailable = await router.routeExpenseDecisionReply({ brandId: 'uncached_brand', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm4' });
         if (missingQuote.handled) throw new Error('uncited reply was handled');
         if (!denied.handled || !denied.reply.includes('não está autorizado')) throw new Error('unauthorized sender not blocked');
         if (!allowed.handled || decisionCalls !== 1) throw new Error('allowed decision not posted exactly once');
+        if (!unavailable.handled || !unavailable.reply.includes('Tente novamente')) throw new Error('config outage escaped the decision flow');
         console.log('agent-decision-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -126,6 +181,300 @@ test('classifies once, caches the receipt and durably delivers one event', () =>
       env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
     });
     assert.ok(output.includes('agent-router-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('defers an energy invoice to Contador with structured fields and no duplicate generic event', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-energy-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        let eventCalls = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv1'], agents: { accounting: true } } }) };
+          if (String(url).includes('openrouter.ai')) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ kind: 'energy_invoice', summary: 'Conta Equatorial', confidence: 0.99, needs_attention: true, energy_bill: { distributor: 'equatorial_go', uc: '1234', ref_period: { year: 2026, month: 7 }, due_date: '2026-08-10', kwh_nao_compensado: 812, tarifa_nao_compensada: 0.75, kwh_compensado: null, tarifa_scee: null, tarifa_sem_tributos_nao_compensada: 0.6, tarifa_sem_tributos: null, total_brl: 'R$ 609,00' } }) } }], usage: {} }) };
+          if (String(url).includes('/api/agents/events')) { eventCalls++; return { ok: true, status: 202, text: async () => '{}' }; }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        const router = require('./lib/agent-router');
+        const input = { messageId: 'energy-1', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', media: { media_type: 'document', mimetype: 'application/pdf; charset=binary' }, receivedAt: now, deferEnergyInvoiceEvent: true };
+        const result = await router.routeInboundMessageDurably(input);
+        await router.deliverDueEvents();
+        const outbox = db.prepare('SELECT COUNT(*) count FROM agent_event_outbox').get();
+        const firstJob = db.prepare('SELECT message_id, kind, status FROM contador_jobs WHERE message_id = ?').get('energy-1');
+        const mediaJob = db.prepare('SELECT status, attempts FROM agent_media_jobs WHERE message_id = ?').get('energy-1');
+        if (!result.eventDeferred || result.energyBill.kwhNaoCompensado !== 812) throw new Error('energy extraction not deferred');
+        if (!result.contadorJobPersisted || firstJob?.kind !== 'pdf' || firstJob?.status !== 'pending') throw new Error('parameterized PDF was not committed as a PDF contador job');
+        if (mediaJob?.status !== 'completed' || mediaJob?.attempts !== 1) throw new Error('classification was not durably completed');
+        if (outbox.count !== 0 || eventCalls !== 0) throw new Error('generic event was duplicated');
+        db.prepare('DELETE FROM contador_jobs WHERE message_id = ?').run('energy-1');
+        const replay = await router.routeInboundMessage(input);
+        const recovered = db.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get('energy-1');
+        if (!replay.duplicate || !replay.contadorJobPersisted || recovered.count !== 1) throw new Error('cached analysis did not recover contador job');
+        console.log('energy-deferred-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('energy-deferred-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('retries a temporary config failure without reserving the Contador message id', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-config-retry-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        let configCalls = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) {
+            configCalls++;
+            if (configCalls === 1) throw new Error('temporary config timeout');
+            return { ok: true, json: async () => ({ config: { enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv1'], agents: { accounting: true } } }) };
+          }
+          if (String(url).includes('openrouter.ai')) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ kind: 'energy_invoice', summary: 'Conta Equatorial', confidence: 0.99, needs_attention: true, energy_bill: { distributor: 'equatorial_go', uc: '1234', ref_period: { year: 2026, month: 7 }, due_date: null, kwh_nao_compensado: 812, tarifa_nao_compensada: 0.75, kwh_compensado: null, tarifa_scee: null, tarifa_sem_tributos_nao_compensada: null, tarifa_sem_tributos: null, total_brl: 'R$ 609,00' } }) } }], usage: {} }) };
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const input = { messageId: 'energy-config-retry', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'conta de energia', media: { media_type: 'image', mimetype: 'image/jpeg' }, receivedAt: nowIso(), deferEnergyInvoiceEvent: true };
+        let firstFailed = false;
+        try { await router.routeInboundMessageDurably(input); } catch (_) { firstFailed = true; }
+        const retryJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+        const prematureContador = db.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get(input.messageId);
+        if (!firstFailed || retryJob?.status !== 'retry') throw new Error('config failure was not left retryable');
+        if (prematureContador.count !== 0) throw new Error('retry reserved the Contador message id');
+        db.prepare("UPDATE agent_media_jobs SET next_attempt_at = ? WHERE message_id = ?").run(nowIso(), input.messageId);
+        await router.deliverDueMediaJobs();
+        const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+        const contadorJob = db.prepare('SELECT status, payload_json FROM contador_jobs WHERE message_id = ?').get(input.messageId);
+        const payload = JSON.parse(contadorJob?.payload_json || '{}');
+        if (completed?.status !== 'completed' || contadorJob?.status !== 'pending') throw new Error('retry did not complete the durable handoff');
+        if (payload.visionExtraction?.kwhNaoCompensado !== 812) throw new Error('retry lost the extracted invoice');
+        console.log('agent-config-retry-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-config-retry-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('caps durable media retries and performs skipped fallback before completion', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-terminal-retry-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        let contadorCalls = 0;
+        let mediaCalls = 0;
+        let emitted = 0;
+        let mediaDescription = '[descrição recuperada]';
+        let suggestionCalls = 0;
+        const suggestionSources = new Set();
+        require.cache[require.resolve('./lib/agent-media-classifier')] = { exports: {
+          classifyMessage: async () => ({ status: 'ok', kind: 'support_attention', summary: 'revisar com suporte', confidence: 0.9 }),
+        } };
+        require.cache[require.resolve('./lib/auto-suggest')] = { exports: {
+          createGroupSuggestion: async (_conversationId, _brandId, options = {}) => {
+            if (!options.sourceMessageId) throw new Error('durable suggestion source id missing');
+            if (suggestionSources.has(options.sourceMessageId)) return { text: 'sugestão recuperada', duplicate: true };
+            suggestionSources.add(options.sourceMessageId);
+            suggestionCalls++;
+            return { text: 'sugestão recuperada' };
+          },
+        } };
+        require.cache[require.resolve('./lib/contador-runtime')] = { exports: {
+          enqueueContadorMessage: (event) => {
+            if (!event.groupJid) return { kind: 'ignored', enqueued: false };
+            contadorCalls++;
+            return { kind: 'pdf', enqueued: true };
+          },
+        } };
+        require.cache[require.resolve('./lib/media-processor')] = { exports: {
+          processMedia: async () => { mediaCalls++; return mediaDescription; },
+        } };
+        require.cache[require.resolve('./lib/sse')] = { exports: {
+          emitEvent: () => { emitted++; },
+        } };
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) throw new Error('permanent config failure');
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const failedInput = { messageId: 'media-failed', conversationId: 'conv1', brandId: 'turbo_station', body: 'imagem', receivedAt: nowIso() };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 4, ?, ?, ?)` + "`" + `).run(failedInput.messageId, JSON.stringify(failedInput), nowIso(), nowIso(), nowIso());
+        await router.deliverDueMediaJobs();
+        const failed = db.prepare('SELECT status, attempts FROM agent_media_jobs WHERE message_id = ?').get(failedInput.messageId);
+        if (failed.status !== 'failed' || failed.attempts !== 5) throw new Error('media retries were not capped');
+
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: false } }) };
+          throw new Error('unexpected URL ' + url);
+        };
+        const skipped = await router.routeInboundMessageDurably({
+          messageId: 'media-skipped', externalMessageId: 'wa-skipped', conversationId: 'conv1', brandId: 'turbo_station',
+          groupJid: 'contas@g.us', instance: 'turbostation', body: 'conta.pdf',
+          media: { media_type: 'document', mimetype: 'application/pdf' }, receivedAt: nowIso(),
+        });
+        const completed = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get('media-skipped');
+        if (!skipped.fallbackHandled || !skipped.contadorFallbackEnqueued || contadorCalls !== 1) throw new Error('skipped fallback was not delivered');
+        if (completed.status !== 'completed') throw new Error('skipped media job was not completed after fallback');
+
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: {
+            enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv-recovery', 'conv-direct-success'],
+            agents: { accounting: true },
+          } }) };
+          if (String(url).includes('/api/agents/events')) return { ok: true, status: 202, text: async () => '{}' };
+          throw new Error('unexpected URL ' + url);
+        };
+        const recoveryInput = {
+          messageId: 'media-success-recovery', externalMessageId: 'wa-success-recovery',
+          conversationId: 'conv-recovery', brandId: 'recovery_brand', groupJid: 'grupo-recovery@g.us',
+          body: '[📷 Imagem]', receivedAt: nowIso(), media: { media_type: 'image', url: '/api/support/media/recovery.jpg' },
+        };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 1, ?, ?, ?)` + "`" + `).run(
+            recoveryInput.messageId, JSON.stringify(recoveryInput), nowIso(), nowIso(), nowIso(),
+          );
+        await router.deliverDueMediaJobs();
+        const recovered = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(recoveryInput.messageId);
+        if (recovered.status !== 'completed' || suggestionCalls !== 1) {
+          throw new Error('successful recovered group media did not complete its support handoff');
+        }
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), recoveryInput.messageId);
+        await router.deliverDueMediaJobs();
+        if (suggestionCalls !== 1) throw new Error('recovered group handoff was not idempotent');
+
+        const directSuccessAt = nowIso();
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-success-recovery', 'conv-direct-success', 'direct_recovery_brand', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct-success', ?)` + "`" + `).run(directSuccessAt);
+        const directSuccessInput = {
+          messageId: 'direct-success-recovery', externalMessageId: 'wa-direct-success',
+          conversationId: 'conv-direct-success', brandId: 'direct_recovery_brand',
+          body: '[📷 Imagem]', receivedAt: directSuccessAt,
+          media: { media_type: 'image', url: '/api/support/media/direct-success.jpg' },
+        };
+        db.prepare(` + "`" + `INSERT INTO agent_media_jobs
+          (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+          VALUES (?, ?, 'retry', 1, ?, ?, ?)` + "`" + `).run(
+            directSuccessInput.messageId, JSON.stringify(directSuccessInput), nowIso(), nowIso(), nowIso(),
+          );
+        await router.deliverDueMediaJobs();
+        const directSuccessJob = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(directSuccessInput.messageId);
+        let directSuccessMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get(directSuccessInput.messageId);
+        if (directSuccessJob.status !== 'completed' || !directSuccessMessage.body.includes('[Análise automática]: revisar com suporte') || emitted !== 1) {
+          throw new Error('successful recovered direct media did not enrich the stored message');
+        }
+        const emittedAfterDirectSuccess = emitted;
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), directSuccessInput.messageId);
+        await router.deliverDueMediaJobs();
+        directSuccessMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get(directSuccessInput.messageId);
+        if ((directSuccessMessage.body.match(/\\[Análise automática\\]:/g) || []).length !== 1 || emitted !== emittedAfterDirectSuccess) {
+          throw new Error('recovered direct media enrichment was not idempotent');
+        }
+
+        const insertedAt = nowIso();
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-media', 'conv-direct', 'turbo_station', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct', ?)` + "`" + `).run(insertedAt);
+        const direct = await router.routeInboundMessageDurably({
+          messageId: 'direct-media', externalMessageId: 'wa-direct', conversationId: 'conv-direct', brandId: 'turbo_station',
+          senderId: '5511999999999', body: '[📷 Imagem]', receivedAt: insertedAt,
+          media: { media_type: 'image', url: '/api/support/media/direct.jpg' },
+        });
+        const directJob = db.prepare('SELECT status, fallback_applied_at FROM agent_media_jobs WHERE message_id = ?').get('direct-media');
+        const directMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
+        if (!direct.fallbackHandled || directJob.status !== 'completed' || !directJob.fallback_applied_at) throw new Error('one-to-one durable fallback was not completed');
+        if (mediaCalls !== 1 || emitted !== emittedAfterDirectSuccess + 1 || !directMessage.body.includes('descrição recuperada')) {
+          throw new Error('one-to-one durable fallback did not enrich the message');
+        }
+        const emittedAfterDirectFallback = emitted;
+        db.prepare("UPDATE agent_media_jobs SET status = 'retry', next_attempt_at = ? WHERE message_id = ?")
+          .run(nowIso(), 'direct-media');
+        await router.deliverDueMediaJobs();
+        const replayedDirectMessage = db.prepare('SELECT body FROM messages WHERE id = ?').get('direct-media');
+        if (mediaCalls !== 1 || emitted !== emittedAfterDirectFallback
+          || replayedDirectMessage.body.split('descrição recuperada').length - 1 !== 1) {
+          throw new Error('one-to-one skipped fallback was not idempotent');
+        }
+
+        mediaDescription = null;
+        db.prepare(` + "`" + `INSERT INTO messages
+          (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at)
+          VALUES ('direct-empty', 'conv-direct', 'turbo_station', 'inbound', 'evolution', '[📷 Imagem]', 'wa-direct-empty', ?)` + "`" + `).run(nowIso());
+        let emptyFailed = false;
+        try {
+          await router.routeInboundMessageDurably({
+            messageId: 'direct-empty', externalMessageId: 'wa-direct-empty', conversationId: 'conv-direct', brandId: 'turbo_station',
+            senderId: '5511999999999', body: '[📷 Imagem]', receivedAt: nowIso(),
+            media: { media_type: 'image', url: '/api/support/media/direct-empty.jpg' },
+          });
+        } catch (_) { emptyFailed = true; }
+        const emptyJob = db.prepare('SELECT status, attempts, last_error FROM agent_media_jobs WHERE message_id = ?').get('direct-empty');
+        if (!emptyFailed || emptyJob.status !== 'retry' || emptyJob.attempts !== 1 || !emptyJob.last_error.includes('empty_result')) {
+          throw new Error('empty one-to-one fallback was not kept retryable');
+        }
+        console.log('agent-terminal-retry-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-terminal-retry-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('deduplicates group suggestions by durable source message id', () => {
+  const dbPath = path.join(os.tmpdir(), `group-suggestion-source-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        let modelCalls = 0;
+        require.cache[require.resolve('./lib/copilot')] = { exports: {
+          generateSuggestion: async () => {
+            modelCalls++;
+            return { text: 'Sugestão única', model: 'test-model' };
+          },
+        } };
+        require.cache[require.resolve('./lib/sse')] = { exports: { emitEvent: () => {} } };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        db.prepare("INSERT INTO conversations (id, brand_id, channel, customer_phone, status, created_at, updated_at) VALUES ('conv-source','turbo_station','whatsapp-group','group@g.us','open',?,?)").run(now, now);
+        db.prepare("INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, created_at) VALUES ('msg-source','conv-source','turbo_station','inbound','evolution','ajuda','wa-source',?)").run(now);
+        const { createGroupSuggestion } = require('./lib/auto-suggest');
+        const first = await createGroupSuggestion('conv-source', 'turbo_station', { sourceMessageId: 'msg-source' });
+        const second = await createGroupSuggestion('conv-source', 'turbo_station', { sourceMessageId: 'msg-source' });
+        const rows = db.prepare('SELECT id, source_message_id FROM suggestions WHERE source_message_id = ?').all('msg-source');
+        if (!first?.suggestionId || !second?.duplicate || rows.length !== 1 || modelCalls !== 1) {
+          throw new Error('group suggestion source dedup failed');
+        }
+        console.log('group-suggestion-source-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('group-suggestion-source-ok'));
   } finally {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
   }
@@ -227,6 +576,7 @@ test('station requests use the tool-backed support suggestion and still require 
         const suggestion = db.prepare("SELECT * FROM suggestions WHERE conversation_id = 'conv1'").get();
         if (result.suggestedReply !== 'Diagnóstico confirmado pelas ferramentas.') throw new Error('deep result missing');
         if (!suggestion || suggestion.status !== 'pending') throw new Error('human support suggestion missing');
+        if (suggestion.source_message_id !== 'msg1') throw new Error('station support suggestion is not durably keyed to its source message');
         console.log('agent-station-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
