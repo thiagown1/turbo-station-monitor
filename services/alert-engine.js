@@ -454,30 +454,68 @@ class AlertEngine {
         const prev = this.cableTheftState[key];
         if (prev && prev.alertedAt) {
             if (!this.hasConnectorRecoveredSince(chargerId, connectorId, prev.alertedAt)) {
+                // Touch the record so an incident that is STILL OPEN can never
+                // age out of the GC window and replay the burst (see
+                // cleanupCableTheftState). Metrópole 3 connector 2 stayed faulted
+                // for 30 days, the record expired, and the same never-resolved
+                // fault re-paged the URGENTE group as if it were brand new.
+                prev.lastSeenAt = Date.now();
+                if (prev.chargerId == null) prev.chargerId = chargerId;
+                this.saveCableTheftState();
                 console.log(`🔇 Cable-theft still open (no recovery since last burst): ${key}`);
                 return false;
             }
             console.log(`♻️ Cable-theft new incident after recovery: ${key}`);
         }
+        const nowTs = Date.now();
         this.cableTheftState[key] = {
-            alertedAt: Date.now(),
+            alertedAt: nowTs,
+            lastSeenAt: nowTs,
+            chargerId,
             connectorId: connectorId != null ? connectorId : null,
         };
         this.saveCableTheftState();
         return true;
     }
 
-    /** Drop cable-theft incident records untouched for >30 days. */
+    /**
+     * Drop cable-theft incident records untouched for >30 days — but ONLY once
+     * the connector has actually RECOVERED. The record is what keeps the burst
+     * silent; expiring it while the fault is still open makes the next tick read
+     * a 30-day-old unresolved theft as a brand-new one and re-page the URGENTE
+     * group (Metrópole 3 connector 2, 2026-08-18 02:00 UTC — the team had known
+     * since 18/07). Age is measured from `lastSeenAt`, refreshed on every
+     * suppressed tick, so an ongoing incident never ages out at all;
+     * `alertedAt` is the fallback for records written before that field existed.
+     */
     cleanupCableTheftState() {
         const now = Date.now();
         const monthMs = 30 * 24 * 60 * 60 * 1000;
         let cleaned = 0;
+        let held = 0;
         Object.keys(this.cableTheftState).forEach(key => {
-            if (now - (this.cableTheftState[key].alertedAt || 0) > monthMs) {
-                delete this.cableTheftState[key];
-                cleaned++;
+            const rec = this.cableTheftState[key] || {};
+            const lastTouch = rec.lastSeenAt || rec.alertedAt || 0;
+            if (now - lastTouch <= monthMs) return;
+
+            const sep = key.lastIndexOf('::');
+            const chargerId = rec.chargerId || (sep > 0 ? key.slice(0, sep) : key);
+            const rawConn = sep > 0 ? key.slice(sep + 2) : '';
+            const connectorId = rec.connectorId != null
+                ? rec.connectorId
+                : (rawConn === 'x' || rawConn === '' ? null : Number(rawConn));
+
+            // Still faulted with no recovery → keep the silence, do NOT expire.
+            if (!this.hasConnectorRecoveredSince(chargerId, connectorId, rec.alertedAt || 0)) {
+                held++;
+                return;
             }
+            delete this.cableTheftState[key];
+            cleaned++;
         });
+        if (held > 0) {
+            console.log(`🔒 Kept ${held} unresolved cable-theft incident(s) past the GC window (no recovery yet)`);
+        }
         if (cleaned > 0) {
             this.saveCableTheftState();
             console.log(`🧹 Cleaned ${cleaned} old cable-theft incident entries`);
