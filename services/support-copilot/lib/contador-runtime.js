@@ -95,8 +95,14 @@ function extractAgentText(result) {
 // work. Schedules run every 15 min and are not latency-sensitive; give the call
 // room and keep the CLI timeout just under the exec kill so the CLI reports its
 // own timeout instead of being SIGTERMed mid-write.
-const AGENT_CLI_TIMEOUT_MS = 240_000;
-const AGENT_EXEC_TIMEOUT_MS = 270_000;
+//
+// The ceiling has to cover the DEGRADED path, not just the happy one: when the
+// box is saturated (CI review agents peg all 4 cores), the CLI spends ~240s
+// retrying the gateway, falls back to embedded transport and only then runs the
+// model turn (~11s). Measured worst case 2026-08-18: 255s wall. 330s leaves
+// real margin and still finishes well inside the 15-minute scheduler tick.
+const AGENT_CLI_TIMEOUT_MS = 300_000;
+const AGENT_EXEC_TIMEOUT_MS = 330_000;
 
 function runAgent(prompt) {
   return new Promise((resolve, reject) => {
