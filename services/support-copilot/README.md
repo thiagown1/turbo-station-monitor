@@ -163,8 +163,53 @@ Two rules keep that from taking the service down again:
    overgrown transcript silently stops receiving alerts — and is then too big
    to compact.
 
+3. **Compaction goes through `openclaw sessions compact`, never
+   `--message /compact`.** OpenClaw 2026.7.1-2 rejects slash commands on the
+   `--message` path (`Slash commands cannot be executed via --message from the
+   CLI`). See below.
+
 Tunable via `SUPPORT_SESSION_TAIL_MAX_BYTES` (default 2 MiB) and
 `SUPPORT_SESSION_RECOMPACT_BYTES` (default 8 MiB).
+
+### How compaction is invoked (and how it broke silently)
+
+`lib/session-compact.js` shells out to:
+
+```
+openclaw sessions compact "agent:<agentId>:explicit:<sessionId>" \
+  --agent <agentId> --json --timeout <ms> [--max-lines <n>]
+```
+
+Three things are load-bearing:
+
+- **The key must be `:explicit:`.** `agent:<id>:main` also resolves but points
+  at whichever session was last made "main" — compacting that truncates an
+  unrelated conversation.
+- **`--json` output is authoritative, not the exit code.** A gateway timeout
+  comes back as `{"ok": false, "error": "gateway timeout after 10000ms"}`
+  without a non-zero exit, so a success check on the exit code alone reports a
+  phantom success.
+- **Oversized sessions use `--max-lines`.** LLM summarization has to load the
+  whole transcript, which is exactly what an overgrown session cannot do — the
+  39 MB one could not be summarized even with a 4-minute deadline. Truncation
+  is the only path that still works past that point, so a session over
+  `SESSION_RECOMPACT_BYTES` skips straight to it.
+
+The previous code sent `/compact` as an agent message. That worked until
+OpenClaw 2026.7.1-2 landed: last success 2026-08-14 23:12:22, gateway restarted
+onto the new version at 23:58:07, first rejection 2026-08-15 00:20:27. Every
+compaction failed for the next four days (102 rejections, zero successes) and
+**nobody noticed**, because the failure was caught as "non-critical" and
+`compacted_at` was stamped anyway — the DB recorded 212 compactions that never
+happened, and the stamp then suppressed every retry.
+
+`compacted_at` is now only written when compaction actually succeeded; a failed
+attempt leaves the session eligible for the next auto-close. If sessions start
+growing again, check for `⚠️ Session compaction failed` in
+`logs/support-copilot-error.log` — that line is now the honest signal.
+
+Tunable via `SUPPORT_COMPACT_MAX_LINES` (default 300) and
+`SUPPORT_COMPACT_TIMEOUT_MS` (default 180000).
 
 ## Database
 

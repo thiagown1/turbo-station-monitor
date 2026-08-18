@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { LOG_TAG, MEDIA_DIR } = require('./constants');
+const { compactSessionWithFallback } = require('./session-compact');
 const {
   readSessionTail,
   rewriteSessionTailWithout,
@@ -1275,6 +1276,7 @@ async function compactSession(conversationId, brandId) {
   console.log(`${LOG_TAG} Compacting session ${sessionId} (agent: ${agentId})`);
 
   let summaryText = null;
+  let compacted = false;
 
   try {
     // Pre-compact: instruct agent to summarize the conversation
@@ -1303,21 +1305,44 @@ async function compactSession(conversationId, brandId) {
       console.log(`${LOG_TAG} Compaction summary captured (${summaryText.length} chars): ${summaryText.substring(0, 120)}...`);
     }
 
-    // Now trigger compaction
-    await callOpenClawAgent(sessionId, '/compact', agentId);
-    console.log(`${LOG_TAG} ✅ Session ${sessionId} compacted successfully`);
+    // Now trigger compaction. NOT via `--message /compact`: OpenClaw 2026.7.1-2
+    // rejects slash commands on that path ("Use: openclaw sessions compact
+    // <key>"), which silently broke every compaction for four days because the
+    // failure is swallowed here and compacted_at is stamped anyway (issue #48).
+    // An oversized session cannot be summarized at all, so that falls back to
+    // truncation — see lib/session-compact.js.
+    const oversized = needsRecompaction(sessionFilePath);
+    const result = await compactSessionWithFallback(sessionId, agentId, { forceTruncate: oversized });
+    compacted = result.ok;
+    if (result.ok) {
+      console.log(`${LOG_TAG} ✅ Session ${sessionId} compacted successfully (${result.mode})`);
+    } else {
+      console.warn(`${LOG_TAG} ⚠️ Session compaction failed for ${sessionId} (${result.mode}): ${result.error}`);
+    }
   } catch (err) {
     // Compaction failure is non-critical — log and continue
     console.warn(`${LOG_TAG} ⚠️ Session compaction failed for ${sessionId}:`, err.message);
   }
 
-  // Mark as compacted and store summary
+  // Store the summary regardless — it is useful on its own — but only stamp
+  // compacted_at when compaction actually happened. Stamping unconditionally is
+  // what hid the four-day outage: the DB claimed 212 compactions while the CLI
+  // was rejecting every one of them, and the stamp then suppressed all retries.
   try {
-    db.prepare('UPDATE session_context SET compacted_at = ?, compaction_summary = ? WHERE conversation_id = ?')
-      .run(nowIso(), summaryText || null, conversationId);
-    console.log(`${LOG_TAG} Session marked as compacted: ${conversationId}`);
+    if (compacted) {
+      db.prepare('UPDATE session_context SET compacted_at = ?, compaction_summary = ? WHERE conversation_id = ?')
+        .run(nowIso(), summaryText || null, conversationId);
+      console.log(`${LOG_TAG} Session marked as compacted: ${conversationId}`);
+    } else {
+      db.prepare('UPDATE session_context SET compaction_summary = ? WHERE conversation_id = ?')
+        .run(summaryText || null, conversationId);
+      console.warn(
+        `${LOG_TAG} NOT marking ${conversationId} as compacted — compaction did not succeed; ` +
+        'it stays eligible for the next auto-close'
+      );
+    }
   } catch (err) {
-    console.warn(`${LOG_TAG} Failed to mark session as compacted:`, err.message);
+    console.warn(`${LOG_TAG} Failed to record compaction state:`, err.message);
   }
 }
 
