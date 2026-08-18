@@ -122,7 +122,14 @@ by `shouldAlertCableTheft(chargerId, connectorId)` instead:
    incident and bursts again.
 
 Incident state persists in `history/cable_theft_incidents.json` (survives
-restarts; pruned after 30 days). Env overrides:
+restarts). A record is pruned only after **both** 30 days have passed since it
+was last touched (`lastSeenAt`, refreshed on every suppressed tick) **and** the
+connector has actually recovered. An incident that is still open therefore never
+ages out — expiring it would make the next tick read the same unresolved theft
+as a brand-new one and re-burst. That is exactly what happened on
+**2026-08-18 02:00 UTC**: Metrópole 3 connector 2 had been faulted since 18/07,
+the record hit the flat 30-day GC, and the URGENTE group was re-paged for a
+theft the team had already handled. Env overrides:
 `ALERT_CABLE_THEFT_BURST_COUNT`, `ALERT_CABLE_THEFT_BURST_INTERVAL_MS`.
 
 The critical **FCM push** for the same fault is a separate, independent path in

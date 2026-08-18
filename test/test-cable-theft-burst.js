@@ -88,17 +88,85 @@ check('recovery on the SAME connector → re-bursts as a new incident', () => {
     assert.strictEqual(e.shouldAlertCableTheft.call(e, 'CH1', 2), true, 're-burst after recovery');
 });
 
-check('cleanupCableTheftState drops entries older than 30 days', () => {
-    const e = {
-        cableTheftState: {
-            'OLD::1': { alertedAt: Date.now() - 40 * 24 * 60 * 60 * 1000 },
-            'NEW::1': { alertedAt: Date.now() - 60 * 1000 },
-        },
+const DAY = 24 * 60 * 60 * 1000;
+
+// The GC fake needs the real recovery check, because "can this record be
+// expired?" is now a function of whether the connector came back.
+function makeGcEngine(state, ocppRows = []) {
+    return {
+        cableTheftState: state,
+        ocppDb: { prepare: () => ({ all: () => ocppRows }) },
         saveCableTheftState() {},
+        isOperationalOcppStatus: AlertEngine.prototype.isOperationalOcppStatus,
+        hasConnectorRecoveredSince: AlertEngine.prototype.hasConnectorRecoveredSince,
+        cleanupCableTheftState: AlertEngine.prototype.cleanupCableTheftState,
     };
-    AlertEngine.prototype.cleanupCableTheftState.call(e);
-    assert.ok(!e.cableTheftState['OLD::1'], 'old incident pruned');
+}
+
+check('cleanupCableTheftState drops RECOVERED entries older than 30 days', () => {
+    const e = makeGcEngine({
+        'OLD::1': { alertedAt: Date.now() - 40 * DAY, connectorId: 1 },
+        'NEW::1': { alertedAt: Date.now() - 60 * 1000, connectorId: 1 },
+    }, [opRow(1, 'Available')]); // connector recovered → safe to forget
+    e.cleanupCableTheftState();
+    assert.ok(!e.cableTheftState['OLD::1'], 'old recovered incident pruned');
     assert.ok(e.cableTheftState['NEW::1'], 'recent incident kept');
+});
+
+// REGRESSION (2026-08-18): Metrópole 3 connector 2 stayed faulted from 18/07.
+// At the 30-day mark the GC dropped the record, the very next tick read the
+// same never-resolved fault as a fresh incident, and the URGENTE group got the
+// full 5x burst again for a theft the team had already handled.
+check('cleanupCableTheftState KEEPS an unresolved incident past 30 days', () => {
+    const e = makeGcEngine({
+        'CH1::2': { alertedAt: Date.now() - 40 * DAY, connectorId: 2 },
+    }, [faultRow(2)]); // still faulted, never recovered
+    e.cleanupCableTheftState();
+    assert.ok(e.cableTheftState['CH1::2'], 'unresolved incident must NOT be expired');
+});
+
+check('unresolved incident survives the GC → still silent on the next tick', () => {
+    const rows = [faultRow(2)];
+    const e = makeGcEngine({
+        'CH1::2': { alertedAt: Date.now() - 40 * DAY, connectorId: 2 },
+    }, rows);
+    e.cleanupCableTheftState();
+    e.shouldAlertCableTheft = AlertEngine.prototype.shouldAlertCableTheft;
+    assert.strictEqual(
+        e.shouldAlertCableTheft('CH1', 2), false,
+        'no re-burst for the same never-resolved fault'
+    );
+});
+
+check('suppressed tick refreshes lastSeenAt so the record never ages out', () => {
+    const e = makeEngine([faultRow(2)]);
+    e.cableTheftState['CH1::2'] = { alertedAt: Date.now() - 40 * DAY, connectorId: 2 };
+    assert.strictEqual(e.shouldAlertCableTheft.call(e, 'CH1', 2), false, 'still silent');
+    const rec = e.cableTheftState['CH1::2'];
+    assert.ok(rec.lastSeenAt >= Date.now() - 5000, 'lastSeenAt refreshed on suppression');
+    assert.ok(rec.alertedAt < Date.now() - 39 * DAY, 'alertedAt is NOT moved (recovery window intact)');
+});
+
+check('GC ages off lastSeenAt, not alertedAt', () => {
+    // Ongoing incident touched a minute ago: old alertedAt must not expire it,
+    // even in the (impossible-in-practice) case where recovery reads true.
+    const e = makeGcEngine({
+        'CH1::2': { alertedAt: Date.now() - 40 * DAY, lastSeenAt: Date.now() - 60 * 1000, connectorId: 2 },
+    }, [opRow(2, 'Available')]);
+    e.cleanupCableTheftState();
+    assert.ok(e.cableTheftState['CH1::2'], 'recently-touched record kept');
+});
+
+check('legacy record without connectorId/chargerId is still GC-safe', () => {
+    // Records written before the chargerId/lastSeenAt fields existed must fall
+    // back to parsing the key rather than throwing or being blindly dropped.
+    const e = makeGcEngine({
+        'CH1::2': { alertedAt: Date.now() - 40 * DAY },
+        'CH2::x': { alertedAt: Date.now() - 40 * DAY },
+    }, [faultRow(2)]);
+    e.cleanupCableTheftState();
+    assert.ok(e.cableTheftState['CH1::2'], 'legacy unresolved record kept');
+    assert.ok(e.cableTheftState['CH2::x'], 'legacy null-connector record kept');
 });
 
 check('formatUrgentCableTheftMessage numbers the burst and announces the silence', () => {
