@@ -23,7 +23,19 @@ const fs = require('node:fs');
 const SERVICE_DIR = path.join(__dirname, '..', '..', 'services', 'support-copilot');
 const PORT = 39500 + Math.floor(Math.random() * 500);
 const DB_PATH = path.join(os.tmpdir(), `support-copilot-smoke-${process.pid}-${Date.now()}.sqlite`);
-const BOOT_TIMEOUT_MS = 15000;
+
+// The service runs ~25 SQLite migrations before it listens, so boot time
+// scales with the runner's disk speed. 15s was tight enough that a slow
+// GitHub Actions runner failed the job on a service that had in fact booted
+// (PR #49, run 32147642479 — the captured output showed the "Listening" line;
+// the identical commit passed on a re-run, 26s of wall clock vs 52s on the
+// failing one). This is a liveness check, not a performance test: give the
+// boot generous room. A genuinely broken boot is still reported immediately
+// by the "process exited early" race below rather than after the timeout.
+const BOOT_TIMEOUT_MS = 60000;
+
+// Printed by services/support-copilot/index.js once the HTTP server is bound.
+const LISTENING_MARKER = 'Listening on';
 
 function cleanupDb() {
   // Best-effort: a just-killed child process may still hold the file open
@@ -38,7 +50,25 @@ function cleanupDb() {
   }
 }
 
-function waitForHealth(deadline) {
+/**
+ * Message for a boot that never answered /health before the deadline.
+ *
+ * A slow boot and a genuinely broken one used to produce the identical
+ * "service never became healthy within the boot timeout" line, which is what
+ * made the PR #49 failure take a re-run to diagnose. Whether the child already
+ * announced itself as listening separates the two cases.
+ */
+function describeBootTimeout({ sawListening, timeoutMs, lastError }) {
+  const seconds = Math.round(timeoutMs / 1000);
+  const tail = lastError ? ` (last connection error: ${lastError})` : '';
+  return sawListening
+    ? `service printed "${LISTENING_MARKER}" but /health never answered within ${seconds}s — `
+      + `the HTTP server bound and then wedged, or it is listening on another port${tail}`
+    : `service never printed "${LISTENING_MARKER}" within ${seconds}s — it either crashed `
+      + `without exiting or is still running its boot migrations${tail}`;
+}
+
+function waitForHealth(deadline, { sawListening = () => false, timeoutMs = BOOT_TIMEOUT_MS } = {}) {
   return new Promise((resolve, reject) => {
     const attempt = () => {
       const req = http.get({ host: '127.0.0.1', port: PORT, path: '/health', timeout: 1000 }, (res) => {
@@ -52,9 +82,13 @@ function waitForHealth(deadline) {
           }
         });
       });
-      req.on('error', () => {
+      req.on('error', (err) => {
         if (Date.now() > deadline) {
-          reject(new Error('service never became healthy within the boot timeout'));
+          reject(new Error(describeBootTimeout({
+            sawListening: sawListening(),
+            timeoutMs,
+            lastError: err.message,
+          })));
         } else {
           setTimeout(attempt, 300);
         }
@@ -78,7 +112,7 @@ function request({ path: requestPath, method = 'GET', headers = {}, body = '' })
   });
 }
 
-(async () => {
+async function main() {
   // SUPPORT_COPILOT_PORT, not PORT: services deliberately ignore the generic
   // PORT (see services/lib/service-port.js). PORT is deleted rather than
   // overwritten so the smoke run does not trip the drift warning if the
@@ -108,7 +142,9 @@ function request({ path: requestPath, method = 'GET', headers = {}, body = '' })
 
   try {
     await Promise.race([
-      waitForHealth(Date.now() + BOOT_TIMEOUT_MS),
+      waitForHealth(Date.now() + BOOT_TIMEOUT_MS, {
+        sawListening: () => output.includes(LISTENING_MARKER),
+      }),
       exitedEarly.then((code) => { throw new Error(`process exited early with code ${code}\n${output}`); }),
     ]);
     const webhook = await request({
@@ -133,4 +169,12 @@ function request({ path: requestPath, method = 'GET', headers = {}, body = '' })
     child.kill();
     cleanupDb();
   }
-})();
+}
+
+if (require.main === module) {
+  main();
+}
+
+// Exported so test/test-smoke-boot-timeout.js can pin the timeout budget and
+// the diagnostic split without booting the real service.
+module.exports = { BOOT_TIMEOUT_MS, LISTENING_MARKER, PORT, describeBootTimeout, waitForHealth };
