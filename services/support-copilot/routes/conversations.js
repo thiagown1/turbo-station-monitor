@@ -21,6 +21,7 @@ const { LOG_TAG, MEDIA_DIR, EVOLUTION_API_KEY } = require('../lib/constants');
 const { sendText, sendMedia } = require('../lib/evolution-client');
 const { emitEvent } = require('../lib/sse');
 const { generateSuggestion, injectIntoSession, buildContextPreview, compactSession, extractLearnedRule, removeSuggestionFromSession, resetAgentSession } = require('../lib/copilot');
+const { readSessionTail, countSessionLines, sessionFileSize, needsRecompaction } = require('../lib/session-file');
 const { classifyConversationOutcome } = require('../lib/outcome-classifier');
 
 const router = Router();
@@ -616,30 +617,35 @@ router.post('/:id/context-preview', (req, res) => {
     const OPENCLAW_HOME = process.env.OPENCLAW_HOME || '/home/openclaw/.openclaw';
     const sessionPath = require('path').join(OPENCLAW_HOME, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
 
+    // Tail-only read: session .jsonl files are append-only and unbounded (the
+    // alert feed reached 39MB), and loading one whole blew past pm2's memory
+    // cap — see lib/session-file.js and issue #48. The preview only ever needs
+    // the recent end of the transcript.
     let sessionEntries = [];
+    let sessionTruncated = false;
+    let sessionTotalBytes = 0;
     try {
-      if (require('fs').existsSync(sessionPath)) {
-        const content = require('fs').readFileSync(sessionPath, 'utf8');
-        const lines = content.split('\n').filter(l => l.trim());
-        sessionEntries = lines.map((line, i) => {
-          try {
-            const entry = JSON.parse(line);
-            // Summarize large content to avoid sending megabytes
-            if (entry.message?.content && entry.message.content.length > 500) {
-              return {
-                ...entry,
-                message: {
-                  ...entry.message,
-                  content: entry.message.content.substring(0, 500) + `... [${entry.message.content.length} chars total]`,
-                },
-              };
-            }
-            return entry;
-          } catch {
-            return { raw: line.substring(0, 200), line: i };
+      const tail = readSessionTail(sessionPath);
+      sessionTruncated = tail.truncated;
+      sessionTotalBytes = tail.totalBytes;
+      sessionEntries = tail.lines.map((line, i) => {
+        try {
+          const entry = JSON.parse(line);
+          // Summarize large content to avoid sending megabytes
+          if (entry.message?.content && entry.message.content.length > 500) {
+            return {
+              ...entry,
+              message: {
+                ...entry.message,
+                content: entry.message.content.substring(0, 500) + `... [${entry.message.content.length} chars total]`,
+              },
+            };
           }
-        });
-      }
+          return entry;
+        } catch {
+          return { raw: line.substring(0, 200), line: i };
+        }
+      });
     } catch (err) {
       console.warn(`${LOG_TAG} Could not read session JSONL:`, err.message);
     }
@@ -653,6 +659,9 @@ router.post('/:id/context-preview', (req, res) => {
         path: sessionPath,
         entryCount: sessionEntries.length,
         entries: sessionEntries,
+        // `entries` is the tail, not the whole session, when truncated is true.
+        truncated: sessionTruncated,
+        totalBytes: sessionTotalBytes,
       },
       sessionDB: sessionCtx || null,
     });
@@ -663,7 +672,7 @@ router.post('/:id/context-preview', (req, res) => {
 });
 
 // ─── Session Info (compaction summary + state) ────────────────────────────
-router.get('/:id/session-info', (req, res) => {
+router.get('/:id/session-info', async (req, res) => {
   const conv = stmts.getConversation.get(req.params.id);
   if (!conv) return res.status(404).json({ error: 'Not found' });
 
@@ -675,12 +684,16 @@ router.get('/:id/session-info', (req, res) => {
   // Check if session JSONL file exists
   const OPENCLAW_HOME = process.env.OPENCLAW_HOME || '/home/openclaw/.openclaw';
   const sessionPath = require('path').join(OPENCLAW_HOME, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
+  // Streamed count — the old readFileSync().split() on the 39MB alert session
+  // cost ~67MB of peak RSS on its own and was enough to trip pm2's cap (#48).
   let sessionFileExists = false;
   let sessionLineCount = 0;
+  let sessionFileBytes = 0;
   try {
     if (require('fs').existsSync(sessionPath)) {
       sessionFileExists = true;
-      sessionLineCount = require('fs').readFileSync(sessionPath, 'utf8').split('\n').filter(l => l.trim()).length;
+      sessionFileBytes = sessionFileSize(sessionPath);
+      sessionLineCount = await countSessionLines(sessionPath);
     }
   } catch { /* ignore */ }
 
@@ -689,6 +702,9 @@ router.get('/:id/session-info', (req, res) => {
     agentId,
     sessionFileExists,
     sessionLineCount,
+    sessionFileBytes,
+    // Surfaces an overgrown session in the dashboard before it becomes a problem.
+    sessionNeedsRecompaction: needsRecompaction(sessionPath),
     compactedAt: sessionCtx?.compacted_at || null,
     compactionSummary: sessionCtx?.compaction_summary || null,
     lastMsgIndex: sessionCtx?.last_msg_index || 0,

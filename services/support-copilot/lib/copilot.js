@@ -16,6 +16,12 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { LOG_TAG, MEDIA_DIR } = require('./constants');
+const {
+  readSessionTail,
+  rewriteSessionTailWithout,
+  sessionFileSize,
+  needsRecompaction,
+} = require('./session-file');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
 const { classifyConversationOutcome } = require('./outcome-classifier');
@@ -1250,9 +1256,20 @@ async function compactSession(conversationId, brandId) {
     console.log(`${LOG_TAG} Skipping compact for ${conversationId} — copilot never used`);
     return;
   }
-  if (sessionCtx.compacted_at) {
+  // "Compacted once, never again" is what let the always-active alert feed grow
+  // to 39MB after its single compaction (issue #48). A conversation that keeps
+  // reopening keeps appending, so an overgrown session is eligible again.
+  const OPENCLAW_HOME = process.env.OPENCLAW_HOME || '/home/openclaw/.openclaw';
+  const sessionFilePath = path.join(OPENCLAW_HOME, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
+  if (sessionCtx.compacted_at && !needsRecompaction(sessionFilePath)) {
     console.log(`${LOG_TAG} Skipping compact for ${conversationId} — already compacted at ${sessionCtx.compacted_at}`);
     return;
+  }
+  if (sessionCtx.compacted_at) {
+    const sizeMB = (sessionFileSize(sessionFilePath) / 1048576).toFixed(1);
+    console.log(
+      `${LOG_TAG} Re-compacting ${conversationId} — session regrew to ${sizeMB}MB since ${sessionCtx.compacted_at}`
+    );
   }
 
   console.log(`${LOG_TAG} Compacting session ${sessionId} (agent: ${agentId})`);
@@ -1550,8 +1567,11 @@ async function removeSuggestionFromSession(conversationId, brandId) {
   }
 
   try {
-    const content = fs.readFileSync(sessionPath, 'utf8');
-    const lines = content.split('\n').filter(l => l.trim());
+    // Tail-scoped: the pair we remove is always at the end, and reading the
+    // whole session cost ~208MB peak RSS on the 39MB alert transcript — past
+    // pm2's cap, which is what recycled the service (issue #48). Indices below
+    // are relative to the tail, not the file.
+    const { lines, truncated, totalBytes } = readSessionTail(sessionPath);
 
     // Walk backwards to find the last assistant + user message pair
     let assistantIdx = -1;
@@ -1571,13 +1591,15 @@ async function removeSuggestionFromSession(conversationId, brandId) {
     }
 
     if (userIdx === -1 || assistantIdx === -1) {
-      console.warn(`${LOG_TAG} Could not find user+assistant pair to remove in ${sessionId}`);
+      console.warn(
+        `${LOG_TAG} Could not find user+assistant pair to remove in ${sessionId}` +
+        (truncated ? ` (searched the last ${lines.length} entries of a ${(totalBytes / 1048576).toFixed(1)}MB session)` : '')
+      );
       return;
     }
 
     // Remove the user message and assistant response
-    const cleaned = lines.filter((_, idx) => idx !== userIdx && idx !== assistantIdx);
-    fs.writeFileSync(sessionPath, cleaned.join('\n') + '\n');
+    rewriteSessionTailWithout(sessionPath, [userIdx, assistantIdx]);
 
     // Also roll back the session_context last_msg_index by 1 so the next suggest
     // re-sends the last customer message (since the agent no longer has it in context)

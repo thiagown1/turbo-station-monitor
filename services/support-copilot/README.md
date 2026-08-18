@@ -128,6 +128,44 @@ copilot owns webhook authentication, conversation/message persistence,
 operator sends and agent routing. See [docs/CONTADOR.md](docs/CONTADOR.md) for
 the accounting-agent boundaries and activation runbook.
 
+### Memory budget
+
+`max_memory_restart` is **256M**. Steady state measured on the live process is
+86–102 MB RSS (heap 14–26 MB); the rest is headroom for transients — media
+base64, `openclaw agent` stdout buffers (5 MB each, several can overlap during
+an alert burst), and session-tail reads.
+
+The previous 150M cap sat only ~50 MB above steady state and was being tripped
+by a single transient, recycling the service and dropping in-flight work (160
+restarts, bursts as tight as 11 min — issue #48). Raising the cap was the last
+step, not the fix; see below.
+
+### Agent session files
+
+Each conversation has an append-only transcript at
+`$OPENCLAW_HOME/agents/<agentId>/sessions/<sessionId>.jsonl`. These grow
+without bound while a conversation stays active — the "Notificações Turbo
+Station" alert feed reached 39 MB / 17k lines.
+
+Two rules keep that from taking the service down again:
+
+1. **Never read a session file whole.** Use `lib/session-file.js`
+   (`countSessionLines`, `readSessionTail`, `rewriteSessionTailWithout`), all of
+   which are bounded regardless of session size. `readFileSync(p,'utf8')
+   .split('\n')` on that 39 MB file peaked at 208 MB RSS — past the old cap on
+   its own. `__tests__/session-file.test.js` guards this with a peak-RSS
+   assertion plus a CONTROL case running the old approach.
+2. **Sessions get re-compacted.** Compaction used to be once-per-lifetime, so
+   an always-active conversation grew unbounded after its single pass. It now
+   runs again whenever the file exceeds `SESSION_RECOMPACT_BYTES` (8 MiB).
+   This matters beyond memory: past roughly 30 MB the OpenClaw agent fails to
+   load the session at all (`Failed to inject into session ...`), so an
+   overgrown transcript silently stops receiving alerts — and is then too big
+   to compact.
+
+Tunable via `SUPPORT_SESSION_TAIL_MAX_BYTES` (default 2 MiB) and
+`SUPPORT_SESSION_RECOMPACT_BYTES` (default 8 MiB).
+
 ## Database
 
 SQLite with WAL mode. Core tables: `brands`, `conversations`, `messages`,
