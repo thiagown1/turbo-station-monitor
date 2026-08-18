@@ -191,7 +191,24 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: true,
       watch: false,
-      max_memory_restart: '150M',
+      // 150M sat only ~50MB above the service's own working set, so a single
+      // transient — a whole-session read, a base64'd image, a couple of
+      // concurrent `openclaw agent` stdout buffers — tripped it and pm2 killed
+      // in-flight work (issue #48; 160 restarts, bursts as tight as 11 min).
+      //
+      // Measured on the live process 2026-08-18 (37 samples / 19 min, taken at
+      // 12h uptime with zero restarts in the window): RSS 86-102MB, heap
+      // 14-26MB. RSS drifts up within that band with activity rather than
+      // sitting flat, but it is not unbounded: at the drift observed in-window
+      // the process would have passed 150M inside two hours, and it had been up
+      // twelve at 102MB. The restarts were spikes, not a leak.
+      //
+      // 256M = that ~100MB working set plus headroom for the real transients:
+      // media base64 (~25MB for a large image), execFile stdout buffers (5MB
+      // each, several may overlap during an alert burst), and the 2MiB
+      // session-tail reads. Still tight enough to catch a genuine runaway, and
+      // the box has room (16GB total, ~2.2GB across all 40 pm2 processes).
+      max_memory_restart: '256M',
       error_file: './logs/support-copilot-error.log',
       out_file: './logs/support-copilot-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
