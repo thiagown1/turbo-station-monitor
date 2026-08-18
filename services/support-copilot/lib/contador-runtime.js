@@ -87,6 +87,17 @@ function extractAgentText(result) {
   ).trim();
 }
 
+// The OpenClaw gateway spends most of a Contador call on session load and
+// workspace injection, not on the model turn: measured 2026-08-18, successful
+// calls land at ~130-140s wall while the model turn itself is ~3s. The previous
+// 135s exec ceiling therefore killed roughly half the runs (the 2026-08-18
+// monthly closing died at ~145s), so both ledgers burned retries on healthy
+// work. Schedules run every 15 min and are not latency-sensitive; give the call
+// room and keep the CLI timeout just under the exec kill so the CLI reports its
+// own timeout instead of being SIGTERMed mid-write.
+const AGENT_CLI_TIMEOUT_MS = 240_000;
+const AGENT_EXEC_TIMEOUT_MS = 270_000;
+
 function runAgent(prompt) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -95,12 +106,12 @@ function runAgent(prompt) {
       '--session-id', config.sessionId,
       '--model', config.model,
       '--json',
-      '--timeout', '120',
+      '--timeout', String(Math.floor(AGENT_CLI_TIMEOUT_MS / 1000)),
       '-m', prompt,
     ];
     const env = { ...process.env, NO_COLOR: '1' };
     delete env.OPENCLAW_GATEWAY_URL;
-    execFile(OPENCLAW_BIN, args, { timeout: 135_000, maxBuffer: 8 * 1024 * 1024, env }, (error, stdout, stderr) => {
+    execFile(OPENCLAW_BIN, args, { timeout: AGENT_EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, env }, (error, stdout, stderr) => {
       if (error) return reject(new Error(`OpenClaw Contador failed: ${error.message}${stderr ? ` | ${String(stderr).slice(0, 180)}` : ''}`));
       try {
         const text = extractAgentText(JSON.parse(stdout));
