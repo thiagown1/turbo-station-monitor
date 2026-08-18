@@ -148,7 +148,14 @@ module.exports = {
       exec_mode: 'fork',
       autorestart: true,
       watch: false,
-      max_memory_restart: '100M',
+      // Steady-state RSS measured at ~90MB (2026-08-18, sampled every 25s for
+      // 3min: 93.1 → 89.8MB, flat-to-decreasing, so the working set is real and
+      // not a leak). It opens four SQLite DBs (ocpp, vercel, mobile, alerts) and
+      // holds them for the life of the process. The old 100M left ~10MB of
+      // headroom, so a routine spike (a wide fault query, a burst) tripped the
+      // ceiling: 8 recycles in the 40min after a restart. A recycle mid-burst
+      // silently drops the URGENTE messages that had not gone out yet.
+      max_memory_restart: '256M',
       error_file: './logs/alert-engine-error.log',
       out_file: './logs/alert-engine-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
