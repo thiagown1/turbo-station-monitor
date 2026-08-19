@@ -38,6 +38,23 @@ async function loadConfig(brandId) {
   }
 }
 
+/**
+ * Resolve group -> accounting agent from the Agent Center, the single place an
+ * operator edits which agent serves which group.
+ * Returns true/false when the central answers, and undefined when it is
+ * unreachable so callers can fall back to CONTADOR_GROUP_CONVERSATION_ID
+ * instead of dropping the message.
+ */
+async function isAccountingGroup(brandId, conversationId) {
+  try {
+    const config = await loadConfig(brandId);
+    if (!config) return undefined;
+    return (config.accountingGroupConversationIds || []).includes(conversationId);
+  } catch (_) {
+    return undefined;
+  }
+}
+
 function recentContext(conversationId) {
   return db.prepare('SELECT direction, body FROM messages WHERE conversation_id = ? ORDER BY datetime(created_at) DESC LIMIT 8')
     .all(conversationId).reverse().map(m => `[${m.direction}]: ${m.body}`).join('\n');
@@ -474,6 +491,7 @@ module.exports = {
   deliverDueMediaJobs,
   startAgentEventWorker,
   loadConfig,
+  isAccountingGroup,
   shouldDeferEnergyInvoice,
   isPdfInput,
 };

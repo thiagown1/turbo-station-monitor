@@ -28,7 +28,20 @@ function normalizedMime(value) {
 function classifyInbound(event, config) {
   if (!config?.enabled) return { kind: 'ignored', reason: 'disabled' };
   if (event?.direction !== 'inbound') return { kind: 'ignored', reason: 'not_inbound' };
-  if (!event.groupJid || event.groupJid !== config.groupConversationId) {
+  // Group authority: the Agent Center (Next) is the source of truth for which
+  // group each agent serves. routeInboundMessage resolves it from
+  // config.accountingGroupConversationIds and passes it down as accountingGroup.
+  // CONTADOR_GROUP_CONVERSATION_ID stays only as a fail-safe for paths that
+  // enqueue without the router, and for when the central config is unreachable.
+  // true  -> the Agent Center lists this group for the accounting agent
+  // false -> it explicitly does NOT: the central wins over the env var
+  // undefined -> central unreachable: fall back to the env so a Next outage
+  //              cannot silence the Contador
+  const groupAllowed = event.accountingGroup === true
+    || (event.accountingGroup !== false
+      && Boolean(event.groupJid)
+      && event.groupJid === config.groupConversationId);
+  if (!groupAllowed) {
     return { kind: 'ignored', reason: 'group_not_allowed' };
   }
 
@@ -42,6 +55,15 @@ function classifyInbound(event, config) {
 
   const body = String(event.body || '');
   if (event.replyToContador || ACCOUNTING_TRIGGER.test(body)) return { kind: 'query' };
+  // Open conversation: in its own group the Contador sees every message and the
+  // AGENT decides whether to answer, returning {"action":"silent"} when a turn
+  // is human-to-human chatter that asks nothing of it. The keyword gate above
+  // only ever matched accounting vocabulary, so a plain "oi" was dropped here as
+  // ordinary_chatter and nothing replied -- the group looked dead while 8205
+  // unread suggestions piled up behind it.
+  // Gated by CONTADOR_OPEN_CONVERSATION so it can be switched off without a
+  // deploy if the agent starts talking over people.
+  if (config.openConversation) return { kind: 'query', reason: 'open_conversation' };
   return { kind: 'ignored', reason: 'ordinary_chatter' };
 }
 
@@ -240,6 +262,13 @@ function initialPrompt(event, messages, openDrafts) {
     'Se esta mensagem for uma resposta citada a uma pergunta sua sobre um draft, consulte estacoes quando necessário e conclua SOMENTE o draft explícito.',
     'Para concluir, use {"action":"resolve_draft","draftId":"...","stationId":"...","fields":{...}}. Só copie UC e campos numéricos literalmente informados pelo operador; nunca derive valores. totalCents é inteiro em centavos; kWh e tarifas são números decimais nas unidades originais.',
     'Se um kWh ou tarifa puder pertencer tanto à distribuidora quanto ao gerador solar, faça uma pergunta objetiva; nunca escolha o lado por suposição.',
+    // The group now forwards EVERY message, so the agent needs an explicit rule
+    // for when not to speak. Without this it would answer chatter between the
+    // operators (and third parties in the group) as if addressed to it.
+    'Você recebe TODAS as mensagens do grupo, inclusive conversa entre pessoas que não é dirigida a você.',
+    'Responda quando a mensagem falar com você, pedir algo seu (contas, faturas, energia, pendências, lançamentos, NFS-e) ou for saudação ou pergunta direta a você.',
+    'Use {"action":"silent"} quando for conversa entre humanos, combinação entre eles, confirmação de algo que não é seu, ou qualquer turno em que responder seria intrometido. Silêncio é a escolha certa e barata; na dúvida entre falar e calar, cale.',
+    'Nunca comente, resuma ou reaja a mensagens que não pedem nada de você.',
     'Responda SOMENTE JSON em um destes formatos:',
     '{"action":"tool","tool":"pendencias","params":{"year":2026,"month":8}}',
     '{"action":"reply","text":"resposta curta"}',

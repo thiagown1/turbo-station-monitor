@@ -480,6 +480,11 @@ router.post('/', async (req, res) => {
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
       const quoted = quotedOutboundMessage(message, conversationId);
+      // Which agent serves this group is decided in the Agent Center, not here.
+      // undefined means the central was unreachable, and classifyInbound then
+      // falls back to CONTADOR_GROUP_CONVERSATION_ID.
+      const { isAccountingGroup } = require('../lib/agent-router');
+      const accountingGroup = await isAccountingGroup(brandId, conversationId);
       const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
@@ -491,6 +496,7 @@ router.post('/', async (req, res) => {
         senderId,
         body,
         media,
+        accountingGroup,
         replyToContador: quoted?.source === 'contador',
         quotedContadorDraftId: quoted?.draftId || null,
       };
