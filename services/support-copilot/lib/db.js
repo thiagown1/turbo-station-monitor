@@ -399,6 +399,18 @@ try {
     -- ("HB Center e da Decathlon", "as estacoes de Goiania quem cuida e a
     -- Prime"). Injetado em todo prompt, para ele nao reperguntar o que ja
     -- foi dito. Fato errado se corrige marcando status='revogado'.
+    -- Perguntas que o Contador precisa fazer e que NAO dao para derivar das
+    -- tools (quanto cada fornecedor cobra de desagio, faturas que so existem
+    -- no papel). Ele repete na cobranca ate alguem responder; a resposta vira
+    -- fato em contador_fatos e a pergunta e encerrada.
+    CREATE TABLE IF NOT EXISTS contador_perguntas_abertas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pergunta TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'aberta',
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS contador_fatos (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       fato TEXT NOT NULL UNIQUE,

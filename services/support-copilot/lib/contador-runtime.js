@@ -165,6 +165,31 @@ function loadContext(conversationId, limit = 30) {
   `).all(conversationId, Math.min(30, Math.max(1, limit))).reverse();
 }
 
+/** Perguntas ainda sem resposta, que a cobranca deve repetir. */
+function listarPerguntasAbertas(limit = 12) {
+  return db.prepare(`
+    SELECT id, pergunta FROM contador_perguntas_abertas
+    WHERE status = 'aberta' ORDER BY id ASC LIMIT ?
+  `).all(Math.min(30, Math.max(1, limit)));
+}
+
+/** Encerra perguntas que foram respondidas. */
+function resolverPerguntas(ids) {
+  const lista = (Array.isArray(ids) ? ids : [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (!lista.length) return 0;
+  const now = nowIso();
+  const stmt = db.prepare(`
+    UPDATE contador_perguntas_abertas SET status = 'respondida', resolved_at = ?
+    WHERE id = ? AND status = 'aberta'
+  `);
+  let n = 0;
+  db.transaction(() => { for (const id of lista) n += stmt.run(now, id).changes; })();
+  if (n) console.log(`${LOG_TAG} [contador] encerrou ${n} pergunta(s)`);
+  return n;
+}
+
 /** Fatos ativos que o grupo ja ensinou, mais recentes primeiro. */
 function listarFatos(limit = 40) {
   return db.prepare(`
@@ -323,6 +348,8 @@ let contador = buildContador({
   loadContext,
   listarFatos,
   registrarFatos,
+  listarPerguntasAbertas,
+  resolverPerguntas,
 });
 
 function _setContadorForTest(value) {
@@ -716,6 +743,8 @@ module.exports = {
   processRegularizacao,
   listarFatos,
   registrarFatos,
+  listarPerguntasAbertas,
+  resolverPerguntas,
   startContadorRuntime,
   resolveMediaPath,
   sendReply,
