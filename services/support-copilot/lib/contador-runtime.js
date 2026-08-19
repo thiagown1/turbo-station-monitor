@@ -118,7 +118,16 @@ function runAgent(prompt) {
     const env = { ...process.env, NO_COLOR: '1' };
     delete env.OPENCLAW_GATEWAY_URL;
     execFile(OPENCLAW_BIN, args, { timeout: AGENT_EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, env }, (error, stdout, stderr) => {
-      if (error) return reject(new Error(`OpenClaw Contador failed: ${error.message}${stderr ? ` | ${String(stderr).slice(0, 180)}` : ''}`));
+      if (error) {
+        // Cause FIRST: the ledger truncates last_error at 500 chars and
+        // error.message starts with the whole command line (prompt included),
+        // so appending stderr at the end meant every failure was persisted as
+        // an unreadable command echo with the real reason cut off.
+        const NEWLINE = String.fromCharCode(10);
+        const why = String(stderr || '').trim().split(NEWLINE).filter(Boolean).slice(-3).join(' / ').slice(0, 300)
+          || (error.killed ? `killed after timeout (signal ${error.signal || 'n/a'})` : `exit code ${error.code}`);
+        return reject(new Error(`OpenClaw Contador failed [${why}] (code=${error.code}, killed=${Boolean(error.killed)})`));
+      }
       try {
         const text = extractAgentText(JSON.parse(stdout));
         if (!text) throw new Error('empty response');
