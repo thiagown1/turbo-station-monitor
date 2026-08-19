@@ -600,6 +600,68 @@ test('model context masks common PII formats', () => {
   assert.doesNotMatch(redacted, /123\.456|12\.345|99999|a@b/);
 });
 
+test('open conversation lets the agent decide instead of a keyword gate', () => {
+  const open = { ...config, openConversation: true };
+
+  // The regression this fixes: a plain greeting used to be dropped as
+  // ordinary_chatter, so nothing ever replied in the group.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    body: 'oi',
+  }, open).kind, 'query');
+
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    body: 'ok, obrigado',
+  }, open).reason, 'open_conversation');
+
+  // Kill switch off -> previous keyword-only behaviour, unchanged.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    body: 'oi',
+  }, { ...config, openConversation: false }).kind, 'ignored');
+
+  // Open conversation never widens WHICH group is served.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: 'other@g.us',
+    body: 'oi',
+  }, open).reason, 'group_not_allowed');
+});
+
+test('Agent Center decides the group, env var is only the fallback', () => {
+  const open = { ...config, openConversation: true };
+
+  // Central says yes -> served even if the env var points elsewhere.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: 'central-approved@g.us',
+    accountingGroup: true,
+    body: 'quais contas faltam?',
+  }, open).kind, 'query');
+
+  // Central says no -> refused even though the env var would allow it.
+  // Without this the central could never REMOVE a group from the agent.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    accountingGroup: false,
+    body: 'quais contas faltam?',
+  }, open).reason, 'group_not_allowed');
+
+  // Central unreachable -> fall back to the env var so a Next outage does not
+  // silence the Contador.
+  assert.equal(classifyInbound({
+    direction: 'inbound',
+    groupJid: config.groupConversationId,
+    accountingGroup: undefined,
+    body: 'quais contas faltam?',
+  }, open).kind, 'query');
+});
+
 (async () => {
   let failed = 0;
   for (const { name, fn } of tests) {

@@ -42,6 +42,14 @@ const GROUP_AGENT = process.env.GROUP_AGENT || 'support_turbo_station';
 // Fail closed: code can be deployed without enabling WhatsApp writes or reads.
 const CONTADOR_ENABLED = process.env.CONTADOR_ENABLED === 'true';
 const CONTADOR_GROUP_CONVERSATION_ID = (process.env.CONTADOR_GROUP_CONVERSATION_ID || '').trim();
+// Open conversation in the Contador's own group: forward every message and let
+// the agent decide (reply vs silent) instead of gating on accounting keywords.
+// OPT-IN on purpose. Defaulting this ON would change behaviour for any group
+// the Contador already serves the moment the code ships, with no operator
+// action -- exactly what the runtime test that caught it asserts against.
+// Enable per environment with CONTADOR_OPEN_CONVERSATION=true; unset or any
+// other value keeps the previous keyword+reply gate.
+const CONTADOR_OPEN_CONVERSATION = process.env.CONTADOR_OPEN_CONVERSATION === 'true';
 const CONTADOR_NEXT_BASE_URL = (process.env.CONTADOR_NEXT_BASE_URL || '').replace(/\/$/, '');
 const CONTADOR_NEXT_SECRET = process.env.CONTADOR_NEXT_SECRET || process.env.ENERGY_BILL_INTAKE_SECRET || '';
 const CONTADOR_INSTANCE = process.env.CONTADOR_INSTANCE || process.env.GATEWAY_INSTANCE_NAME || 'turbostation';
@@ -81,6 +89,7 @@ module.exports = {
   GROUP_AGENT,
   CONTADOR_ENABLED,
   CONTADOR_GROUP_CONVERSATION_ID,
+  CONTADOR_OPEN_CONVERSATION,
   CONTADOR_NEXT_BASE_URL,
   CONTADOR_NEXT_SECRET,
   CONTADOR_INSTANCE,
