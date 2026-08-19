@@ -250,6 +250,8 @@ async function notifyDeploy(message, options = {}) {
     conversationId = process.env.MONITOR_DEPLOY_WHATSAPP_CONV || process.env.ALERT_WHATSAPP_CONV || 'conv_jiuijxjtmnet23i9',
     brandId = process.env.ALERT_WHATSAPP_BRAND || 'turbo',
     secret = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '',
+    // Pass `null` to mean "no transport" — an omitted/undefined value falls
+    // back to the global fetch, which on any Node >= 18 is a REAL network call.
     fetchImpl = globalThis.fetch,
     timeoutMs = 15000,
   } = options;

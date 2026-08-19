@@ -159,9 +159,13 @@ async function expectReject(name, fn, pattern) {
   assert.strictEqual(noConv.delivered, false);
   assert.match(noConv.reason, /conversation/i);
 
-  const noFetch = await notifyDeploy('x', { ...notifyOpts, fetchImpl: undefined });
+  // `null`, not `undefined`: undefined falls through to the destructuring
+  // default and would issue a REAL request from the runner. No unit test in this
+  // file is allowed to touch the network.
+  const noFetch = await notifyDeploy('x', { ...notifyOpts, fetchImpl: null });
   assert.strictEqual(noFetch.delivered, false);
   assert.match(noFetch.reason, /fetch/i);
+  assert.ok(!/support API/.test(noFetch.reason), 'não pode ter saído pela rede');
   console.log('  ✅ notifyDeploy names the missing configuration instead of failing silently');
 
   console.log('✅ Auto-deploy tests passed');
