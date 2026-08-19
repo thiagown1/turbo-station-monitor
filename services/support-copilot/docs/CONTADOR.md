@@ -71,6 +71,37 @@ writing. Context sent to the model is capped at 30 messages and masks email
 addresses and long numeric identifiers. Structured amounts and tariffs are
 queried on demand, never read from memory files.
 
+## Where the Contador may speak (group scoping)
+
+The agent is scoped to the configured accounting group on every axis, and the
+inbound gate is duplicated so a single missed check cannot open it:
+
+- **Inbound**: `classifyInbound` drops anything whose `groupJid` is not exactly
+  `CONTADOR_GROUP_CONVERSATION_ID` (`lib/contador.js`), and
+  `canRouteContadorEvent` repeats the check before a job is queued
+  (`lib/contador-runtime.js`). A DM or another group never reaches the model.
+  Inside the group, ordinary chatter is still ignored unless it is a PDF/image,
+  an accounting keyword, or a reply to the Contador.
+- **Outbound**: the daily heartbeat and the monthly closing pass
+  `config.groupConversationId` explicitly; job replies carry the `groupJid` that
+  already passed the inbound gate.
+- **Expense decisions (`EXP-` quoted replies)**: this path is reachable from any
+  chat that quotes a bot message carrying the code, so it checks
+  `accountingGroupConversationIds` FIRST and returns `{ silent: true }` outside
+  them — the ingest route then sends nothing at all. Inside an accounting
+  conversation a non-allowlisted sender still gets the refusal, because the
+  operator needs to know why their decision did nothing.
+- **Writes are revalidated in Next**, independently of this box:
+  `/api/agents/expense-decisions` enforces conversation allowlist (403), sender
+  allowlist (403) and decision-code match (409); `/api/accounting/energy-bill-intake`
+  rejects a `groupConversationId` that differs from the configured one (403) and
+  re-checks it against the stored draft on every step.
+
+Note the read-only tool surface `/api/accounting/energy-agent/query` has **no**
+group check by design — its gates are the scoped bearer secret plus the
+`energy_bill_intake` kill switch, both fail-closed. That secret is therefore the
+asset to rotate if this box is ever suspect.
+
 ## Runtime configuration
 
 | Variable | Required to activate | Default / purpose |

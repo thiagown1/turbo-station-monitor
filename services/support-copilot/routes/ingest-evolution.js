@@ -501,7 +501,9 @@ router.post('/', async (req, res) => {
           body, quotedBody: quoted.body,
         });
         if (decision.handled) {
-          await sendReply(decision.reply, contadorEvent).catch((err) => console.warn(`${LOG_TAG} expense decision reply failed:`, err.message));
+          // decision.silent = not an accounting conversation; the agent must
+          // not speak there at all, not even to refuse.
+          if (!decision.silent && decision.reply) await sendReply(decision.reply, contadorEvent).catch((err) => console.warn(`${LOG_TAG} expense decision reply failed:`, err.message));
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
       }

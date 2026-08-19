@@ -93,7 +93,7 @@ test('parses only explicit expense decisions and gives recurrence precedence', (
   assert.equal(parseExpenseBrlAmount('sim'), undefined);
 });
 
-test('requires the cited expense code and an allowlisted sender before posting a decision', () => {
+test('requires the cited expense code and an allowlisted sender, and stays silent outside accounting conversations', () => {
   const dbPath = path.join(os.tmpdir(), `agent-decision-${process.pid}-${Date.now()}.sqlite`);
   try {
     const output = execFileSync(process.execPath, ['-e', `
@@ -115,10 +115,16 @@ test('requires the cited expense code and an allowlisted sender before posting a
           if (String(url).includes('/api/agents/config')) throw new Error('temporary config timeout');
           throw new Error('unexpected URL ' + url);
         };
+        const foreignConv = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv_outra_sala', senderId: '5511999999999', body: 'registrar', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm5' });
+        const foreignConvStranger = await router.routeExpenseDecisionReply({ brandId: 'turbo_station', conversationId: 'conv_outra_sala', senderId: '5511777777777', body: 'registrar', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm6' });
+        const callsAfterForeign = decisionCalls;
         const unavailable = await router.routeExpenseDecisionReply({ brandId: 'uncached_brand', conversationId: 'conv1', senderId: '5511999999999', body: '2', quotedBody: 'Código EXP-A1B2C3D4', messageId: 'm4' });
         if (missingQuote.handled) throw new Error('uncited reply was handled');
         if (!denied.handled || !denied.reply.includes('não está autorizado')) throw new Error('unauthorized sender not blocked');
         if (!allowed.handled || decisionCalls !== 1) throw new Error('allowed decision not posted exactly once');
+        if (!foreignConv.silent || foreignConv.reply) throw new Error('agent answered an EXP- quote outside an accounting conversation');
+        if (!foreignConvStranger.silent || foreignConvStranger.reply) throw new Error('agent answered a stranger outside an accounting conversation');
+        if (callsAfterForeign !== 1) throw new Error('foreign conversation reached the decision API');
         if (!unavailable.handled || !unavailable.reply.includes('Tente novamente')) throw new Error('config outage escaped the decision flow');
         console.log('agent-decision-ok');
       })().catch(e => { console.error(e); process.exit(1); });

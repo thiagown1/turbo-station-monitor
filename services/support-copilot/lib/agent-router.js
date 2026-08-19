@@ -379,11 +379,18 @@ async function routeExpenseDecisionReply(input) {
   if (!codeMatch || !action) return { handled: false };
   try {
     const config = await loadConfig(input.brandId);
+    // Conversation allowlist FIRST, and silently: this path is reachable from
+    // any chat that quotes a bot message carrying an EXP- code, so answering
+    // outside an accounting conversation would make the agent talk in a room it
+    // was never authorised to speak in. Inside an accounting conversation we do
+    // answer, because an operator needs to know why their decision did nothing.
+    if (!(config?.accountingGroupConversationIds || []).includes(input.conversationId)) {
+      return { handled: true, silent: true, reason: 'conversation_not_allowed' };
+    }
     if (!config?.enabled || !config.agents?.accounting || !config.whatsappExpenseConfirmationEnabled) {
       return { handled: true, reply: 'A confirmação de despesas pelo WhatsApp está desativada. Use a revisão no dashboard.' };
     }
-    if (!(config.accountingGroupConversationIds || []).includes(input.conversationId)
-      || !(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
+    if (!(config.allowedAccountingDecisionSenderIds || []).includes(input.senderId)) {
       return { handled: true, reply: 'Este remetente não está autorizado a confirmar despesas.' };
     }
     const res = await fetch(`${baseUrl()}/api/agents/expense-decisions`, {
