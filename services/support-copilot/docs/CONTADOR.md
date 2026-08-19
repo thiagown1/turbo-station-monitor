@@ -117,6 +117,7 @@ asset to rotate if this box is ever suspect.
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
 | `CONTADOR_MONTHLY_DAY` | no | monthly closing day, default `3` (clamped to 1..28) |
 | `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
+| `CONTADOR_REGULARIZACAO_DIAS` | no | intervalo mínimo entre cobranças de regularização, em dias (default `3`) |
 
 Provision the dedicated OpenClaw agent with a workspace based on
 `contador-workspace/`. Copy the template after `openclaw agents add` as well,
@@ -196,6 +197,48 @@ monthly values into the workspace.
   message id. A recovered `sent` reply completes without another send; an
   interruption while `sending` becomes `delivery_unknown` for operator
   reconciliation instead of risking a duplicate accounting confirmation.
+
+## Chasing what is missing, and remembering what it is told
+
+Two routines exist so the accounting does not depend on someone remembering to
+ask. Both were added on 2026-08-19, after a reconciliation found that nothing
+had been registered since April.
+
+### Regularização — it asks on its own
+
+`processRegularizacao` walks every closed month since `regularizacaoDesde`
+(April 2026) and derives, from the read-only tools, what is still missing in
+each: a month with no entry at all, and the stations whose bill was never
+registered. It then asks in the group.
+
+The cadence is a backoff, not a schedule: it only asks again after
+`CONTADOR_REGULARIZACAO_DIAS` (3 by default), and only while a gap is still
+there. Because the gaps come from the tools rather than a checklist, **they
+close themselves** the moment the entry lands — there is no "mark as resolved"
+for anyone to forget. Every ask is recorded in `contador_regularizacao_runs`.
+
+Not everything is derivable, though, and the underivable part is exactly where
+the accounting stalls: how much deságio each solar supplier charges, who
+invoices a given station's compensated energy, invoices that exist only on
+paper. Those live in `contador_perguntas_abertas` and are repeated alongside
+the derived gaps until someone answers. When the answer arrives the agent
+returns `"responde_perguntas": [id]` and the question is closed.
+
+### Memória — it stops re-asking
+
+Before this, the agent's whole context was the last 30 messages, so anything
+the group taught it evaporated. `contador_fatos` is the durable half: the
+agent may return `"aprender": ["fato curto"]` alongside any reply, the runtime
+persists it, and every prompt afterwards carries what is already known plus an
+instruction not to ask again.
+
+Only durable business facts belong there — whose station a given invoice is,
+which supplier covers which site, which deságio applies to whom. Never a
+month's number, never chatter. A wrong fact is corrected by setting
+`status = 'revogado'`.
+
+Both `aprender` and `responde_perguntas` are optional in the reply contract, so
+an instruction that carries neither has exactly the shape it always had.
 
 ## Expense receipts and recurrence
 
