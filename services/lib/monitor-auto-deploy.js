@@ -227,6 +227,62 @@ async function deployMonitor({
   }
 }
 
+/**
+ * Announce a deploy outcome on the channel the team actually reads.
+ *
+ * This used to shell `openclaw message send --channel telegram`. Telegram was
+ * dropped as an alert channel (team decision 2026-06-22) and that transport is
+ * not linked on the box, so every notification failed — which meant the
+ * auto-deploy failed SILENTLY. On 2026-08-18 three deploys in a row were
+ * refused for a dirty checkout (PRs #49, #50, #51 merged and never reached
+ * production) and nobody was told; it only surfaced because someone went
+ * looking at the log by hand.
+ *
+ * Same transport as the alert-engine: POST to the support-copilot API, which
+ * fans out to WhatsApp via Evolution. Returns { delivered, reason } instead of
+ * throwing — a broken notification must never fail a deploy that succeeded.
+ * When it cannot deliver, the reason is returned so the caller logs it loudly:
+ * an undelivered notification is itself news.
+ */
+async function notifyDeploy(message, options = {}) {
+  const {
+    apiBase = process.env.SUPPORT_API_BASE || 'http://127.0.0.1:3005',
+    conversationId = process.env.MONITOR_DEPLOY_WHATSAPP_CONV || process.env.ALERT_WHATSAPP_CONV || 'conv_jiuijxjtmnet23i9',
+    brandId = process.env.ALERT_WHATSAPP_BRAND || 'turbo',
+    secret = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '',
+    fetchImpl = globalThis.fetch,
+    timeoutMs = 15000,
+  } = options;
+
+  if (!conversationId) return { delivered: false, reason: 'no conversation configured' };
+  if (!secret) return { delivered: false, reason: 'SUPPORT_API_SECRET/MONITOR_API_SECRET not set' };
+  if (typeof fetchImpl !== 'function') return { delivered: false, reason: 'no fetch implementation' };
+
+  const url = `${apiBase}/api/support/conversations/${encodeURIComponent(conversationId)}/messages`
+    + `?brandId=${encodeURIComponent(brandId)}`;
+
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
+  try {
+    const res = await fetchImpl(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-secret': secret,
+        'x-brand-id': brandId,
+      },
+      body: JSON.stringify({ body: String(message), source: 'system' }),
+      signal: controller ? controller.signal : undefined,
+    });
+    if (!res || !res.ok) return { delivered: false, reason: `support API ${res ? res.status : 'no response'}` };
+    return { delivered: true, reason: null };
+  } catch (error) {
+    return { delivered: false, reason: error && error.message ? error.message : String(error) };
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 module.exports = {
   ALL_SERVICES,
   HEALTH_ENDPOINTS,
@@ -236,4 +292,5 @@ module.exports = {
   verifyHealth,
   deployMonitor,
   execFilePromise,
+  notifyDeploy,
 };

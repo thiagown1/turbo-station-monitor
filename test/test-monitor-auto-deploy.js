@@ -11,6 +11,7 @@ const {
   servicesForFiles,
   waitForSuccessfulCi,
   deployMonitor,
+  notifyDeploy,
 } = require('../services/lib/monitor-auto-deploy');
 
 const OLD_SHA = '1'.repeat(40);
@@ -102,6 +103,66 @@ async function expectReject(name, fn, pattern) {
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
+
+  // ── notifyDeploy ──────────────────────────────────────────────────────────
+  // Regression for 2026-08-18: the notifier shelled out to a Telegram transport
+  // that is not linked on this box, so three consecutive dirty-checkout refusals
+  // (PRs #49, #50 and #51 merged and never reaching production) were announced
+  // to nobody. It only surfaced because someone read the log by hand.
+  const notifyOpts = {
+    apiBase: 'http://127.0.0.1:3005',
+    conversationId: 'conv_test',
+    brandId: 'turbo',
+    secret: 'shhh',
+  };
+
+  const notifyCalls = [];
+  const okNotify = await notifyDeploy('deploy ok', {
+    ...notifyOpts,
+    fetchImpl: async (url, init) => { notifyCalls.push({ url, init }); return { ok: true, status: 200 }; },
+  });
+  assert.strictEqual(okNotify.delivered, true, 'entrega confirmada em 200');
+  assert.strictEqual(notifyCalls.length, 1, 'exatamente um POST');
+  assert.match(notifyCalls[0].url, /\/api\/support\/conversations\/conv_test\/messages/, 'rota da conversa');
+  assert.match(notifyCalls[0].url, /brandId=turbo/, 'brand na query');
+  assert.strictEqual(notifyCalls[0].init.method, 'POST');
+  assert.strictEqual(notifyCalls[0].init.headers['x-api-secret'], 'shhh', 'manda o segredo');
+  assert.deepStrictEqual(JSON.parse(notifyCalls[0].init.body), { body: 'deploy ok', source: 'system' });
+  assert.ok(!/telegram/i.test(notifyCalls[0].url), 'nunca mais telegram');
+  console.log('  ✅ notifyDeploy posts to the support-copilot API, not Telegram');
+
+  const http503 = await notifyDeploy('x', { ...notifyOpts, fetchImpl: async () => ({ ok: false, status: 503 }) });
+  assert.strictEqual(http503.delivered, false, 'non-2xx não conta como entregue');
+  assert.match(http503.reason, /503/, 'reason carrega o status');
+
+  const threw = await notifyDeploy('x', {
+    ...notifyOpts,
+    fetchImpl: async () => { throw new Error('ECONNREFUSED'); },
+  });
+  assert.strictEqual(threw.delivered, false);
+  assert.match(threw.reason, /ECONNREFUSED/, 'transporte quebrado não derruba o deploy');
+  console.log('  ✅ notifyDeploy reports failure instead of throwing or swallowing');
+
+  const noSecret = await notifyDeploy('x', {
+    ...notifyOpts,
+    secret: '',
+    fetchImpl: async () => ({ ok: true, status: 200 }),
+  });
+  assert.strictEqual(noSecret.delivered, false, 'sem segredo não finge sucesso');
+  assert.match(noSecret.reason, /SECRET/i, 'diz qual config falta');
+
+  const noConv = await notifyDeploy('x', {
+    ...notifyOpts,
+    conversationId: '',
+    fetchImpl: async () => ({ ok: true, status: 200 }),
+  });
+  assert.strictEqual(noConv.delivered, false);
+  assert.match(noConv.reason, /conversation/i);
+
+  const noFetch = await notifyDeploy('x', { ...notifyOpts, fetchImpl: undefined });
+  assert.strictEqual(noFetch.delivered, false);
+  assert.match(noFetch.reason, /fetch/i);
+  console.log('  ✅ notifyDeploy names the missing configuration instead of failing silently');
 
   console.log('✅ Auto-deploy tests passed');
 })().catch((error) => {
