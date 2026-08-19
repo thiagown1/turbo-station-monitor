@@ -3,16 +3,13 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFile } = require('child_process');
-const { deployMonitor } = require('../services/lib/monitor-auto-deploy');
+const { deployMonitor, notifyDeploy } = require('../services/lib/monitor-auto-deploy');
 
 const repoDir = path.resolve(__dirname, '..');
 const logPath = path.join(repoDir, 'logs', 'monitor-deploy.log');
 const targetSha = process.argv[2];
 const commitMessage = String(process.argv[3] || '').slice(0, 120);
 const pusher = String(process.argv[4] || 'unknown').slice(0, 80);
-const openClawBin = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
-const telegramTarget = process.env.MONITOR_DEPLOY_TELEGRAM_TARGET || 'telegram:-5103508388';
 
 fs.mkdirSync(path.dirname(logPath), { recursive: true });
 
@@ -22,15 +19,11 @@ function log(message) {
   console.log(line);
 }
 
-function notify(message) {
-  return new Promise((resolve) => {
-    execFile(openClawBin, [
-      'message', 'send', '--channel', 'telegram', '--target', telegramTarget, '--message', message,
-    ], { timeout: 15000 }, (error) => {
-      if (error) log(`[auto-deploy] notification failed: ${error.message}`);
-      resolve();
-    });
-  });
+async function notify(message) {
+  const { delivered, reason } = await notifyDeploy(message);
+  // An undelivered notification is itself news: it means the next deploy
+  // failure would also go unheard. Log it at the same volume as a deploy error.
+  if (!delivered) log(`[auto-deploy] NOTIFICATION UNDELIVERED (${reason}) — mensagem era: ${String(message).slice(0, 200)}`);
 }
 
 (async () => {
