@@ -6,6 +6,15 @@ const path = require('path');
 const { execFile } = require('child_process');
 
 const REPOSITORY = 'thiagown1/turbo-station-monitor';
+// The webhook that SPAWNS the deploy worker. pm2 kills a restarted app's whole
+// process tree by ppid (treekill is on by default), so restarting this one from
+// inside the worker kills the worker mid-deploy: the git merge lands, then the
+// process dies before restarting the remaining services, before the health check
+// and before recording the SHA. Production ends up with new code on disk and old
+// code in memory, and the log just stops — no error line at all. Two deploys died
+// this way on 2026-08-18/19. It is therefore restarted LAST, by the caller, once
+// everything else is already durable.
+const SELF_SERVICE = 'github-webhook';
 const ALL_SERVICES = [
   'ocpp-collector',
   'ocpp-alerts',
@@ -167,6 +176,22 @@ function acquireLock(lockPath, fsImpl = fs) {
   }
 }
 
+/**
+ * Restart pm2 apps THROUGH the ecosystem file.
+ *
+ * `pm2 restart <name>` reuses the config pm2 already holds in memory, so an edit
+ * to ecosystem.config.js reaches the disk and never takes effect. That is how
+ * alert-engine ran for hours on a 100M ceiling while the committed file said
+ * 256M, and how ocpp-collector sat at a 100M runtime ceiling against a 200M file
+ * (1042 recycles). Passing the config file plus --only makes pm2 re-read it.
+ */
+async function restartServices(services, { run = execFilePromise, pm2Bin, repoDir, timeout = 30000 } = {}) {
+  for (const service of services) {
+    await run(pm2Bin, ['restart', 'ecosystem.config.js', '--only', service, '--update-env'], { cwd: repoDir, timeout });
+  }
+  return [...services];
+}
+
 async function deployMonitor({
   sha,
   repoDir,
@@ -213,15 +238,19 @@ async function deployMonitor({
       await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
     }
 
-    for (const service of services) {
-      await run(pm2Bin, ['restart', service, '--update-env'], { cwd: repoDir, timeout: 30000 });
-    }
-    await checkHealth([...services]);
+    const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
+    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
+
+    await restartServices(immediateServices, { run, pm2Bin, repoDir });
+    await checkHealth(immediateServices);
     await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
 
     fsImpl.writeFileSync(statePath, `${targetSha}\n`, 'utf8');
-    log(`[auto-deploy] deployed ${targetSha.slice(0, 8)}; restarted: ${[...services].join(', ') || 'none'}`);
-    return { targetSha, deployedSha, changedFiles, services: [...services] };
+    log(`[auto-deploy] deployed ${targetSha.slice(0, 8)}; restarted: ${immediateServices.join(', ') || 'none'}`);
+    if (deferredServices.length) {
+      log(`[auto-deploy] deferred to last (it spawns this worker): ${deferredServices.join(', ')}`);
+    }
+    return { targetSha, deployedSha, changedFiles, services: [...services], immediateServices, deferredServices };
   } finally {
     try { fsImpl.unlinkSync(lockPath); } catch {}
   }
@@ -295,4 +324,6 @@ module.exports = {
   deployMonitor,
   execFilePromise,
   notifyDeploy,
+  restartServices,
+  SELF_SERVICE,
 };
