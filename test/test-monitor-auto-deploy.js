@@ -12,6 +12,8 @@ const {
   waitForSuccessfulCi,
   deployMonitor,
   notifyDeploy,
+  restartServices,
+  SELF_SERVICE,
 } = require('../services/lib/monitor-auto-deploy');
 
 const OLD_SHA = '1'.repeat(40);
@@ -99,7 +101,14 @@ async function expectReject(name, fn, pattern) {
   assert.deepStrictEqual(result.services, ['support-copilot']);
   assert.ok(calls.some((call) => call[1] === 'merge' && call.includes('--ff-only')));
   assert.ok(calls.some((call) => call[1] === 'ci' && call.includes('--omit=dev')));
-  assert.ok(calls.some((call) => call[1] === 'restart' && call.includes('support-copilot')));
+  // Through the ecosystem file, not the bare name: a bare `pm2 restart <name>`
+  // reuses the config pm2 holds in memory, so ecosystem.config.js edits (memory
+  // ceilings, env) land on disk and never take effect.
+  const restartCall = calls.find((call) => call[1] === 'restart' && call.includes('support-copilot'));
+  assert.ok(restartCall, 'reiniciou o support-copilot');
+  assert.ok(restartCall.includes('ecosystem.config.js'), 'restart relê o ecosystem.config.js');
+  assert.ok(restartCall.includes('--only'), 'restart usa --only');
+  assert.ok(restartCall.includes('--update-env'), 'restart atualiza o env');
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
@@ -167,6 +176,91 @@ async function expectReject(name, fn, pattern) {
   assert.match(noFetch.reason, /fetch/i);
   assert.ok(!/support API/.test(noFetch.reason), 'não pode ter saído pela rede');
   console.log('  ✅ notifyDeploy names the missing configuration instead of failing silently');
+
+
+  // ── self-restart hazard ───────────────────────────────────────────────────
+  // Regression for 2026-08-18/19: the worker is spawned BY github-webhook, and
+  // pm2 kills a restarted app's process tree by ppid. Restarting the webhook from
+  // inside deployMonitor killed the worker after the git merge but before the
+  // remaining restarts, the health check and the SHA record — twice, each time
+  // leaving new code on disk with old code in memory and a log that just stopped.
+  assert.strictEqual(SELF_SERVICE, 'github-webhook', 'o serviço que gera o worker');
+
+  const selfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-self-'));
+  fs.mkdirSync(path.join(selfDir, 'db'), { recursive: true });
+  const selfCalls = [];
+  const selfRun = async (command, args) => {
+    selfCalls.push([command, ...args]);
+    if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+    if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+    if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+    if (args[0] === 'status') return { stdout: '' };
+    // A shared file: fans out to every service, github-webhook included.
+    if (args[0] === 'diff') return { stdout: 'package.json\n' };
+    return { stdout: '' };
+  };
+  let healthChecked = null;
+  const selfResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: selfDir,
+    run: selfRun,
+    checkHealth: async (services) => { healthChecked = services; },
+  });
+
+  assert.ok(selfResult.services.includes(SELF_SERVICE), 'o webhook está entre os afetados');
+  assert.deepStrictEqual(selfResult.deferredServices, [SELF_SERVICE], 'webhook adiado para o fim');
+  assert.ok(!selfResult.immediateServices.includes(SELF_SERVICE), 'webhook fora da rodada imediata');
+
+  const restartedNames = selfCalls
+    .filter((call) => call[1] === 'restart')
+    .map((call) => call[call.indexOf('--only') + 1]);
+  assert.ok(restartedNames.length > 0, 'reiniciou alguma coisa');
+  assert.ok(
+    !restartedNames.includes(SELF_SERVICE),
+    'deployMonitor NUNCA reinicia o próprio pai — isso se mata no meio do deploy'
+  );
+  assert.ok(healthChecked && !healthChecked.includes(SELF_SERVICE), 'health check não espera o webhook adiado');
+
+  // The durable bits must already be on disk before the caller triggers the
+  // self-kill, otherwise dying on that last restart loses them again.
+  assert.strictEqual(
+    fs.readFileSync(path.join(selfDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(),
+    NEW_SHA,
+    'SHA gravado ANTES do restart do webhook'
+  );
+  assert.ok(!fs.existsSync(path.join(selfDir, 'db', '.monitor-deploy.lock')), 'lock liberado antes do self-kill');
+  console.log('  ✅ never restarts the webhook that spawns it; defers it to the caller');
+
+  // Nothing to defer when the webhook is not among the changed services.
+  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-plain-'));
+  fs.mkdirSync(path.join(plainDir, 'db'), { recursive: true });
+  const plainResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: plainDir,
+    run: async (command, args) => {
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'diff') return { stdout: 'services/alert-engine.js\n' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => {},
+  });
+  assert.deepStrictEqual(plainResult.deferredServices, [], 'sem webhook afetado, nada a adiar');
+  console.log('  ✅ defers nothing when the webhook is not affected');
+
+  // The deferred restart the caller runs uses the same ecosystem-aware command.
+  const deferredCalls = [];
+  await restartServices([SELF_SERVICE], {
+    run: async (command, args) => { deferredCalls.push([command, ...args]); return { stdout: '' }; },
+    pm2Bin: '/usr/bin/pm2',
+    repoDir: '/tmp/whatever',
+  });
+  assert.strictEqual(deferredCalls.length, 1);
+  assert.ok(deferredCalls[0].includes('ecosystem.config.js'), 'restart adiado também relê o config');
+  assert.ok(deferredCalls[0].includes(SELF_SERVICE));
+  console.log('  ✅ the deferred restart re-reads the ecosystem config too');
 
   console.log('✅ Auto-deploy tests passed');
 })().catch((error) => {
