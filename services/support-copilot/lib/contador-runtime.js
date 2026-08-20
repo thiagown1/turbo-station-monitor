@@ -165,6 +165,62 @@ function loadContext(conversationId, limit = 30) {
   `).all(conversationId, Math.min(30, Math.max(1, limit))).reverse();
 }
 
+/** Perguntas ainda sem resposta, que a cobranca deve repetir. */
+function listarPerguntasAbertas(limit = 12) {
+  return db.prepare(`
+    SELECT id, pergunta FROM contador_perguntas_abertas
+    WHERE status = 'aberta' ORDER BY id ASC LIMIT ?
+  `).all(Math.min(30, Math.max(1, limit)));
+}
+
+/** Encerra perguntas que foram respondidas. */
+function resolverPerguntas(ids) {
+  const lista = (Array.isArray(ids) ? ids : [])
+    .map((n) => Number(n))
+    .filter((n) => Number.isInteger(n) && n > 0);
+  if (!lista.length) return 0;
+  const now = nowIso();
+  const stmt = db.prepare(`
+    UPDATE contador_perguntas_abertas SET status = 'respondida', resolved_at = ?
+    WHERE id = ? AND status = 'aberta'
+  `);
+  let n = 0;
+  db.transaction(() => { for (const id of lista) n += stmt.run(now, id).changes; })();
+  if (n) console.log(`${LOG_TAG} [contador] encerrou ${n} pergunta(s)`);
+  return n;
+}
+
+/** Fatos ativos que o grupo ja ensinou, mais recentes primeiro. */
+function listarFatos(limit = 40) {
+  return db.prepare(`
+    SELECT fato, categoria FROM contador_fatos
+    WHERE status = 'ativo'
+    ORDER BY id DESC LIMIT ?
+  `).all(Math.min(80, Math.max(1, limit)));
+}
+
+/**
+ * Registra o que o agente aprendeu na conversa. Idempotente pelo texto do
+ * fato, entao repetir a mesma informacao no grupo nao duplica a memoria.
+ */
+function registrarFatos(fatos, origemMessageId = null) {
+  const lista = (Array.isArray(fatos) ? fatos : [])
+    .map((f) => String(f || '').trim())
+    .filter((f) => f.length >= 8 && f.length <= 300);
+  if (!lista.length) return 0;
+  const now = nowIso();
+  let gravados = 0;
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO contador_fatos (fato, categoria, origem_message_id, status, created_at)
+    VALUES (?, 'geral', ?, 'ativo', ?)
+  `);
+  db.transaction(() => {
+    for (const fato of lista) gravados += stmt.run(fato, origemMessageId, now).changes;
+  })();
+  if (gravados) console.log(`${LOG_TAG} [contador] aprendeu ${gravados} fato(s)`);
+  return gravados;
+}
+
 function recordOutbound(text, event, externalMessageId, contadorJobId = null) {
   const now = nowIso();
   const messageId = randomId('msg');
@@ -290,6 +346,10 @@ let contador = buildContador({
   sendReply,
   runAgent,
   loadContext,
+  listarFatos,
+  registrarFatos,
+  listarPerguntasAbertas,
+  resolverPerguntas,
 });
 
 function _setContadorForTest(value) {
@@ -469,6 +529,52 @@ function monthlySummaryOwnsHeartbeat(now, localDate) {
 }
 
 let heartbeatBusy = false;
+const REGULARIZACAO_INTERVALO_DIAS = Number(process.env.CONTADOR_REGULARIZACAO_DIAS || 3);
+
+/**
+ * Cobra no grupo o que falta para regularizar os meses ja fechados.
+ *
+ * Nao repete todo dia: so volta a perguntar depois de
+ * CONTADOR_REGULARIZACAO_DIAS, e so quando ainda existe lacuna. Como as
+ * lacunas sao derivadas das tools, elas somem sozinhas quando o lancamento
+ * entra - por isso nao existe "marcar como resolvido".
+ */
+async function processRegularizacao(now = new Date()) {
+  if (!configured()) return { status: 'skipped', reason: 'not_configured' };
+
+  const ultima = db.prepare(`
+    SELECT asked_at, gaps_fingerprint FROM contador_regularizacao_runs
+    WHERE status = 'sent' ORDER BY id DESC LIMIT 1
+  `).get();
+
+  if (ultima?.asked_at) {
+    const idadeMs = now.getTime() - Date.parse(ultima.asked_at);
+    if (Number.isFinite(idadeMs) && idadeMs < REGULARIZACAO_INTERVALO_DIAS * 24 * 60 * 60 * 1000) {
+      return { status: 'skipped', reason: 'backoff' };
+    }
+  }
+
+  try {
+    const lacunas = await contador.levantarLacunas(now);
+    if (!lacunas.length) return { status: 'silent', reason: 'sem_lacunas' };
+
+    const fingerprint = JSON.stringify(lacunas);
+    const result = await contador.regularizacao(now);
+    db.prepare(`
+      INSERT INTO contador_regularizacao_runs (asked_at, gaps_fingerprint, gaps_json, status)
+      VALUES (?, ?, ?, ?)
+    `).run(nowIso(), fingerprint, fingerprint, result.status === 'sent' ? 'sent' : 'silent');
+    return result;
+  } catch (err) {
+    db.prepare(`
+      INSERT INTO contador_regularizacao_runs (asked_at, gaps_fingerprint, gaps_json, status, last_error)
+      VALUES (?, '', '[]', 'failed', ?)
+    `).run(nowIso(), String(err.message || err).slice(0, 300));
+    console.warn(`${LOG_TAG} [contador] regularizacao falhou:`, err.message);
+    return { status: 'failed', error: err.message };
+  }
+}
+
 async function processHeartbeat(now = new Date()) {
   const localDate = saoPauloDay(now);
   if (
@@ -618,6 +724,7 @@ function startContadorRuntime() {
   const heartbeatTimer = setInterval(() => {
     processHeartbeat().catch((err) => console.warn(`${LOG_TAG} [contador] heartbeat failed:`, err.message));
     processMonthlySummary().catch((err) => console.warn(`${LOG_TAG} [contador] monthly summary failed:`, err.message));
+    processRegularizacao().catch((err) => console.warn(`${LOG_TAG} [contador] regularizacao failed:`, err.message));
   }, HEARTBEAT_INTERVAL_MS);
   workerTimer.unref?.();
   heartbeatTimer.unref?.();
@@ -633,6 +740,11 @@ module.exports = {
   processPendingJobs,
   processHeartbeat,
   processMonthlySummary,
+  processRegularizacao,
+  listarFatos,
+  registrarFatos,
+  listarPerguntasAbertas,
+  resolverPerguntas,
   startContadorRuntime,
   resolveMediaPath,
   sendReply,

@@ -77,7 +77,20 @@ function parseAgentInstruction(value) {
   try {
     const parsed = JSON.parse(stripCodeFence(value));
     if (parsed?.action === 'reply' && typeof parsed.text === 'string' && parsed.text.trim()) {
-      return { action: 'reply', text: parsed.text.trim().slice(0, 4000) };
+      // `aprender` e opcional: o agente devolve junto da resposta os fatos
+      // duraveis que acabou de descobrir na conversa, e o runtime persiste.
+      const aprender = Array.isArray(parsed.aprender)
+        ? parsed.aprender.slice(0, 8)
+        : [];
+      const responde = Array.isArray(parsed.responde_perguntas)
+        ? parsed.responde_perguntas.slice(0, 12)
+        : [];
+      // So carrega o campo quando ha algo a aprender: assim a forma da
+      // instrucao continua identica ao contrato antigo no caso comum.
+      const base = { action: 'reply', text: parsed.text.trim().slice(0, 4000) };
+      if (aprender.length) base.aprender = aprender;
+      if (responde.length) base.responde_perguntas = responde;
+      return base;
     }
     if (parsed?.action === 'silent') return { action: 'silent' };
     if (parsed?.action === 'tool' && ALLOWED_TOOLS.has(parsed.tool)) {
@@ -245,7 +258,7 @@ function draftFieldsMatchReply(fields, body) {
   });
 }
 
-function initialPrompt(event, messages, openDrafts) {
+function initialPrompt(event, messages, openDrafts, memoria = null) {
   const authorizedLiterals = event.quotedContadorDraftId
     ? extractDraftReplyLiterals(event.body)
     : null;
@@ -275,6 +288,9 @@ function initialPrompt(event, messages, openDrafts) {
     '{"action":"resolve_draft","draftId":"rcpt_...","stationId":"station-id"}',
     '{"action":"silent"}',
     '',
+    'Em qualquer resposta com action=reply voce pode incluir "aprender": ["fato curto"] com o que a conversa ensinou de DURAVEL sobre o negocio (de quem e uma estacao, que fornecedor cuida de qual praca, que desagio vale para quem). Nao registre valor de um mes especifico, conversa fiada, nem nada que mude todo mes. Se nao aprendeu nada, omita o campo.',
+    'Se a mensagem responder alguma pergunta que voce fez, inclua tambem "responde_perguntas": [id] com os ids das perguntas_abertas que foram respondidas, para nao perguntar de novo.',
+    memoria || '',
     `Data atual: ${new Date().toISOString().slice(0, 10)}`,
     `Mensagem atual: ${redactForModel(event.body)}`,
     `Draft autorizado pela mensagem citada: ${event.quotedContadorDraftId || 'nenhum'}`,
@@ -331,7 +347,7 @@ function periodInSaoPaulo(now) {
   return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day) };
 }
 
-function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTool, loadContext }) {
+function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTool, loadContext, listarFatos, registrarFatos, listarPerguntasAbertas, resolverPerguntas }) {
   if (!config || !readMedia || !intake || !sendReply || !runAgent || !queryTool || !loadContext) {
     throw new Error('Contador dependencies are incomplete');
   }
@@ -342,7 +358,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     const messages = await loadContext(event.conversationId, 30);
     const openDrafts = await queryTool('drafts_abertos', {});
     const trustedStationIds = new Set();
-    let raw = await runAgent(initialPrompt(event, messages, openDrafts));
+    let raw = await runAgent(initialPrompt(event, messages, openDrafts, blocoDeFatos()));
     let instruction = parseAgentInstruction(raw);
     let calls = 1;
 
@@ -407,6 +423,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       ...event,
       contadorDraftId: event.quotedContadorDraftId || undefined,
     });
+    aprender(instruction, event);
     return { status: 'sent', toolCalls: calls };
   }
 
@@ -474,6 +491,104 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     return { status: 'sent' };
   }
 
+  /**
+   * Varre os meses fechados desde REGULARIZACAO_DESDE e devolve o que ainda
+   * falta para cada um. As lacunas saem das tools (fonte da verdade), entao
+   * somem sozinhas quando o lancamento entra - nao existe "marcar resolvido".
+   */
+  /** Bloco de memoria injetado nos prompts, para o agente nao reperguntar. */
+  function blocoDeFatos() {
+    if (typeof listarFatos !== 'function') return null;
+    const fatos = listarFatos();
+    if (!fatos.length) return null;
+    return ['O que voce ja sabe sobre o negocio (nao pergunte de novo):']
+      .concat(fatos.map((f) => '- ' + f.fato))
+      .join(String.fromCharCode(10));
+  }
+
+  /** Persiste o que o agente aprendeu, se o runtime deu essa capacidade. */
+  function aprender(instruction, event = {}) {
+    if (typeof resolverPerguntas === 'function' && Array.isArray(instruction?.responde_perguntas)) {
+      try {
+        resolverPerguntas(instruction.responde_perguntas);
+      } catch (err) {
+        console.warn('[contador] falha ao encerrar perguntas:', err.message);
+      }
+    }
+    if (typeof registrarFatos !== 'function') return;
+    const fatos = instruction && Array.isArray(instruction.aprender) ? instruction.aprender : [];
+    if (!fatos.length) return;
+    try {
+      registrarFatos(fatos, event.messageId || null);
+    } catch (err) {
+      console.warn('[contador] falha ao registrar fatos:', err.message);
+    }
+  }
+
+  async function levantarLacunas(now = new Date(), opts = {}) {
+    const desde = opts.desde || config.regularizacaoDesde || { year: 2026, month: 4 };
+    const atual = periodInSaoPaulo(now);
+    const meses = [];
+    let cursor = { ...desde };
+    while (cursor.year < atual.year || (cursor.year === atual.year && cursor.month < atual.month)) {
+      meses.push({ ...cursor });
+      cursor = cursor.month === 12
+        ? { year: cursor.year + 1, month: 1 }
+        : { year: cursor.year, month: cursor.month + 1 };
+      if (meses.length > 24) break; // guarda contra config absurda
+    }
+
+    const lacunas = [];
+    for (const period of meses) {
+      const [pendencias, lancamentos] = await Promise.all([
+        queryTool('pendencias', period),
+        queryTool('lancamentos', period),
+      ]);
+      const semLancamento = (lancamentos?.entries || []).length === 0;
+      const estacoesPendentes = (pendencias?.stations || [])
+        .filter((s) => s.pending)
+        .map((s) => s.stationName || s.stationId);
+      if (!semLancamento && estacoesPendentes.length === 0) continue;
+      lacunas.push({
+        periodo: `${period.year}-${String(period.month).padStart(2, '0')}`,
+        sem_nenhum_lancamento: semLancamento,
+        estacoes_sem_conta: estacoesPendentes,
+      });
+    }
+    return lacunas;
+  }
+
+  /**
+   * Cobra no grupo o que falta para regularizar os meses passados. Fica em
+   * silencio quando nao ha lacuna - o proprio sumico da pendencia encerra a
+   * cobranca.
+   */
+  async function regularizacao(now = new Date(), opts = {}) {
+    const lacunas = await levantarLacunas(now, opts);
+    // Nem tudo da para derivar das tools: quanto cada fornecedor cobra de
+    // desagio, por exemplo, so alguem do grupo sabe. Essas perguntas ficam
+    // em contador_perguntas_abertas e sao repetidas ate serem respondidas.
+    const perguntas = typeof listarPerguntasAbertas === 'function' ? listarPerguntasAbertas() : [];
+    if (!lacunas.length && !perguntas.length) return { status: 'silent', lacunas: [] };
+
+    const prompt = [
+      'Voce e o Contador da Turbo Station. Peca no grupo, de forma curta e direta, as informacoes que faltam para regularizar os meses ja fechados.',
+      'Use somente os dados abaixo. Nao invente numeros, nao cite PII e nao repita saudacao.',
+      'Agrupe por mes, diga o que falta em cada um e termine pedindo que respondam por partes.',
+      'Repita tambem as perguntas_abertas, que sao coisas que so o grupo sabe responder.',
+      'Responda SOMENTE JSON: {"action":"reply","text":"..."} ou {"action":"silent"}.',
+      JSON.stringify({ lacunas, perguntas_abertas: perguntas }),
+    ].join(String.fromCharCode(10));
+
+    const instruction = parseAgentInstruction(await runAgent(prompt));
+    if (instruction.action !== 'reply') return { status: 'silent', lacunas };
+    await sendReply(redactForModel(instruction.text), {
+      kind: 'regularizacao',
+      groupJid: config.groupConversationId,
+    });
+    return { status: 'sent', lacunas };
+  }
+
   async function monthlySummary(now = new Date(), hooks = {}) {
     const current = periodInSaoPaulo(now);
     const period = current.month === 1
@@ -523,7 +638,9 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     return { status: 'sent', period };
   }
 
-  return { handle, heartbeat, monthlySummary };
+  return {
+    levantarLacunas,
+    regularizacao, handle, heartbeat, monthlySummary };
 }
 
 module.exports = {

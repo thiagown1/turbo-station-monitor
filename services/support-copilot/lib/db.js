@@ -391,6 +391,44 @@ try {
       updated_at TEXT NOT NULL
     );
 
+    -- Rotina de regularização: o Contador varre os meses passados, deriva o
+    -- que ainda falta das próprias tools e cobra no grupo até a lacuna sumir.
+    -- Uma linha por rodada de cobrança; a lacuna some sozinha quando o
+    -- lançamento entra, então não existe "resolver" manual.
+    -- Memoria duravel do Contador: o que o grupo ensina sobre o negocio
+    -- ("HB Center e da Decathlon", "as estacoes de Goiania quem cuida e a
+    -- Prime"). Injetado em todo prompt, para ele nao reperguntar o que ja
+    -- foi dito. Fato errado se corrige marcando status='revogado'.
+    -- Perguntas que o Contador precisa fazer e que NAO dao para derivar das
+    -- tools (quanto cada fornecedor cobra de desagio, faturas que so existem
+    -- no papel). Ele repete na cobranca ate alguem responder; a resposta vira
+    -- fato em contador_fatos e a pergunta e encerrada.
+    CREATE TABLE IF NOT EXISTS contador_perguntas_abertas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pergunta TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'aberta',
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS contador_fatos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fato TEXT NOT NULL UNIQUE,
+      categoria TEXT NOT NULL DEFAULT 'geral',
+      origem_message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'ativo',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS contador_regularizacao_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      asked_at TEXT NOT NULL,
+      gaps_fingerprint TEXT NOT NULL,
+      gaps_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_error TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS contador_monthly_runs (
       run_month TEXT PRIMARY KEY,
       status TEXT NOT NULL,
