@@ -50,6 +50,34 @@ Only a genuinely empty discovery result records
 on consecutive days means discovery itself is broken (model erroring, or every
 proposal already covered) and is worth investigating.
 
+## Internal links: code decides, the editor does not
+
+Whether `/blog/<slug>` exists is a **fact**, not a judgement call, so
+`sanitizeInternalLinks` decides it deterministically and runs **before** the
+editor. Every internal link that reaches the editor is therefore valid by
+construction, and the editor prompt explicitly says so.
+
+It used to police this too, and it was worse at it: the writer prompt tells the
+model to link 1-2 published posts, the editor prompt rejected "rotas
+inexistentes (as únicas válidas são /, /blog e /#contato)", and the two
+contradicted each other. Once dynamic topic discovery started producing posts
+again, that held **two consecutive days** (2026-08-21 and 2026-08-22) over links
+to posts that exist.
+
+Rules:
+
+- **`VALID_STATIC_ROUTES` is the allowlist of non-blog routes**, and it is
+  verified against production: `/`, `/blog`, `/faq`, `/#contato`,
+  `/parceiro/ganhe-com-estacoes`. `/contato`, `/sobre` and `/estacoes` are 404.
+  Add a route only after confirming it serves 200.
+- The sanitiser covers **all** internal links, not just `/blog/`. It used to only
+  look at `/blog/`, so an invented `/contato` sailed through it.
+- Only the bare canonical post path counts. A trailing slash, a query or an
+  extra segment gets unwrapped, on purpose: only the exact path is provably real.
+- External links and images are untouched.
+- **Never reintroduce a route check into the editor prompt.** There is a test
+  asserting the old string does not come back.
+
 ## Content bar enforced in the prompts
 
 The writer prompt and the editor prompt must stay in sync — the editor rejects

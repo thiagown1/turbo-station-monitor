@@ -250,7 +250,8 @@ Requisitos:
 - Headings H2/H3, listas quando útil, tom claro e confiável.
 - PELO MENOS 2 dos H2 devem ser uma PERGUNTA que o leitor realmente digitaria, respondida logo abaixo por um parágrafo autocontido de 2 a 4 frases (sem lista e sem sub-heading no meio). Esse formato é o que vira resultado de FAQ na busca.
 - Cite 1 ou 2 fontes externas confiáveis pelo NOME (ANEEL, Inmetro, ABVE, Denatran, o Detran do estado, o manual do fabricante), no ponto do texto em que a informação aparece. Não invente número nem link: se você não sabe a URL exata, cite só o nome da fonte.
-- Inclua links internos APENAS para rotas que existem de fato: /blog, a home / e o contato /#contato (âncora na home). NUNCA use /contato, /contact ou outras rotas inexistentes.
+- Inclua links internos APENAS para rotas que existem de fato: a home /, o blog /blog, as perguntas frequentes /faq, a página de parceiro /parceiro/ganhe-com-estacoes, e o contato /#contato (âncora na home). NUNCA use /contato, /contact, /sobre, /estacoes ou qualquer outra rota: elas dão 404.
+- Ao falar de quem quer receber uma estação (síndico, estacionamento, shopping, frota), linke /parceiro/ganhe-com-estacoes. Ao responder uma dúvida geral já coberta, linke /faq.
 - Se a lista de POSTS JÁ PUBLICADOS (abaixo) trouxer algo relacionado, linke 1-2 deles naturalmente no corpo, no formato [titulo](/blog/slug).
 - ESCREVA COMO HUMANO, NÃO COMO IA: varie o tamanho das frases (algumas bem curtas), evite simetria e listas perfeitas demais, evite clichês de IA ("no mundo de hoje", "é importante ressaltar", "em um mundo cada vez mais", "vale lembrar", "em resumo", abuso de advérbios). Tom direto e coloquial brasileiro.
 - PROIBIDO o bullet no formato "- **Frase de abertura.** explicação". É a assinatura mais óbvia de texto de IA. Ou o item da lista é curto e direto (sem negrito nenhum), ou vira parágrafo de verdade com um H3 em cima.
@@ -270,7 +271,8 @@ tags: ["t1","t2","t3"]
 
 function editorPrompt(topic, markdown, guidelines) {
   return `Você é editor-chefe rigoroso da Turbo Station (rede de recarga PÚBLICA / em destino). Revise criticamente o rascunho de blog abaixo (tópico: "${topic}").
-Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~1200 palavras; ou prometer algo enganoso; ou usar links internos para rotas inexistentes (as únicas válidas são /, /blog e /#contato); ou usar travessão (— ou –); ou soar como texto de IA (clichês genéricos, frases todas do mesmo tamanho, listas perfeitas demais).
+Reprove se: contiver fatos/leis/estatísticas que parecem inventados ou não verificáveis; for raso/genérico demais; tiver erros de PT-BR; título/description ruins para SEO; menos de ~1200 palavras; ou prometer algo enganoso; ou usar travessão (— ou –); ou soar como texto de IA (clichês genéricos, frases todas do mesmo tamanho, listas perfeitas demais).
+NÃO avalie se os links internos apontam para rotas que existem. Isso já foi validado por código antes de você ver o rascunho: todo link interno que chegou até aqui é comprovadamente válido, e link para rota inexistente foi removido automaticamente. Reprovar por causa disso segura post bom por engano.
 Reprove TAMBÉM pelos tells de IA que a gente já cansou de ver: bullet no formato "- **Frase.** explicação" (qualquer ocorrência reprova); mais de uma antítese "não é X, é Y" no artigo; seção final chamada "Resumo", "Resumindo", "Conclusão" ou "No fim das contas" que só repete o que já foi dito.
 Reprove se o artigo NÃO tiver ao menos 2 H2 em forma de pergunta respondidos por um parágrafo autocontido logo abaixo, ou se não citar nenhuma fonte externa pelo nome.
 Se o rascunho prometer no título algo que o corpo não entrega, reprove: um título de comparação ("melhores X", "X vs Y") exige que o corpo compare de fato, com os itens nomeados.
@@ -313,10 +315,46 @@ function stripDashes(s) {
   return (s || '').replace(/\s*[—–]\s*/g, ' - ');
 }
 
+/**
+ * Internal routes that exist on the public site. Verified against production
+ * 2026-08-22; `/contato`, `/sobre` and `/estacoes` are 404 and must never be
+ * linked (the contact anchor lives on the home page as `/#contato`).
+ *
+ * Add a route here only after confirming it actually serves 200.
+ */
+const VALID_STATIC_ROUTES = new Set([
+  '/',
+  '/blog',
+  '/faq',
+  '/#contato',
+  '/parceiro/ganhe-com-estacoes',
+]);
+
+/**
+ * Unwrap every internal link the site cannot actually serve.
+ *
+ * This is the ONLY enforcement of "no dead internal links", and it is
+ * deterministic on purpose: a slug either is in the published set or it is not,
+ * which is a fact, not a judgement call. The editor prompt used to also police
+ * this and it was strictly worse at it — it held two days of posts in a row for
+ * linking `/blog/recarga-dc-vs-ac-...`, a post that exists and that the writer
+ * prompt explicitly tells the model to link.
+ *
+ * Runs BEFORE the editor, so by the time the editor reads a draft every
+ * surviving internal link is valid by construction. Keep it that way: let code
+ * enforce what code can prove, and leave the editor to judge the writing.
+ *
+ * Images are skipped (the `!` lookbehind) so a broken path never leaves a
+ * dangling `!alt` in the body.
+ */
 function sanitizeInternalLinks(markdown, related) {
   const validSlugs = new Set((related || []).map((p) => p.slug));
-  return markdown.replace(/\[([^\]]+)\]\(\/blog\/([^)\s]+)\)/g, (match, text, slug) => {
-    return validSlugs.has(slug) ? match : text;
+
+  return markdown.replace(/(?<!!)\[([^\]]+)\]\((\/[^)\s]*)\)/g, (match, text, href) => {
+    if (VALID_STATIC_ROUTES.has(href)) return match;
+    const post = /^\/blog\/([^/?#]+)$/.exec(href);
+    if (post && validSlugs.has(post[1])) return match;
+    return text;
   });
 }
 
@@ -610,6 +648,8 @@ module.exports = {
   topicDiscoveryPrompt,
   slugify,
   SEED_TOPICS,
+  sanitizeInternalLinks,
+  VALID_STATIC_ROUTES,
 };
 
 if (require.main === module) {
