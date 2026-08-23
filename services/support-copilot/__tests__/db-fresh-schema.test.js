@@ -256,7 +256,7 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         const Database = require('better-sqlite3');
         const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
         const tables = check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
-        for (const expected of ['contador_jobs', 'contador_daily_runs', 'contador_monthly_runs', 'agent_media_jobs']) {
+        for (const expected of ['contador_jobs', 'contador_daily_runs', 'contador_monthly_runs', 'agent_media_jobs', 'station_investigation_jobs']) {
           if (!tables.includes(expected)) throw new Error(expected + ' table missing: ' + tables.join(','));
         }
         const jobCols = check.prepare("PRAGMA table_info('contador_jobs')").all().map(r => r.name);
@@ -269,6 +269,10 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         if (!mediaJobCols.includes('fallback_applied_at')) throw new Error('agent_media_jobs.fallback_applied_at column missing');
         const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
         if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
+        const messageCols = check.prepare("PRAGMA table_info('messages')").all().map(r => r.name);
+        for (const expected of ['raw_body', 'provider_timestamp', 'quoted_message_id', 'mentioned_jids_json', 'is_forwarded']) {
+          if (!messageCols.includes(expected)) throw new Error('messages.' + expected + ' column missing');
+        }
         `,
       ],
       {
