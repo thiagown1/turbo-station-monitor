@@ -60,8 +60,15 @@ try {
       direction TEXT NOT NULL,
       source TEXT NOT NULL,
       body TEXT NOT NULL,
+      raw_body TEXT,
       author_id TEXT,
       external_message_id TEXT,
+      provider_timestamp TEXT,
+      quoted_message_id TEXT,
+      quoted_sender_id TEXT,
+      mentioned_jids_json TEXT,
+      is_forwarded INTEGER NOT NULL DEFAULT 0,
+      forwarding_score INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
 
@@ -172,6 +179,15 @@ safeAddColumn('messages', 'media_json', 'TEXT DEFAULT NULL');
 // Stable group-participant/phone identity. Display names are not authorization.
 safeAddColumn('messages', 'sender_id', 'TEXT DEFAULT NULL');
 safeAddColumn('messages', 'sender_name', 'TEXT DEFAULT NULL');
+// Structured WhatsApp context used by the station investigator. The visible
+// body stays backward-compatible; raw_body avoids reparsing the group prefix.
+safeAddColumn('messages', 'raw_body', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'provider_timestamp', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'quoted_message_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'quoted_sender_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'mentioned_jids_json', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'is_forwarded', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('messages', 'forwarding_score', 'INTEGER NOT NULL DEFAULT 0');
 
 // Copilot settings — per-brand configuration for the AI assistant
 try {
@@ -507,6 +523,41 @@ try {
   console.warn(`${LOG_TAG} agent router migration:`, err.message);
 }
 safeAddColumn('agent_media_jobs', 'fallback_applied_at', 'TEXT DEFAULT NULL');
+
+// Durable, idempotent orchestration for explicit @mention station requests.
+// Raw chat text is not copied here: only the structured context fingerprint,
+// message references and bounded result returned by Next are retained.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS station_investigation_jobs (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      context_fingerprint TEXT,
+      context_message_ids_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      decision TEXT,
+      confidence TEXT,
+      station_ids_json TEXT,
+      result_json TEXT,
+      ack_sent_at TEXT,
+      ack_external_message_id TEXT,
+      response_sent_at TEXT,
+      response_external_message_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_station_investigation_jobs_due
+      ON station_investigation_jobs(status, next_attempt_at, created_at);
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} station investigator migration:`, err.message);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
