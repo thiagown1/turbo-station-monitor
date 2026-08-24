@@ -1,7 +1,7 @@
 const { db, nowIso, randomId } = require('./db');
 const { loadConfig } = require('./agent-router');
 const { buildConversationIncidentContext } = require('./conversation-incident-context');
-const { hasAllowedStructuredMention } = require('./whatsapp-message-context');
+const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
@@ -18,9 +18,10 @@ async function routeStationInvestigation(input, deps = {}) {
   const config = await (deps.loadConfig || loadConfig)(input.brandId).catch(() => null);
   const policy = config?.stationInvestigator;
   if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) return { skipped: true, reason: 'disabled' };
-  if (policy.killSwitch || !policy.autoSend) return { skipped: true, reason: 'send_disabled' };
+  if (policy.killSwitch) return { skipped: true, reason: 'send_disabled' };
   if (!policy.allowedConversationIds?.includes(input.conversationId)) return { skipped: true, reason: 'conversation_not_allowed' };
-  if (!hasAllowedStructuredMention(input.whatsappContext, policy.mentionJids || [])) return { skipped: true, reason: 'structured_mention_required' };
+  const mentionedJid = findAllowedStructuredMention(input.whatsappContext, policy.mentionJids || []);
+  if (!mentionedJid) return { skipped: true, reason: 'structured_mention_required' };
   if (!baseUrl() || !secret()) return { skipped: true, reason: 'central_unavailable' };
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
   if (prior?.status === 'sent' || prior?.status === 'review') return { duplicate: true, status: prior.status };
@@ -36,12 +37,12 @@ async function routeStationInvestigation(input, deps = {}) {
   try {
     const response = await (deps.request || fetch)(`${baseUrl()}/api/agents/station-investigations`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },
-      body: JSON.stringify({ brandId: input.brandId, conversationId: input.conversationId, groupJid: input.groupJid, sourceMessageId: input.messageId, receivedAt: input.receivedAt, context }),
+      body: JSON.stringify({ brandId: input.brandId, conversationId: input.conversationId, groupJid: input.groupJid, mentionedJid, sourceMessageId: input.messageId, receivedAt: input.receivedAt, context }),
       signal: AbortSignal.timeout(45_000),
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`investigator_http_${response.status}`);
-    if (result.decision !== 'send' || !result.reply) {
+    if (!policy.autoSend || result.decision !== 'send' || !result.reply) {
       db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, updated_at=? WHERE message_id=?")
         .run(result.decision || 'review', result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
       return { status: 'review', result };
@@ -53,7 +54,7 @@ async function routeStationInvestigation(input, deps = {}) {
       db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, created_at)
         VALUES (?, ?, ?, 'outbound', 'station-investigator', ?, ?, 'sent', ?)`)
         .run(randomId('msg'), input.conversationId, input.brandId, result.reply, externalId, sentAt);
-      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, response_sent_at=?, response_message_id=?, updated_at=? WHERE message_id=?")
+      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, response_sent_at=?, response_external_message_id=?, updated_at=? WHERE message_id=?")
         .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), sentAt, externalId, sentAt, input.messageId);
     })();
     return { status: 'sent', result };

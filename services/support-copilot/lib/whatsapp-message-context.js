@@ -41,9 +41,14 @@ function extractWhatsappMessageContext(message, messageTimestamp) {
   };
 }
 
-function hasAllowedStructuredMention(context, allowedJids) {
+function findAllowedStructuredMention(context, allowedJids) {
   const allowed = new Set(uniqueStrings(allowedJids).map((jid) => jid.toLowerCase()));
-  return context.mentionedJids.some((jid) => allowed.has(String(jid).toLowerCase()));
+  return uniqueStrings(context?.mentionedJids || [])
+    .find((jid) => allowed.has(jid.toLowerCase())) || null;
 }
 
-module.exports = { extractWhatsappMessageContext, hasAllowedStructuredMention };
+function hasAllowedStructuredMention(context, allowedJids) {
+  return Boolean(findAllowedStructuredMention(context, allowedJids));
+}
+
+module.exports = { extractWhatsappMessageContext, findAllowedStructuredMention, hasAllowedStructuredMention };
