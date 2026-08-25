@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const { buildContador, classifyInbound } = require('./contador');
+const { createContadorModelRunner } = require('./contador-model-runner');
 const { db, nowIso, randomId } = require('./db');
 const { sendText } = require('./evolution-client');
 const { emitEvent } = require('./sse');
@@ -18,6 +19,10 @@ const {
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,
+  CONTADOR_CODEX_FALLBACK_ENABLED,
+  CONTADOR_CODEX_FALLBACK_MODEL,
+  CONTADOR_CODEX_BIN,
+  CONTADOR_CODEX_WORKSPACE,
   CONTADOR_SESSION_ID,
   CONTADOR_HEARTBEAT_HOUR,
   CONTADOR_MONTHLY_DAY,
@@ -38,6 +43,8 @@ const config = {
   instance: CONTADOR_INSTANCE,
   agent: CONTADOR_OPENCLAW_AGENT,
   model: CONTADOR_OPENCLAW_MODEL,
+  codexFallbackEnabled: CONTADOR_CODEX_FALLBACK_ENABLED,
+  codexFallbackModel: CONTADOR_CODEX_FALLBACK_MODEL,
   sessionId: CONTADOR_SESSION_ID,
   maxToolCalls: 5,
 };
@@ -80,15 +87,6 @@ async function postNext(route, body) {
   return data;
 }
 
-function extractAgentText(result) {
-  return String(
-    result?.result?.payloads?.[0]?.text ||
-    result?.payloads?.[0]?.text ||
-    result?.text ||
-    ''
-  ).trim();
-}
-
 // The OpenClaw gateway spends most of a Contador call on session load and
 // workspace injection, not on the model turn: measured 2026-08-18, successful
 // calls land at ~130-140s wall while the model turn itself is ~3s. The previous
@@ -106,39 +104,24 @@ function extractAgentText(result) {
 const AGENT_CLI_TIMEOUT_MS = 300_000;
 const AGENT_EXEC_TIMEOUT_MS = 330_000;
 
-function runAgent(prompt) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      'agent',
-      '--agent', config.agent,
-      '--session-id', config.sessionId,
-      '--model', config.model,
-      '--json',
-      '--timeout', String(Math.floor(AGENT_CLI_TIMEOUT_MS / 1000)),
-      '-m', prompt,
-    ];
-    const env = { ...process.env, NO_COLOR: '1' };
-    delete env.OPENCLAW_GATEWAY_URL;
-    execFile(OPENCLAW_BIN, args, { timeout: AGENT_EXEC_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024, env }, (error, stdout, stderr) => {
-      if (error) {
-        // Cause FIRST: the ledger truncates last_error at 500 chars and
-        // error.message starts with the whole command line (prompt included),
-        // so appending stderr at the end meant every failure was persisted as
-        // an unreadable command echo with the real reason cut off.
-        const NEWLINE = String.fromCharCode(10);
-        const why = String(stderr || '').trim().split(NEWLINE).filter(Boolean).slice(-3).join(' / ').slice(0, 300)
-          || (error.killed ? `killed after timeout (signal ${error.signal || 'n/a'})` : `exit code ${error.code}`);
-        return reject(new Error(`OpenClaw Contador failed [${why}] (code=${error.code}, killed=${Boolean(error.killed)})`));
-      }
-      try {
-        const text = extractAgentText(JSON.parse(stdout));
-        if (!text) throw new Error('empty response');
-        resolve(text);
-      } catch (err) {
-        reject(new Error(`OpenClaw Contador returned invalid JSON: ${err.message}`));
-      }
-    });
-  });
+const modelRunner = createContadorModelRunner({
+  execFileImpl: execFile,
+  openClawBin: OPENCLAW_BIN,
+  codexBin: CONTADOR_CODEX_BIN,
+  agent: config.agent,
+  sessionId: config.sessionId,
+  primaryModel: config.model,
+  codexFallbackEnabled: config.codexFallbackEnabled,
+  codexFallbackModel: config.codexFallbackModel,
+  codexWorkspace: CONTADOR_CODEX_WORKSPACE,
+  logger: console,
+  openClawCliTimeoutMs: AGENT_CLI_TIMEOUT_MS,
+  openClawExecTimeoutMs: AGENT_EXEC_TIMEOUT_MS,
+  codexExecTimeoutMs: AGENT_EXEC_TIMEOUT_MS,
+});
+
+function runAgent(prompt, turnState) {
+  return modelRunner.runAgent(prompt, turnState);
 }
 
 function resolveMediaPath(media) {

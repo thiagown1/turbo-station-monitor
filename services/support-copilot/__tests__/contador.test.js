@@ -121,6 +121,7 @@ test('image bill fails closed when the paid classifier produced no extraction', 
 test('tool loop stops after five calls and asks the agent for an evidence-only final answer', async () => {
   const toolCalls = [];
   const prompts = [];
+  const turnStates = [];
   const contador = buildContador({
     config,
     readMedia: async () => Buffer.alloc(0),
@@ -131,8 +132,9 @@ test('tool loop stops after five calls and asks the agent for an evidence-only f
       toolCalls.push({ tool, params });
       return { pendingCount: 2 };
     },
-    runAgent: async (prompt) => {
+    runAgent: async (prompt, turnState) => {
       prompts.push(prompt);
+      turnStates.push(turnState);
       if (prompts.length <= 5) return JSON.stringify({ action: 'tool', tool: 'pendencias', params: { year: 2026, month: 8 } });
       return JSON.stringify({ action: 'reply', text: 'Há 2 estações pendentes.' });
     },
@@ -151,6 +153,8 @@ test('tool loop stops after five calls and asks the agent for an evidence-only f
   assert.match(prompts[0], /protocolo JSON intermediado pelo runtime/i);
   assert.match(prompts[0], /Nunca responda que uma ferramenta permitida está indisponível/i);
   assert.match(prompts.at(-1), /limite de 5 ferramentas/i);
+  assert.ok(turnStates[0]);
+  assert.ok(turnStates.every((turnState) => turnState === turnStates[0]));
 });
 
 test('a quoted operator answer resolves exactly the draft and station selected through tools', async () => {

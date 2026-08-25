@@ -61,6 +61,10 @@ There are two independent kill switches: the local `CONTADOR_ENABLED` and the
 Next feature flag. Both fail closed. Deploying this code does not activate
 messages or accounting writes.
 
+The Codex capacity fallback is a third, independent opt-in. It remains inert
+unless `CONTADOR_CODEX_FALLBACK_ENABLED=true`; deploying the runner alone does
+not change the active model or consume the ChatGPT subscription.
+
 The model can call only the eight read-only tools exposed by
 `/api/accounting/energy-agent/query`, with at most five tool calls per turn.
 The only writes are the deterministic intake keyed by the original WhatsApp
@@ -113,6 +117,10 @@ asset to rotate if this box is ever suspect.
 | `CONTADOR_INSTANCE` | no | gateway instance, default `turbostation`; set it explicitly to the existing Baileys instance name in production |
 | `CONTADOR_OPENCLAW_AGENT` | no | dedicated agent id, default `contador` |
 | `CONTADOR_OPENCLAW_MODEL` | no | default `claude-cli/claude-opus-4-8` |
+| `CONTADOR_CODEX_FALLBACK_ENABLED` | no | default `false`; permits one cross-provider fallback only for explicit quota/capacity failures |
+| `CONTADOR_CODEX_FALLBACK_MODEL` | no | fixed fallback model, default `gpt-5.6-sol` |
+| `CONTADOR_CODEX_BIN` | no | Codex CLI path, default `/home/openclaw/.npm-global/bin/codex` |
+| `CONTADOR_CODEX_WORKSPACE` | no | read-only Codex working root, default `/home/openclaw/.openclaw/workspace-contador` |
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
 | `CONTADOR_MONTHLY_DAY` | no | monthly closing day, default `3` (clamped to 1..28) |
@@ -167,7 +175,10 @@ monthly values into the workspace.
   the decision flow and answer with a safe retry instruction; a temporary
   config outage does not escape the webhook after the inbound message commit;
 - natural-language questions use the read-only tool loop and Claude Opus in a
-  persistent OpenClaw session;
+  persistent OpenClaw session. When the separate Codex fallback is enabled,
+  only an explicit quota/capacity error (for example weekly limit or HTTP 429)
+  may retry that same prompt once with `gpt-5.6-sol`. Policy, malformed-output,
+  timeout and arbitrary runtime errors do not cross providers;
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
 - once the day-3 heartbeat schedule has passed, a separate once-per-month
@@ -197,6 +208,38 @@ monthly values into the workspace.
   message id. A recovered `sent` reply completes without another send; an
   interruption while `sending` becomes `delivery_unknown` for operator
   reconciliation instead of risking a duplicate accounting confirmation.
+
+## GPT-5.6 Sol capacity fallback
+
+The fallback invokes the locally authenticated Codex CLI directly because the
+installed OpenClaw catalog does not currently expose GPT-5.6. It uses
+`codex exec --model gpt-5.6-sol` with an ephemeral session, read-only sandbox,
+fixed workspace and the prompt on stdin. The browser and WhatsApp payload can
+never choose a model, binary or workspace.
+
+The fallback does not bypass any Contador boundary: the model can only return
+the same bounded instruction contract, read tools still go through the scoped
+Next endpoint, and writes remain deterministic and revalidated by Next. If both
+providers fail, the job remains retryable and the ledger stores a bounded error
+that excludes the prompt.
+
+If capacity is exhausted after one or more read-tool calls, the runner rebuilds
+only the current bounded turn for Codex: prior runtime prompts remain
+authoritative and prior model responses are explicitly labeled as untrusted
+history. That in-memory context is keyed to one job, capped at six exchanges and
+never reused by another WhatsApp event.
+
+Activation is deliberately separate from deployment:
+
+1. confirm `/home/openclaw/.npm-global/bin/codex login status` reports a valid
+   ChatGPT login and run a harmless `gpt-5.6-sol` read-only smoke test;
+2. deploy the tested commit with `CONTADOR_CODEX_FALLBACK_ENABLED=false`;
+3. verify support-copilot health and the Contador queues;
+4. request operator approval, set only
+   `CONTADOR_CODEX_FALLBACK_ENABLED=true`, restart `support-copilot`, and
+   observe one controlled capacity-fallback test without financial writes;
+5. rollback by setting the flag to `false` and restarting only
+   `support-copilot`.
 
 ## Chasing what is missing, and remembering what it is told
 
