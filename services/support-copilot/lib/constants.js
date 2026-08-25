@@ -55,6 +55,10 @@ const CONTADOR_NEXT_SECRET = process.env.CONTADOR_NEXT_SECRET || process.env.ENE
 const CONTADOR_INSTANCE = process.env.CONTADOR_INSTANCE || process.env.GATEWAY_INSTANCE_NAME || 'turbostation';
 const CONTADOR_OPENCLAW_AGENT = process.env.CONTADOR_OPENCLAW_AGENT || 'contador';
 const CONTADOR_OPENCLAW_MODEL = process.env.CONTADOR_OPENCLAW_MODEL || 'claude-cli/claude-opus-4-8';
+const CONTADOR_CODEX_FALLBACK_ENABLED = process.env.CONTADOR_CODEX_FALLBACK_ENABLED === 'true';
+const CONTADOR_CODEX_FALLBACK_MODEL = process.env.CONTADOR_CODEX_FALLBACK_MODEL || 'gpt-5.6-sol';
+const CONTADOR_CODEX_BIN = process.env.CONTADOR_CODEX_BIN || process.env.CODEX_BIN || '/home/openclaw/.npm-global/bin/codex';
+const CONTADOR_CODEX_WORKSPACE = process.env.CONTADOR_CODEX_WORKSPACE || '/home/openclaw/.openclaw/workspace-contador';
 const CONTADOR_SESSION_ID = process.env.CONTADOR_SESSION_ID || 'contador-contas';
 const CONTADOR_HEARTBEAT_HOUR = Math.min(23, Math.max(0, Number(process.env.CONTADOR_HEARTBEAT_HOUR || 8)));
 const CONTADOR_MONTHLY_DAY = Math.min(28, Math.max(1, Number(process.env.CONTADOR_MONTHLY_DAY || 3)));
@@ -95,6 +99,10 @@ module.exports = {
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,
+  CONTADOR_CODEX_FALLBACK_ENABLED,
+  CONTADOR_CODEX_FALLBACK_MODEL,
+  CONTADOR_CODEX_BIN,
+  CONTADOR_CODEX_WORKSPACE,
   CONTADOR_SESSION_ID,
   CONTADOR_HEARTBEAT_HOUR,
   CONTADOR_MONTHLY_DAY,

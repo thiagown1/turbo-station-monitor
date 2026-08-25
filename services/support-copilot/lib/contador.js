@@ -358,7 +358,8 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     const messages = await loadContext(event.conversationId, 30);
     const openDrafts = await queryTool('drafts_abertos', {});
     const trustedStationIds = new Set();
-    let raw = await runAgent(initialPrompt(event, messages, openDrafts, blocoDeFatos()));
+    const modelTurn = {};
+    let raw = await runAgent(initialPrompt(event, messages, openDrafts, blocoDeFatos()), modelTurn);
     let instruction = parseAgentInstruction(raw);
     let calls = 1;
 
@@ -366,12 +367,12 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
       const data = await queryTool(instruction.tool, instruction.params);
       rememberTrustedStationIds(instruction.tool, data, trustedStationIds);
       calls += 1;
-      raw = await runAgent(toolResultPrompt(instruction.tool, instruction.params, data));
+      raw = await runAgent(toolResultPrompt(instruction.tool, instruction.params, data), modelTurn);
       instruction = parseAgentInstruction(raw);
     }
 
     if (instruction.action === 'tool') {
-      instruction = parseAgentInstruction(await runAgent(finalPrompt(maxToolCalls)));
+      instruction = parseAgentInstruction(await runAgent(finalPrompt(maxToolCalls), modelTurn));
     }
 
     if (instruction.action === 'resolve_draft') {

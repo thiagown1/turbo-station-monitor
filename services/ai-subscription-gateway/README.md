@@ -31,11 +31,14 @@ ChatGPT subscription (via the `codex` runtime):
 > **not allowlisted yet**, so a gateway turn fails with
 > `Model override "…" is not allowed for agent "…"`. See "Model allowlist"
 > below — that is a config change on the VPS, not a code change here.
-> The Codex path is
-> **not** verified. Two open items block it:
+> The OpenClaw gateway pass-through for Codex is **not** verified. The direct
+> Codex CLI path was verified on 2026-08-25: Codex CLI v0.146.0 was logged in
+> with ChatGPT and `codex exec -m gpt-5.6-sol -s read-only --ephemeral --json`
+> returned a successful GPT-5.6 Sol turn. Two gateway-specific open items
+> remain:
 >
-> 1. The ChatGPT plan hit its usage limit on 2026-08-15 and does not reset
->    until 2026-08-20, so it cannot be smoke-tested before then.
+> 1. The `ai_dashboard_codex` OpenClaw gateway profile still needs its own
+>    end-to-end smoke test; a direct CLI success does not prove gateway routing.
 > 2. `gpt-5.6-sol|terra|luna` are real model names in the installed `codex` CLI
 >    (v0.146.0), but OpenClaw 2026.7.1-2's `openai/*` catalog tops out at
 >    `gpt-5.4`, and there is no `codex-cli/*` provider mirroring `claude-cli/*`.
