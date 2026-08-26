@@ -256,19 +256,33 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         const Database = require('better-sqlite3');
         const check = new Database(process.env.SUPPORT_COPILOT_DB_PATH, { readonly: true });
         const tables = check.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all().map(r => r.name);
-        for (const expected of ['contador_jobs', 'contador_daily_runs', 'contador_monthly_runs', 'agent_media_jobs']) {
+        for (const expected of ['contador_jobs', 'contador_daily_runs', 'contador_monthly_runs', 'contador_financial_proposals', 'contador_financial_classifications', 'agent_media_jobs', 'station_investigation_jobs']) {
           if (!tables.includes(expected)) throw new Error(expected + ' table missing: ' + tables.join(','));
         }
         const jobCols = check.prepare("PRAGMA table_info('contador_jobs')").all().map(r => r.name);
-        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json', 'reply_status', 'reply_external_message_id']) {
+        for (const expected of ['message_id', 'status', 'attempts', 'next_attempt_at', 'payload_json', 'reply_status', 'reply_external_message_id', 'model_waits', 'last_model_wait_at']) {
           if (!jobCols.includes(expected)) throw new Error('contador_jobs.' + expected + ' column missing');
         }
         const monthlyCols = check.prepare("PRAGMA table_info('contador_monthly_runs')").all().map(r => r.name);
         if (!monthlyCols.includes('next_attempt_at')) throw new Error('contador_monthly_runs.next_attempt_at column missing');
         const mediaJobCols = check.prepare("PRAGMA table_info('agent_media_jobs')").all().map(r => r.name);
-        if (!mediaJobCols.includes('fallback_applied_at')) throw new Error('agent_media_jobs.fallback_applied_at column missing');
+        for (const expected of ['fallback_applied_at', 'model_waits', 'last_model_wait_at']) {
+          if (!mediaJobCols.includes(expected)) throw new Error('agent_media_jobs.' + expected + ' column missing');
+        }
         const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
         if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
+        const messageCols = check.prepare("PRAGMA table_info('messages')").all().map(r => r.name);
+        for (const expected of ['raw_body', 'provider_timestamp', 'quoted_message_id', 'mentioned_jids_json', 'is_forwarded']) {
+          if (!messageCols.includes(expected)) throw new Error('messages.' + expected + ' column missing');
+        }
+        const proposalCols = check.prepare("PRAGMA table_info('contador_financial_proposals')").all().map(r => r.name);
+        for (const expected of ['proposal_code', 'source_message_id', 'action_payload_json', 'payload_hash', 'status', 'send_attempts', 'execution_attempts', 'expires_at', 'confirmation_message_id', 'confirmed_by']) {
+          if (!proposalCols.includes(expected)) throw new Error('contador_financial_proposals.' + expected + ' column missing');
+        }
+        const classificationCols = check.prepare("PRAGMA table_info('contador_financial_classifications')").all().map(r => r.name);
+        for (const expected of ['source_message_id', 'proposal_id', 'action_payload_json', 'payload_hash', 'classified_by']) {
+          if (!classificationCols.includes(expected)) throw new Error('contador_financial_classifications.' + expected + ' column missing');
+        }
         `,
       ],
       {

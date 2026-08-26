@@ -40,6 +40,13 @@ const {
 } = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
+const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
+const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const {
+  handleFinancialApprovalReply,
+  sendFinancialApprovalAcknowledgement,
+  processFinancialApprovalWork,
+} = require('../lib/financial-approval');
 
 const router = Router();
 // Ensure media directory exists
@@ -279,6 +286,7 @@ router.post('/', async (req, res) => {
   if (!body) {
     return res.json({ ok: true, skipped: true, reason: 'no extractable body' });
   }
+  const whatsappContext = extractWhatsappMessageContext(message, messageTimestamp);
 
   // Extract media info (if any)
   const media = extractMedia(message || {});
@@ -369,6 +377,9 @@ router.post('/', async (req, res) => {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
         if (direction === 'inbound') {
+          void routeStationInvestigation({ messageId: externalMessageId, conversationId, brandId, groupJid,
+            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext })
+            .catch(err => console.warn(`${LOG_TAG} duplicate investigator recovery failed for ${dup.id}:`, err.message));
           const quoted = quotedOutboundMessage(message, conversationId);
           const contadorEvent = {
             messageId: externalMessageId,
@@ -407,9 +418,13 @@ router.post('/', async (req, res) => {
 
     db.transaction(() => {
       db.prepare(`
-        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name, created_at)
-        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(msgId, conversationId, brandId, direction, groupBody, null, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, senderId, senderName, now);
+        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, raw_body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name,
+          provider_timestamp, quoted_message_id, quoted_sender_id, mentioned_jids_json, is_forwarded, forwarding_score, created_at)
+        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(msgId, conversationId, brandId, direction, groupBody, body, null, externalMessageId || null, mediaJson,
+        direction === 'outbound' ? 'sent' : null, senderId, senderName, whatsappContext.providerTimestamp,
+        whatsappContext.quotedMessageId, whatsappContext.quotedSenderId, JSON.stringify(whatsappContext.mentionedJids),
+        whatsappContext.isForwarded ? 1 : 0, whatsappContext.forwardingScore, now);
 
       if (direction === 'inbound') {
         db.prepare('UPDATE conversations SET last_message_at = ?, last_inbound_at = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?')
@@ -479,6 +494,10 @@ router.post('/', async (req, res) => {
     // Contador/group-suggestion behavior. A successful central classification
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
+      void routeStationInvestigation({
+        messageId: externalMessageId || msgId, conversationId, brandId, groupJid, instance,
+        senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
+      }).catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
       const quoted = quotedOutboundMessage(message, conversationId);
       // Which agent serves this group is decided in the Agent Center, not here.
       // undefined means the central was unreachable, and classifyInbound then
@@ -860,6 +879,43 @@ router.post('/', async (req, res) => {
       tags: updatedConv.tags_json ? JSON.parse(updatedConv.tags_json) : [],
     } : null,
   });
+
+  // Personal financial confirmations use an exact-code protocol and are
+  // consumed before generic Copilot/media paths. This prevents free-form,
+  // unauthorized, expired or duplicate replies from reaching a broader agent.
+  if (direction === 'inbound') {
+    const financialDecision = handleFinancialApprovalReply({
+      messageId: msgId,
+      externalMessageId,
+      conversationId,
+      brandId,
+      instance,
+      senderId: normalizedPhone,
+      body,
+      quotedMessageId: whatsappContext.quotedMessageId,
+    });
+    if (financialDecision.handled) {
+      if (financialDecision.confirmed) void processFinancialApprovalWork();
+      if (!financialDecision.silent && financialDecision.reply) {
+        void sendFinancialApprovalAcknowledgement({
+          conversationId,
+          brandId,
+          instance,
+          senderId: normalizedPhone,
+        }, financialDecision.reply).catch(() => {
+          console.warn(`${LOG_TAG} financial approval acknowledgement failed`);
+        });
+      }
+      return res.status(201).json({
+        id: msgId,
+        conversationId,
+        created,
+        duplicate: false,
+        source: 'evolution',
+        financialApproval: true,
+      });
+    }
+  }
 
   // NOTE: We no longer inject every message into the agent session here.
   // The incremental prompt system in generateSuggestion() handles sending

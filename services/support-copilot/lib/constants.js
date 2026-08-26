@@ -55,9 +55,23 @@ const CONTADOR_NEXT_SECRET = process.env.CONTADOR_NEXT_SECRET || process.env.ENE
 const CONTADOR_INSTANCE = process.env.CONTADOR_INSTANCE || process.env.GATEWAY_INSTANCE_NAME || 'turbostation';
 const CONTADOR_OPENCLAW_AGENT = process.env.CONTADOR_OPENCLAW_AGENT || 'contador';
 const CONTADOR_OPENCLAW_MODEL = process.env.CONTADOR_OPENCLAW_MODEL || 'claude-cli/claude-opus-4-8';
+const CONTADOR_CODEX_FALLBACK_ENABLED = process.env.CONTADOR_CODEX_FALLBACK_ENABLED === 'true';
+const CONTADOR_CODEX_FALLBACK_MODEL = process.env.CONTADOR_CODEX_FALLBACK_MODEL || 'gpt-5.6-sol';
+const CONTADOR_CODEX_BIN = process.env.CONTADOR_CODEX_BIN || process.env.CODEX_BIN || '/home/openclaw/.npm-global/bin/codex';
+const CONTADOR_CODEX_WORKSPACE = process.env.CONTADOR_CODEX_WORKSPACE || '/home/openclaw/.openclaw/workspace-contador';
 const CONTADOR_SESSION_ID = process.env.CONTADOR_SESSION_ID || 'contador-contas';
 const CONTADOR_HEARTBEAT_HOUR = Math.min(23, Math.max(0, Number(process.env.CONTADOR_HEARTBEAT_HOUR || 8)));
 const CONTADOR_MONTHLY_DAY = Math.min(28, Math.max(1, Number(process.env.CONTADOR_MONTHLY_DAY || 3)));
+const CONTADOR_FINANCIAL_APPROVAL_ENABLED = process.env.CONTADOR_FINANCIAL_APPROVAL_ENABLED === 'true';
+const CONTADOR_FINANCIAL_APPROVAL_OPERATOR_JID = (process.env.CONTADOR_FINANCIAL_APPROVAL_OPERATOR_JID || '').trim();
+const CONTADOR_FINANCIAL_APPROVAL_ALLOWED_SENDER_IDS = (process.env.CONTADOR_FINANCIAL_APPROVAL_ALLOWED_SENDER_IDS || '')
+  .split(',')
+  .map((value) => value.replace(/\D/g, ''))
+  .filter(Boolean);
+const financialApprovalTtl = Number(process.env.CONTADOR_FINANCIAL_APPROVAL_TTL_MINUTES || 15);
+const CONTADOR_FINANCIAL_APPROVAL_TTL_MINUTES = Number.isFinite(financialApprovalTtl)
+  ? Math.min(60, Math.max(5, financialApprovalTtl))
+  : 15;
 
 /**
  * Map Evolution API instance name → brand_id.
@@ -95,7 +109,15 @@ module.exports = {
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,
+  CONTADOR_CODEX_FALLBACK_ENABLED,
+  CONTADOR_CODEX_FALLBACK_MODEL,
+  CONTADOR_CODEX_BIN,
+  CONTADOR_CODEX_WORKSPACE,
   CONTADOR_SESSION_ID,
   CONTADOR_HEARTBEAT_HOUR,
   CONTADOR_MONTHLY_DAY,
+  CONTADOR_FINANCIAL_APPROVAL_ENABLED,
+  CONTADOR_FINANCIAL_APPROVAL_OPERATOR_JID,
+  CONTADOR_FINANCIAL_APPROVAL_ALLOWED_SENDER_IDS,
+  CONTADOR_FINANCIAL_APPROVAL_TTL_MINUTES,
 };

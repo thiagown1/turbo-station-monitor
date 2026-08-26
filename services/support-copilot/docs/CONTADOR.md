@@ -18,9 +18,13 @@ The WhatsApp socket is entirely in this repository:
    after a PM2 restart. The successful
    `agent_media_analyses` row and its deferred `contador_jobs` row commit in the
    same SQLite transaction; a cached classification can also recover a missing
-   job without another paid model call. Configuration fetch failures and model
-   failures remain retryable; they do not create an extraction-less Contador
-   job. Media work stops after five failed attempts. Explicitly skipped work
+   job without another paid model call. A recognized model/provider outage moves
+   work to `waiting_model`, does not spend the message's five-attempt failure
+   budget and retries after a 15-minute cooldown. The first unavailable call
+   opens a process-wide circuit so later messages are only queued, rather than
+   fanning out more doomed provider calls. Data, policy, parsing and unrelated
+   infrastructure failures still stop after five failed attempts. No failure
+   creates an extraction-less Contador job. Explicitly skipped work
    completes only after the Contador or suggestion fallback has run. Successful
    `station_support`, `support_attention` and `other` group work uses the source
    message as the unique identity for its richer support suggestion across
@@ -60,6 +64,17 @@ The Contador is inert unless all of these are true:
 There are two independent kill switches: the local `CONTADOR_ENABLED` and the
 Next feature flag. Both fail closed. Deploying this code does not activate
 messages or accounting writes.
+
+The Codex capacity fallback is a third, independent opt-in. It remains inert
+unless `CONTADOR_CODEX_FALLBACK_ENABLED=true`; deploying the runner alone does
+not change the active model or consume the ChatGPT subscription.
+
+Personal approval of proposed receipt classifications is a fourth independent
+opt-in and remains inert unless `CONTADOR_FINANCIAL_APPROVAL_ENABLED=true` plus
+an exact personal target and matching sender allowlist are configured. It writes
+only a local classification marker after an exact, quoted, one-use response;
+it does not call the Next expense/loan write paths. See
+[`CONTADOR_FINANCIAL_APPROVAL.md`](./CONTADOR_FINANCIAL_APPROVAL.md).
 
 The model can call only the eight read-only tools exposed by
 `/api/accounting/energy-agent/query`, with at most five tool calls per turn.
@@ -113,9 +128,17 @@ asset to rotate if this box is ever suspect.
 | `CONTADOR_INSTANCE` | no | gateway instance, default `turbostation`; set it explicitly to the existing Baileys instance name in production |
 | `CONTADOR_OPENCLAW_AGENT` | no | dedicated agent id, default `contador` |
 | `CONTADOR_OPENCLAW_MODEL` | no | default `claude-cli/claude-opus-4-8` |
+| `CONTADOR_CODEX_FALLBACK_ENABLED` | no | default `false`; permits one cross-provider fallback only for explicit quota/capacity failures |
+| `CONTADOR_CODEX_FALLBACK_MODEL` | no | fixed fallback model, default `gpt-5.6-sol` |
+| `CONTADOR_CODEX_BIN` | no | Codex CLI path, default `/home/openclaw/.npm-global/bin/codex` |
+| `CONTADOR_CODEX_WORKSPACE` | no | read-only Codex working root, default `/home/openclaw/.openclaw/workspace-contador` |
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
 | `CONTADOR_MONTHLY_DAY` | no | monthly closing day, default `3` (clamped to 1..28) |
+| `CONTADOR_FINANCIAL_APPROVAL_ENABLED` | no | default `false`; enables personal approval proposals for new expense receipts only |
+| `CONTADOR_FINANCIAL_APPROVAL_OPERATOR_JID` | yes for personal approval | exact personal WhatsApp target; group JIDs fail closed |
+| `CONTADOR_FINANCIAL_APPROVAL_ALLOWED_SENDER_IDS` | yes for personal approval | comma-separated sender digits; target must also be allowlisted |
+| `CONTADOR_FINANCIAL_APPROVAL_TTL_MINUTES` | no | one-use confirmation TTL, default `15`, clamped to 5..60 |
 | `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
 | `CONTADOR_REGULARIZACAO_DIAS` | no | intervalo mínimo entre cobranças de regularização, em dias (default `3`) |
 
@@ -167,7 +190,10 @@ monthly values into the workspace.
   the decision flow and answer with a safe retry instruction; a temporary
   config outage does not escape the webhook after the inbound message commit;
 - natural-language questions use the read-only tool loop and Claude Opus in a
-  persistent OpenClaw session;
+  persistent OpenClaw session. When the separate Codex fallback is enabled,
+  only an explicit quota/capacity error (for example weekly limit or HTTP 429)
+  may retry that same prompt once with `gpt-5.6-sol`. Policy, malformed-output,
+  timeout and arbitrary runtime errors do not cross providers;
 - daily heartbeat queries upcoming bills, open drafts and current-month
   pendencies; it is silent if all three are empty and has a once-per-day ledger;
 - once the day-3 heartbeat schedule has passed, a separate once-per-month
@@ -191,12 +217,52 @@ monthly values into the workspace.
   responses and transport interruptions remain `delivery_unknown`; an operator
   must reconcile that run before retrying, which prefers a visible missing
   closing over a duplicate message;
-- failed model/API work is visible in `contador_jobs` with attempts and a
-  redacted error, and transient failures use bounded backoff. Each job fences
+- model-unavailable work is visible as `waiting_model` in `contador_jobs` or
+  `agent_media_jobs`, with `model_waits`, `last_model_wait_at`, the next probe and
+  a redacted error. It remains durable across restarts and resumes oldest-first
+  when the provider answers again. Capacity waits do not consume `attempts`;
+  malformed, policy and per-message errors retain the bounded five-attempt
+  backoff. Existing legacy rows already terminal as `failed` are not silently
+  revived by deployment and require an explicit, audited requeue;
+- each Contador job fences
   its WhatsApp reply before delivery and checkpoints the accepted external
   message id. A recovered `sent` reply completes without another send; an
   interruption while `sending` becomes `delivery_unknown` for operator
   reconciliation instead of risking a duplicate accounting confirmation.
+
+## GPT-5.6 Sol capacity fallback
+
+The fallback invokes the locally authenticated Codex CLI directly because the
+installed OpenClaw catalog does not currently expose GPT-5.6. It uses
+`codex exec --model gpt-5.6-sol` with an ephemeral session, read-only sandbox,
+fixed workspace and the prompt on stdin. The browser and WhatsApp payload can
+never choose a model, binary or workspace.
+
+The fallback does not bypass any Contador boundary: the model can only return
+the same bounded instruction contract, read tools still go through the scoped
+Next endpoint, and writes remain deterministic and revalidated by Next. If both
+providers report capacity exhaustion, the job moves to `waiting_model`; one
+oldest item probes again after 15 minutes while newer messages stay queued. The
+ledger stores a bounded error that excludes the prompt. A successful probe drains
+the durable queue in order without bypassing reply or financial idempotency.
+
+If capacity is exhausted after one or more read-tool calls, the runner rebuilds
+only the current bounded turn for Codex: prior runtime prompts remain
+authoritative and prior model responses are explicitly labeled as untrusted
+history. That in-memory context is keyed to one job, capped at six exchanges and
+never reused by another WhatsApp event.
+
+Activation is deliberately separate from deployment:
+
+1. confirm `/home/openclaw/.npm-global/bin/codex login status` reports a valid
+   ChatGPT login and run a harmless `gpt-5.6-sol` read-only smoke test;
+2. deploy the tested commit with `CONTADOR_CODEX_FALLBACK_ENABLED=false`;
+3. verify support-copilot health and the Contador queues;
+4. request operator approval, set only
+   `CONTADOR_CODEX_FALLBACK_ENABLED=true`, restart `support-copilot`, and
+   observe one controlled capacity-fallback test without financial writes;
+5. rollback by setting the flag to `false` and restarting only
+   `support-copilot`.
 
 ## Chasing what is missing, and remembering what it is told
 

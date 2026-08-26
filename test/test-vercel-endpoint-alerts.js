@@ -36,6 +36,19 @@ assert.deepStrictEqual(getVercel5xxAlertPolicy('/api/payments/process', 1), {
     title: null,
 });
 
+const telemetryRows = [
+    { id: 101, endpoint: '/api/monitor/heatmap-data?period=7d', status_code: 504 },
+    { id: 102, endpoint: '/api/monitor/online-users', status_code: 504 },
+];
+const telemetryGrouped = groupByNormalizedEndpoint(telemetryRows);
+assert.deepStrictEqual(Object.keys(telemetryGrouped), ['/api/monitor/mobile-telemetry']);
+assert.strictEqual(telemetryGrouped['/api/monitor/mobile-telemetry'].length, 2);
+assert.deepStrictEqual(getVercel5xxAlertPolicy('/api/monitor/mobile-telemetry', 1), {
+    shouldAlert: true,
+    severity: 'warning',
+    title: 'Instabilidade na telemetria móvel',
+});
+
 const rows = variants.map((endpoint, index) => ({
     id: index + 1,
     timestamp: Date.now() - index,
