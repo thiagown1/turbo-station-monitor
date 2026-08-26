@@ -149,6 +149,14 @@ test('preserves definitions used by reference-style images', () => {
     keeps('[![diagrama][mapa]](/faq)\n\n[mapa]: /imagens/mapa.png');
 });
 
+test('validates text links that share a definition with a reference-style image', () => {
+    const md = '![mapa][shared]\n\nFale pelo [Contato][shared].\n\n[shared]: /contato';
+    assert.strictEqual(
+        sanitizeInternalLinks(md, related),
+        '![mapa][shared]\n\nFale pelo Contato.\n\n[shared]: /contato',
+    );
+});
+
 test('handles several links in one body, keeping the good and dropping the bad', () => {
     const out = sanitizeInternalLinks(
         'Veja [A](/blog/recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma), [B](/blog/inventado) e o [FAQ](/faq).',

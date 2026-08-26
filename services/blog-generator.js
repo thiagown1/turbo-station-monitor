@@ -401,12 +401,13 @@ function sanitizeInternalLinks(markdown, related) {
   let referencesSanitized = protectedMarkdown.replace(
     definitionPattern,
     (match, indent, label, angleHref, bareHref, title = '') => {
-      if (imageReferenceLabels.has(normalizeReferenceLabel(label))) return match;
+      const normalizedLabel = normalizeReferenceLabel(label);
       const href = angleHref || bareHref;
       const destination = inspectLinkDestination(href, validSlugs);
       if (!destination.owned) return match;
       if (!destination.valid) {
-        invalidReferences.add(normalizeReferenceLabel(label));
+        invalidReferences.add(normalizedLabel);
+        if (imageReferenceLabels.has(normalizedLabel)) return match;
         return '\u0000BLOG_INVALID_REFERENCE_DEFINITION\u0000';
       }
       const renderedHref = angleHref ? `<${destination.renderedHref}>` : destination.renderedHref;
@@ -415,11 +416,11 @@ function sanitizeInternalLinks(markdown, related) {
   );
 
   referencesSanitized = referencesSanitized.replace(
-    /(?<!!)\[([^\]\n]+)\]\[([^\]\n]*)\]/g,
+    /(?<!!)\[([^\]\n]+)\]\[([^\]\n]*)\](?!\](?:\(|\[))/g,
     (match, text, label) => invalidReferences.has(normalizeReferenceLabel(label || text)) ? text : match,
   );
   referencesSanitized = referencesSanitized.replace(
-    /(?<!!)(?<!\])\[([^\]\n]+)\](?![\[(])/g,
+    /(?<!!)(?<!\])\[([^\]\n]+)\](?![\[(:])/g,
     (match, label) => invalidReferences.has(normalizeReferenceLabel(label)) ? label : match,
   );
   referencesSanitized = referencesSanitized.replace(
