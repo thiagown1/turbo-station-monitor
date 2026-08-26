@@ -32,7 +32,9 @@ const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/home/openclaw/.npm-global/bin
 const WORKER_INTERVAL_MS = 15_000;
 const HEARTBEAT_INTERVAL_MS = 15 * 60_000;
 const MAX_ATTEMPTS = 5;
+const MODEL_WAIT_RETRY_MS = 15 * 60_000;
 let runtimeStarted = false;
+let contadorModelUnavailableUntil = 0;
 
 const config = {
   enabled: CONTADOR_ENABLED,
@@ -379,12 +381,12 @@ function isDefinitiveEvolutionRejection(err) {
 
 let workerBusy = false;
 async function processPendingJobs() {
-  if (!configured() || workerBusy) return;
+  if (!configured() || workerBusy || Date.now() < contadorModelUnavailableUntil) return;
   workerBusy = true;
   try {
     const jobs = db.prepare(`
       SELECT * FROM contador_jobs
-      WHERE status IN ('pending', 'retry')
+      WHERE status IN ('pending', 'retry', 'waiting_model')
         AND (next_attempt_at IS NULL OR datetime(next_attempt_at) <= datetime('now'))
       ORDER BY datetime(created_at) ASC
       LIMIT 5
@@ -393,7 +395,7 @@ async function processPendingJobs() {
     for (const job of jobs) {
       const claimed = db.prepare(`
         UPDATE contador_jobs SET status = 'processing', attempts = attempts + 1, updated_at = ?
-        WHERE id = ? AND status IN ('pending', 'retry')
+        WHERE id = ? AND status IN ('pending', 'retry', 'waiting_model')
       `).run(nowIso(), job.id);
       if (!claimed.changes) continue;
       try {
@@ -408,6 +410,26 @@ async function processPendingJobs() {
           .run(status, result.reason || null, nowIso(), job.id);
       } catch (err) {
         const attempts = job.attempts + 1;
+        if (err.modelUnavailable === true) {
+          const waitUntil = new Date(Date.now() + MODEL_WAIT_RETRY_MS).toISOString();
+          contadorModelUnavailableUntil = Date.parse(waitUntil);
+          db.prepare(`
+            UPDATE contador_jobs
+            SET status = 'waiting_model', attempts = ?, next_attempt_at = ?,
+                model_waits = model_waits + 1, last_model_wait_at = ?,
+                last_error = ?, updated_at = ?
+            WHERE id = ?
+          `).run(
+            job.attempts,
+            waitUntil,
+            nowIso(),
+            String(err.message || err).slice(0, 500),
+            nowIso(),
+            job.id,
+          );
+          console.warn(`${LOG_TAG} [contador] model unavailable; job ${job.id} retained until ${waitUntil}`);
+          break;
+        }
         const deliveryUnknown = Boolean(err.deliveryUnknown)
           || db.prepare('SELECT reply_status FROM contador_jobs WHERE id = ?').get(job.id)?.reply_status === 'delivery_unknown';
         const retryable = !deliveryUnknown && err.retryable !== false && attempts < MAX_ATTEMPTS;

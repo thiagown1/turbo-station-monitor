@@ -17,7 +17,9 @@ WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:
 - **Auth**: `X-Api-Secret` header (env `SUPPORT_API_SECRET`)
 - **Agent routing**: each inbound image/PDF is classified at most once and
   delivered to the dashboard through a durable SQLite outbox. Financial and
-  outbound actions begin behind human review.
+  outbound actions begin behind human review. Provider/model outages retain
+  affected media and Contador messages in `waiting_model` without consuming the
+  per-message failure budget; a single 15-minute probe prevents outage fan-out.
 
 ## Routes
 

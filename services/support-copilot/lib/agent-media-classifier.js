@@ -117,7 +117,11 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
   } catch (_) { return { status: 'error', reason: 'transport', environmental: true }; }
-  if (!response.ok) return { status: 'error', reason: `http_${response.status}`, environmental: [401, 403, 429].includes(response.status) };
+  if (!response.ok) return {
+    status: 'error',
+    reason: `http_${response.status}`,
+    environmental: isProviderUnavailableStatus(response.status),
+  };
   const data = await response.json().catch(() => null);
   const parsed = parseModelJson(data?.choices?.[0]?.message?.content);
   const kinds = new Set(['partner_payment_receipt', 'expense_receipt', 'energy_invoice', 'station_support', 'support_attention', 'other']);
@@ -155,4 +159,8 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
   };
 }
 
-module.exports = { classifyMessage, estimateCost, extractFinancialFields, extractEnergyBill };
+function isProviderUnavailableStatus(status) {
+  return [401, 403, 408, 429].includes(status) || status >= 500;
+}
+
+module.exports = { classifyMessage, estimateCost, extractFinancialFields, extractEnergyBill, isProviderUnavailableStatus };

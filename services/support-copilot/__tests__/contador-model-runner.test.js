@@ -143,7 +143,11 @@ test('does not cross providers for arbitrary primary failures', async () => {
     response({ error: primaryError, stderr: 'workspace policy rejected the request' }),
   ]);
 
-  await assert.rejects(runner(exec).runAgent('safe prompt'), /workspace policy rejected/);
+  await assert.rejects(runner(exec).runAgent('safe prompt'), (error) => {
+    assert.match(error.message, /workspace policy rejected/);
+    assert.equal(error.modelUnavailable, undefined);
+    return true;
+  });
   assert.equal(exec.calls.length, 1);
 });
 
@@ -155,7 +159,11 @@ test('keeps the fallback fail-closed until explicitly enabled', async () => {
 
   await assert.rejects(
     runner(exec, { codexFallbackEnabled: false }).runAgent('safe prompt'),
-    /rate limit exceeded/,
+    (error) => {
+      assert.match(error.message, /rate limit exceeded/);
+      assert.equal(error.modelUnavailable, true);
+      return true;
+    },
   );
   assert.equal(exec.calls.length, 1);
 });
@@ -175,6 +183,7 @@ test('reports both providers without leaking the prompt when the fallback also f
       assert.match(error.message, /primary=.*quota exceeded/i);
       assert.match(error.message, /fallback=.*usage limit reached/i);
       assert.ok(!error.message.includes(secretPrompt));
+      assert.equal(error.modelUnavailable, true);
       return true;
     },
   );
