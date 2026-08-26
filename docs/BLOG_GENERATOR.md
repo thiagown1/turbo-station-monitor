@@ -81,6 +81,10 @@ Rules:
   Schemed and protocol-relative external links are preserved unchanged.
 - Standard Markdown link titles are parsed without bypassing validation; the
   title is preserved when the destination itself is valid.
+- Absolute links back to `turbostation.com.br` use the same route allowlist as
+  relative links; genuinely external hosts remain untouched. Clickable-image
+  Markdown is preserved as a complete construct instead of being reinterpreted
+  as an ordinary text link.
 - Only the bare canonical post path counts. A trailing slash, a query or an
   extra segment gets unwrapped, on purpose: only the exact path is provably real.
 - External links and images are untouched.

@@ -329,6 +329,7 @@ const VALID_STATIC_ROUTES = new Set([
   '/#contato',
   '/parceiro/ganhe-com-estacoes',
 ]);
+const FIRST_PARTY_HOSTS = new Set(['turbostation.com.br', 'www.turbostation.com.br']);
 
 /**
  * Unwrap every internal link the site cannot actually serve.
@@ -349,27 +350,48 @@ const VALID_STATIC_ROUTES = new Set([
  */
 function sanitizeInternalLinks(markdown, related) {
   const validSlugs = new Set((related || []).map((p) => p.slug));
+  const linkedImages = [];
+  const protectedMarkdown = markdown.replace(
+    /\[!\[[^\]\n]*\]\([^)\n]*\)\]\([^)\n]*\)/g,
+    (match) => {
+      const token = `\u0000BLOG_LINKED_IMAGE_${linkedImages.length}\u0000`;
+      linkedImages.push(match);
+      return token;
+    },
+  );
 
   const linkPattern = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
-  return markdown.replace(linkPattern, (match, text, href, title = '') => {
+  const sanitized = protectedMarkdown.replace(linkPattern, (match, text, href, title = '') => {
     // Schemed, protocol-relative and same-page destinations are not routes
-    // owned by this allowlist. Leave them exactly as authored.
-    if (
-      /^[a-z][a-z\d+.-]*:/i.test(href)
-      || href.startsWith('//')
-      || href.startsWith('#')
-      || href.startsWith('?')
-    ) return match;
+    // owned by this allowlist unless they point back to the public site.
+    let normalizedHref;
+    let renderedHref;
+    if (/^[a-z][a-z\d+.-]*:/i.test(href) || href.startsWith('//')) {
+      try {
+        const absolute = new URL(href.startsWith('//') ? `https:${href}` : href);
+        if (!['http:', 'https:'].includes(absolute.protocol) || !FIRST_PARTY_HOSTS.has(absolute.hostname.toLowerCase())) {
+          return match;
+        }
+        normalizedHref = `${absolute.pathname}${absolute.search}${absolute.hash}`;
+        renderedHref = href;
+      } catch {
+        return match;
+      }
+    } else if (href.startsWith('#') || href.startsWith('?')) {
+      return match;
+    }
 
     // Markdown resolves `faq` from a blog post as `/blog/faq`. Canonicalise
     // root-relative before validation so a model cannot bypass the allowlist
     // merely by omitting the leading slash.
-    const normalizedHref = href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}`;
-    if (VALID_STATIC_ROUTES.has(normalizedHref)) return `[${text}](${normalizedHref}${title})`;
+    normalizedHref ||= href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}`;
+    renderedHref ||= normalizedHref;
+    if (VALID_STATIC_ROUTES.has(normalizedHref)) return `[${text}](${renderedHref}${title})`;
     const post = /^\/blog\/([^/?#]+)$/.exec(normalizedHref);
-    if (post && validSlugs.has(post[1])) return `[${text}](${normalizedHref}${title})`;
+    if (post && validSlugs.has(post[1])) return `[${text}](${renderedHref}${title})`;
     return text;
   });
+  return sanitized.replace(/\u0000BLOG_LINKED_IMAGE_(\d+)\u0000/g, (_, index) => linkedImages[Number(index)]);
 }
 
 

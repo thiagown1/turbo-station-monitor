@@ -100,10 +100,30 @@ test('validates internal links that carry an optional Markdown title', () => {
     keeps('[ANEEL](https://www.aneel.gov.br "Agência reguladora")');
 });
 
+test('validates absolute links that target the Turbo Station public site', () => {
+    assert.strictEqual(
+        sanitizeInternalLinks('[Contato](https://www.turbostation.com.br/contato)', related),
+        'Contato',
+    );
+    assert.strictEqual(sanitizeInternalLinks('[Contato](//www.turbostation.com.br/contato)', related), 'Contato');
+    keeps('[FAQ](https://www.turbostation.com.br/faq)');
+    keeps('[FAQ](//www.turbostation.com.br/faq)');
+    keeps('[ANEEL](https://www.aneel.gov.br/contato)');
+});
+
 test('does not mangle an image whose path is invalid', () => {
     // Without the `!` lookbehind this produced a dangling "!alt" in the body.
     const md = '![diagrama](/imagens/nao-existe.png)';
     assert.strictEqual(sanitizeInternalLinks(md, related), md);
+});
+
+test('does not reinterpret a clickable image as an ordinary text link', () => {
+    for (const md of [
+        '[![diagrama](/imagens/mapa.png)](/faq)',
+        '[![diagrama](/imagens/mapa.png)](/contato)',
+    ]) {
+        assert.strictEqual(sanitizeInternalLinks(md, related), md);
+    }
 });
 
 test('handles several links in one body, keeping the good and dropping the bad', () => {
