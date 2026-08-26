@@ -379,6 +379,13 @@ function normalizeReferenceLabel(label) {
  */
 function sanitizeInternalLinks(markdown, related) {
   const validSlugs = new Set((related || []).map((p) => p.slug));
+  const imageReferenceLabels = new Set();
+  for (const match of markdown.matchAll(/!\[([^\]\n]*)\]\[([^\]\n]*)\]/g)) {
+    imageReferenceLabels.add(normalizeReferenceLabel(match[2] || match[1]));
+  }
+  for (const match of markdown.matchAll(/!\[([^\]\n]+)\](?![\[(])/g)) {
+    imageReferenceLabels.add(normalizeReferenceLabel(match[1]));
+  }
   const linkedImages = [];
   const protectedMarkdown = markdown.replace(
     /\[!\[[^\]\n]*\]\([^)\n]*\)\](?:\([^)\n]*\)|\[[^\]\n]*\])/g,
@@ -394,6 +401,7 @@ function sanitizeInternalLinks(markdown, related) {
   let referencesSanitized = protectedMarkdown.replace(
     definitionPattern,
     (match, indent, label, angleHref, bareHref, title = '') => {
+      if (imageReferenceLabels.has(normalizeReferenceLabel(label))) return match;
       const href = angleHref || bareHref;
       const destination = inspectLinkDestination(href, validSlugs);
       if (!destination.owned) return match;

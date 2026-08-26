@@ -87,7 +87,8 @@ Rules:
   as an ordinary text link.
 - Reference-style Markdown definitions use the same validation. Invalid
   first-party definitions and their references are unwrapped, while valid
-  internal and external definitions remain usable.
+  internal and external definitions remain usable. Definitions referenced by
+  images are preserved as media sources rather than treated as page routes.
 - Only the bare canonical post path counts. A trailing slash, a query or an
   extra segment gets unwrapped, on purpose: only the exact path is provably real.
 - External links and images are untouched.

@@ -143,6 +143,12 @@ test('validates reference-style internal links and their definitions', () => {
     keeps('[ANEEL][agencia]\n\n[agencia]: https://www.aneel.gov.br');
 });
 
+test('preserves definitions used by reference-style images', () => {
+    keeps('![diagrama][mapa]\n\n[mapa]: /imagens/mapa.png');
+    keeps('![mapa]\n\n[mapa]: /imagens/mapa.png "Mapa da rede"');
+    keeps('[![diagrama][mapa]](/faq)\n\n[mapa]: /imagens/mapa.png');
+});
+
 test('handles several links in one body, keeping the good and dropping the bad', () => {
     const out = sanitizeInternalLinks(
         'Veja [A](/blog/recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma), [B](/blog/inventado) e o [FAQ](/faq).',
