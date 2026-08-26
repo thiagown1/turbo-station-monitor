@@ -51,7 +51,7 @@ test('Contador retains model-outage jobs without spending their failure budget o
         const created = nowIso();
         const secondCreated = new Date(Date.parse(created) + 1000).toISOString();
         insert.run('job-oldest', 'message-oldest', 4, created, created, created);
-        insert.run('job-second', 'message-second', 0, secondCreated, secondCreated, secondCreated);
+        insert.run('job-second', 'message-second', 0, created, secondCreated, secondCreated);
         await runtime.processPendingJobs();
         const rows = db.prepare('SELECT id, status, attempts, model_waits, next_attempt_at FROM contador_jobs ORDER BY id').all();
         process.stdout.write(JSON.stringify({ calls, rows }));
