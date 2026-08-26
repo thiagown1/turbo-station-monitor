@@ -30,6 +30,7 @@ const {
   killSwitchAllowsActuation,
   pendingProposalNeedsAttention,
   approvalDeliveryAction,
+  currentProductionShaBlocker,
 } = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
@@ -348,6 +349,38 @@ test('dedupe and cooldown blockers never offer an unusable approval proposal', (
     assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE, name);
     assert.equal(result.action, ACTION.ALERT_INVESTIGATE, name);
   }
+});
+
+test('routine aggregate guardrails never offer an unusable approval proposal', () => {
+  const routineFailure = {
+    post: [
+      metric('/api/a', { total: 8, c5xx: 5 }),
+      metric('/api/b', { total: 7, c5xx: 4 }),
+      metric('/api/c', { total: 5, c5xx: 1 }),
+    ],
+    baseline: [
+      metric('/api/a', { total: 5, c5xx: 0 }),
+      metric('/api/b', { total: 5, c5xx: 0 }),
+      metric('/api/c', { total: 5, c5xx: 0 }),
+    ],
+    aggregate: { total: 20, c5xx: 10, distinct5xxEndpoints: 3 },
+    rolloutPhase: ROLLOUT_PHASE.APPROVAL_REQUIRED,
+  };
+  for (const [name, guardrails] of [
+    ['already acted', { alreadyActedForRelease: true }],
+    ['cooldown', { cooldownElapsed: false }],
+  ]) {
+    const result = assessRollback(fullContext({ ...routineFailure, guardrails }));
+    assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE, name);
+    assert.equal(result.action, ACTION.ALERT_INVESTIGATE, name);
+  }
+});
+
+test('authorization requires the production SHA to be confirmed on the current tick', () => {
+  const state = { newSha: NEW_SHA };
+  assert.equal(currentProductionShaBlocker(state, NEW_SHA), null);
+  assert.match(currentProductionShaBlocker(state, null), /could not be confirmed/i);
+  assert.match(currentProductionShaBlocker(state, PREV_SHA), /does not match/i);
 });
 
 test('critical financial failures alert quickly but can never authorize rollback', () => {

@@ -144,6 +144,14 @@ function directEligibilityBlockers(input, catastrophicMetric, attributionBlocker
   return [...new Set(blockers)];
 }
 
+function nonOverridableGuardrailBlockers(input) {
+  const guards = input.guardrails || {};
+  const blockers = [];
+  if (guards.alreadyActedForRelease === true) blockers.push('one rollback was already attempted for this release');
+  if (guards.cooldownElapsed === false) blockers.push('rollback cooldown has not elapsed');
+  return blockers;
+}
+
 function sameRouteBaselineBlocker(input, catastrophicMetric) {
   const baseline = metricFor(input.baseline, normalizeEndpoint(catastrophicMetric && catastrophicMetric.endpoint));
   if (!baseline || Number(baseline.success || 0) < 2 || Number(baseline.c5xx || 0) !== 0) {
@@ -219,10 +227,7 @@ function assessRollback(input = {}) {
     }
     const directBlockers = directEligibilityBlockers(input, catastrophic, attributionBlockers);
     const eligible = directBlockers.length === 0;
-    const guards = input.guardrails || {};
-    const nonOverridableBlockers = [];
-    if (guards.alreadyActedForRelease === true) nonOverridableBlockers.push('one rollback was already attempted for this release');
-    if (guards.cooldownElapsed === false) nonOverridableBlockers.push('rollback cooldown has not elapsed');
+    const nonOverridableBlockers = nonOverridableGuardrailBlockers(input);
     if (phase !== ROLLOUT_PHASE.SHADOW && nonOverridableBlockers.length > 0) {
       return {
         recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
@@ -257,6 +262,17 @@ function assessRollback(input = {}) {
         action: ACTION.ALERT_INVESTIGATE,
         reasons,
         blockers,
+        directEligibility: { eligible: false, blockers: ['aggregate failures are never eligible for direct rollback'] },
+      };
+    }
+    const nonOverridableBlockers = nonOverridableGuardrailBlockers(input);
+    if (phase !== ROLLOUT_PHASE.SHADOW && nonOverridableBlockers.length > 0) {
+      return {
+        recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
+        failureClass: 'rollback_guardrail_blocked',
+        action: ACTION.ALERT_INVESTIGATE,
+        reasons,
+        blockers: nonOverridableBlockers,
         directEligibility: { eligible: false, blockers: ['aggregate failures are never eligible for direct rollback'] },
       };
     }

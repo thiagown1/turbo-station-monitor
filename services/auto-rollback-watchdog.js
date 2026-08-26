@@ -257,6 +257,12 @@ async function currentSha() {
   return null;
 }
 
+function currentProductionShaBlocker(state, liveSha) {
+  if (!liveSha) return 'current production SHA could not be confirmed on this tick';
+  if (liveSha !== state.newSha) return `current production SHA ${liveSha} does not match watched release ${state.newSha}`;
+  return null;
+}
+
 // ─── Metrics from vercel.db (read-only) ──────────────────────────────
 function normalizeRouteRows(rows) {
   const byRoute = new Map();
@@ -766,6 +772,21 @@ async function tick() {
     return;
   }
 
+  const productionShaBlocker = currentProductionShaBlocker(state, live);
+  if (productionShaBlocker) {
+    db.close();
+    const blockedEv = {
+      ...ev,
+      recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
+      failureClass: 'production_sha_unconfirmed',
+      action: ACTION.ALERT_INVESTIGATE,
+      blockers: [...new Set([...(ev.blockers || []), productionShaBlocker])],
+      directEligibility: { eligible: false, blockers: [productionShaBlocker] },
+    };
+    await alertBlockedOnce(state, blockedEv, productionShaBlocker);
+    return;
+  }
+
   // A rollback recommendation is not enough: verify the previous deployment,
   // smoke its own URL, load the exact release safety attestation, and re-run the
   // deterministic policy with guardrail evidence.
@@ -963,6 +984,7 @@ module.exports = {
   prepareApprovalProposal,
   pendingProposalNeedsAttention,
   approvalDeliveryAction,
+  currentProductionShaBlocker,
   pendingConfirmationEvaluation,
   formatApprovalProposal,
 };
