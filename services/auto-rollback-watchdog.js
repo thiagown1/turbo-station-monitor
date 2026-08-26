@@ -555,6 +555,30 @@ function readinessBlocksBeforeAction(rolloutPhase, readiness = {}) {
   return !readiness.selection?.target || !rollbackIsReversible(readiness);
 }
 
+function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
+  const proposal = state.pendingProposal;
+  if (!state.pendingConfirmation || !proposal) return null;
+  if (
+    proposal.status !== 'pending'
+    || proposal.releaseSha !== state.newSha
+    || proposal.targetSha !== state.prevSha
+  ) return null;
+  if (!Number.isFinite(Number(proposal.expiresAtMs)) || nowMs > Number(proposal.expiresAtMs)) return null;
+  const evaluation = proposal.evaluation;
+  return evaluation?.critical === true ? evaluation : null;
+}
+
+function formatApprovalProposal(proposal, reasonStr) {
+  const expiresAt = new Date(proposal.expiresAtMs).toISOString();
+  return `🔶 PROPOSTA DE ROLLBACK ${proposal.id}\n` +
+    `Release atual: ${proposal.releaseSha}\nCandidato anterior verificado: ${proposal.targetSha}\n` +
+    `Evidência: ${reasonStr}\nExpira: ${expiresAt}\n` +
+    'Para autorizar, responda na conversa pessoal com todos os campos abaixo:\n' +
+    `Ação: CONFIRM_ROLLBACK\nID: ${proposal.id}\nNonce: ${proposal.nonce}\n` +
+    `Release: ${proposal.releaseSha}\nDestino: ${proposal.targetSha}\n` +
+    'Uso único; grupos não são aceitos.';
+}
+
 async function alertBlockedOnce(state, ev, detail, deps = {}) {
   const send = deps.send || sendWhatsApp;
   const persist = deps.persist || saveState;
@@ -608,6 +632,14 @@ async function tick() {
   if (!inWindow) { db.close(); return; }
 
   let ev = evaluate(db, now, state);
+  const resumedEvaluation = !ev.critical ? pendingConfirmationEvaluation(state, now) : null;
+  if (resumedEvaluation) {
+    ev = resumedEvaluation;
+    decisionLog({
+      phase: 'pending-confirmation-resumed', proposalId: state.pendingProposal.id,
+      newSha: state.newSha, prevSha: state.prevSha,
+    });
+  }
 
   if (!ev.critical) { db.close(); log(`ok — ${ev.reasons[0]}`); return; }
 
@@ -626,7 +658,7 @@ async function tick() {
   // smoke its own URL, load the exact release safety attestation, and re-run the
   // deterministic policy with guardrail evidence.
   const readiness = await buildReadiness(state, now);
-  ev = evaluate(db, now, state, readiness);
+  if (!resumedEvaluation) ev = evaluate(db, now, state, readiness);
   db.close();
   const reasonStr = reasonString(ev);
   decisionLog({
@@ -675,6 +707,7 @@ async function tick() {
   // pendingConfirmation; the agent/LLM never writes or consumes authorization.
   if (!state.pendingProposal || state.pendingProposal.releaseSha !== state.newSha || state.pendingProposal.expiresAtMs <= now) {
     state.pendingProposal = createApprovalProposal({ releaseSha: state.newSha, targetSha: state.prevSha, nowMs: now });
+    state.pendingProposal.evaluation = JSON.parse(JSON.stringify(ev));
     state.pendingConfirmation = null;
     saveState(state);
   }
@@ -699,10 +732,7 @@ async function tick() {
 
   if (state.lastShadowAlertSha === state.newSha) { log('approval proposal already sent for this deploy — skipping'); return; }
   const expiresAt = new Date(state.pendingProposal.expiresAtMs).toISOString();
-  const proposalText = `🔶 PROPOSTA DE ROLLBACK ${state.pendingProposal.id}\n` +
-    `Release atual: ${state.newSha}\nCandidato anterior verificado: ${state.prevSha}\n` +
-    `Evidência: ${reasonStr}\nExpira: ${expiresAt}\n` +
-    `Para autorizar, responda na conversa pessoal com a confirmação explícita vinculada ao ID e à release. Uso único; grupos não são aceitos.`;
+  const proposalText = formatApprovalProposal(state.pendingProposal, reasonStr);
   const sent = await sendApprovalProposal(proposalText);
   if (!sent) {
     await alertBlockedOnce(state, ev, 'proposta não enviada: destino pessoal allowlisted ou transporte confirmado indisponível');
@@ -802,4 +832,6 @@ module.exports = {
   evaluate,
   alertBlockedOnce,
   readinessBlocksBeforeAction,
+  pendingConfirmationEvaluation,
+  formatApprovalProposal,
 };

@@ -66,7 +66,9 @@ Missing or inconclusive evidence fails closed to proposal or alert/investigate.
 
 In `approval-required`, a rollback proposal is created for one exact
 `releaseSha -> targetSha` pair. It expires in at most five minutes and contains
-a random proposal ID and nonce. Confirmation is valid only when a trusted,
+a random proposal ID and nonce. The personal proposal message includes the
+exact `CONFIRM_ROLLBACK` action, proposal ID, nonce, release SHA, and target SHA
+that the inbound adapter must return. Confirmation is valid only when a trusted,
 non-LLM WhatsApp ingress records all of these facts:
 
 - explicit `CONFIRM_ROLLBACK` action;
@@ -79,9 +81,13 @@ non-LLM WhatsApp ingress records all of these facts:
 - proposal still pending and unused.
 
 The watchdog consumes and persists the approval before calling the actuator.
-Replays are rejected. The agent/LLM may summarize evidence and recommend an
-outcome, but it cannot write the trusted receipt, change a rollout phase, access
-the rollback token, or invoke the Vercel rollback endpoint.
+Replays are rejected. A confirmation received during the proposal lifetime
+resumes the release-bound critical evaluation even if the rolling 90-second log
+signal has already cleared; candidate readiness and release safety are still
+checked again immediately before action. Expired proposals never resume. The
+agent/LLM may summarize evidence and recommend an outcome, but it cannot write
+the trusted receipt, change a rollout phase, access the rollback token, or invoke
+the Vercel rollback endpoint.
 
 The trusted inbound adapter that records the confirmation is intentionally not
 activated by this change. Until that adapter and its atomic persistence are

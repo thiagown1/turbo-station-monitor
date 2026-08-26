@@ -24,6 +24,8 @@ const {
   evaluate,
   alertBlockedOnce,
   readinessBlocksBeforeAction,
+  pendingConfirmationEvaluation,
+  formatApprovalProposal,
 } = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
@@ -180,6 +182,43 @@ test('missing action readiness never suppresses an inert shadow report', () => {
   assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.SHADOW, missingReadiness), false);
   assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.APPROVAL_REQUIRED, missingReadiness), true);
   assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.CATASTROPHIC_AUTO, missingReadiness), true);
+});
+
+test('a valid pending confirmation resumes its proposal evaluation after the live signal clears', () => {
+  const evaluation = {
+    critical: true,
+    recommendation: RECOMMENDATION.ROLLBACK_RECOMMENDED,
+    action: ACTION.PROPOSAL_REQUIRED,
+  };
+  const state = {
+    newSha: NEW_SHA,
+    prevSha: PREV_SHA,
+    pendingProposal: {
+      status: 'pending', releaseSha: NEW_SHA, targetSha: PREV_SHA,
+      expiresAtMs: NOW + 60_000, evaluation,
+    },
+    pendingConfirmation: { proposalId: 'rbp_test' },
+  };
+  assert.strictEqual(pendingConfirmationEvaluation(state, NOW), evaluation);
+  assert.equal(pendingConfirmationEvaluation(state, NOW + 60_001), null);
+  assert.equal(pendingConfirmationEvaluation({ ...state, pendingConfirmation: null }, NOW), null);
+  assert.equal(pendingConfirmationEvaluation({ ...state, prevSha: 'different-target' }, NOW), null);
+});
+
+test('approval proposal tells the operator the exact action and nonce required by validation', () => {
+  const proposal = createApprovalProposal({
+    releaseSha: NEW_SHA,
+    targetSha: PREV_SHA,
+    nowMs: NOW,
+    proposalId: 'rbp_visible_contract',
+    nonce: 'nonce-visible-contract',
+  });
+  const text = formatApprovalProposal(proposal, 'evidence summary');
+  assert.match(text, /CONFIRM_ROLLBACK/);
+  assert.match(text, /nonce-visible-contract/);
+  assert.match(text, /rbp_visible_contract/);
+  assert.match(text, new RegExp(NEW_SHA));
+  assert.match(text, new RegExp(PREV_SHA));
 });
 
 test('post-deploy evaluation excludes failures recorded before the cutover', () => {
