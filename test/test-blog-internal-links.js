@@ -74,6 +74,20 @@ test('leaves external links completely alone', () => {
     keeps('Veja o [manual](http://exemplo.com/manual.pdf).');
 });
 
+test('normalizes relative internal links before validating them', () => {
+    assert.strictEqual(sanitizeInternalLinks('[FAQ](faq)', related), '[FAQ](/faq)');
+    assert.strictEqual(
+        sanitizeInternalLinks('[Post](blog/recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma)', related),
+        '[Post](/blog/recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma)',
+    );
+    assert.strictEqual(sanitizeInternalLinks('[Contato](contato)', related), 'Contato');
+    assert.strictEqual(sanitizeInternalLinks('[Fantasma](blog/nao-publicado)', related), 'Fantasma');
+});
+
+test('leaves protocol-relative external links completely alone', () => {
+    keeps('Segundo a [ANEEL](//www.aneel.gov.br), a regra e essa.');
+});
+
 test('does not mangle an image whose path is invalid', () => {
     // Without the `!` lookbehind this produced a dangling "!alt" in the body.
     const md = '![diagrama](/imagens/nao-existe.png)';

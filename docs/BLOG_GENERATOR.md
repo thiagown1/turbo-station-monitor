@@ -76,6 +76,9 @@ Rules:
   Add a route only after confirming it serves 200.
 - The sanitiser covers **all** internal links, not just `/blog/`. It used to only
   look at `/blog/`, so an invented `/contato` sailed through it.
+- Relative internal destinations are canonicalised to root-relative paths
+  before validation (`faq` becomes `/faq`); invalid relatives are unwrapped.
+  Schemed and protocol-relative external links are preserved unchanged.
 - Only the bare canonical post path counts. A trailing slash, a query or an
   extra segment gets unwrapped, on purpose: only the exact path is provably real.
 - External links and images are untouched.
