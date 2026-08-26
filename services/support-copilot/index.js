@@ -14,7 +14,8 @@
  */
 
 const express = require('express');
-const { PORT, LOG_TAG, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
+const crypto = require('crypto');
+const { PORT, BIND_HOST, LOG_TAG, MEDIA_DIR, MAX_PAYLOAD_BYTES, EVOLUTION_WEBHOOK_SECRET } = require('./lib/constants');
 require('./lib/db'); // ensure DB is initialised before routes
 
 const app = express();
@@ -24,42 +25,61 @@ const { requireSecret } = require('./middleware/auth');
 app.use(express.json({ limit: MAX_PAYLOAD_BYTES }));
 
 // ─── Health ──────────────────────────────────────────────────────────────────
-app.get('/health', (_req, res) => res.json({ ok: true, service: 'support-copilot' }));
+// X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+app.get('/health', (_req, res) =>
+    res.set('X-Service', 'support-copilot').json({ ok: true, service: 'support-copilot' })
+);
 app.get('/ping', (_req, res) => res.send('pong'));
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
+// Evolution API webhook — uses its own secret and must be mounted before the
+// generic /api/support dashboard middleware below.
+const evolutionAuth = (req, res, next) => {
+  if (!EVOLUTION_WEBHOOK_SECRET) {
+    console.error(`${LOG_TAG} Evolution webhook secret is not configured`);
+    return res.status(503).json({ error: 'Webhook unavailable' });
+  }
+  const header = req.headers['x-webhook-secret'] || req.headers['apikey'];
+  const provided = Buffer.from(String(header || ''));
+  const expected = Buffer.from(EVOLUTION_WEBHOOK_SECRET);
+  if (provided.length === expected.length && crypto.timingSafeEqual(provided, expected)) return next();
+  console.warn(`${LOG_TAG} Evolution webhook auth failed from ${req.ip}`);
+  return res.status(401).json({ error: 'Unauthorized' });
+};
+app.use('/api/support/ingest/evolution', evolutionAuth, require('./routes/ingest-evolution'));
+
 // SSE real-time events (replaces frontend polling)
 const { sseRouter } = require('./lib/sse');
 app.use('/api/support', requireSecret, sseRouter);
 
 app.use('/api/support/conversations', requireSecret, require('./routes/conversations'));
 app.use('/api/support/settings', requireSecret, require('./routes/settings'));
+app.use('/api/support/shadow', requireSecret, require('./routes/shadow'));
+app.use('/api/support/outcomes', requireSecret, require('./routes/outcomes'));
+app.use('/api/support/groups', requireSecret, require('./routes/groups'));
 app.use('/api/support/actions', requireSecret, require('./routes/actions'));
 app.use('/api/support/test-runner', requireSecret, require('./routes/test-runner'));
 app.use('/api/support/ingest/whatsapp', requireSecret, require('./routes/ingest'));
-
-// Evolution API webhook — uses its own secret (separate from dashboard auth)
-const evolutionAuth = (req, res, next) => {
-  if (!EVOLUTION_WEBHOOK_SECRET) return next(); // no secret = open (dev)
-  const header = req.headers['x-webhook-secret'] || req.headers['apikey'];
-  if (header === EVOLUTION_WEBHOOK_SECRET) return next();
-  console.warn(`${LOG_TAG} Evolution webhook auth failed from ${req.ip}`);
-  return res.status(401).json({ error: 'Unauthorized' });
-};
-app.use('/api/support/ingest/evolution', evolutionAuth, require('./routes/ingest-evolution'));
 
 // WhatsApp management routes — dashboard can connect/disconnect WhatsApp accounts
 app.use('/api/support/whatsapp', requireSecret, require('./routes/whatsapp'));
 
 // Static media files (no auth — files have random names)
-const path = require('path');
-app.use('/api/support/media', require('express').static(path.join(__dirname, '..', '..', 'db', 'media')));
+app.use('/api/support/media', requireSecret, require('express').static(MEDIA_DIR));
 
 // ─── Start ───────────────────────────────────────────────────────────────────
-app.listen(PORT, () => {
-  console.log(`${LOG_TAG} Listening on port ${PORT}`);
+app.listen(PORT, BIND_HOST, () => {
+  console.log(`${LOG_TAG} Listening on ${BIND_HOST}:${PORT}`);
 
   // Start auto-close worker (closes stale conversations + compacts sessions)
   const { startAutoClose } = require('./lib/auto-close');
   startAutoClose();
+
+  // Contador is fail-closed and starts only when all required env values exist.
+  const { startContadorRuntime } = require('./lib/contador-runtime');
+  startContadorRuntime();
+
+  // The reviewed-agent outbox is independent and also fail-closed.
+  const { startAgentEventWorker } = require('./lib/agent-router');
+  startAgentEventWorker();
 });

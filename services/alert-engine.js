@@ -13,6 +13,8 @@ const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
+const { notifyPartnerFault } = require('./partner-fault-notifier');
+const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
 
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -26,6 +28,43 @@ const ALERTS_DB_PATH = path.join(DB_DIR, 'logs.db');
 // Disabled by default (Thiago request 2026-02-26). To enable:
 //   export ALERT_TELEGRAM_GROUP='telegram:-5102620169'
 const TELEGRAM_GROUP = process.env.ALERT_TELEGRAM_GROUP || null;
+// WhatsApp alerts via the support-copilot → Evolution transport (the openclaw
+// WhatsApp-Web gateway is NOT linked, so `openclaw message send` fails). This is
+// the same path the Next whatsapp-notifier and the manual tests use, confirmed
+// delivering to the "Notificações Turbo Station" group. Set ALERT_WHATSAPP_CONV=''
+// to disable WhatsApp dispatch.
+const WHATSAPP_CONV = process.env.ALERT_WHATSAPP_CONV !== undefined
+    ? process.env.ALERT_WHATSAPP_CONV
+    : 'conv_jiuijxjtmnet23i9';
+const WHATSAPP_BRAND = process.env.ALERT_WHATSAPP_BRAND || 'turbo_station';
+// Urgent alerts (cable-theft suspects) additionally go to the dedicated
+// "Turbo Station + URGENTE" WhatsApp group. Same support-copilot transport as
+// the normal group. Set ALERT_URGENT_WHATSAPP_CONV='' to disable.
+const URGENT_WHATSAPP_CONV = process.env.ALERT_URGENT_WHATSAPP_CONV !== undefined
+    ? process.env.ALERT_URGENT_WHATSAPP_CONV
+    : 'conv_i7ljlrvrmrl33ohs';
+const SUPPORT_API_BASE = (process.env.SUPPORT_API_URL || 'https://logs.turbostation.com.br').replace(/\/+$/, '');
+const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
+
+// A 2xx from the support API only means the message was QUEUED — Evolution
+// fires async and delivery_status can still flip to 'failed' (instance
+// disconnected being the classic). After the POST we poll the conversation for
+// the message's terminal delivery_status with this backoff (comma-separated ms,
+// tunable without a deploy). Mirrors confirmDelivery in the Next.js
+// whatsapp-notifier (next/lib/services/whatsapp-notifier.ts).
+function deliveryPollScheduleMs() {
+    const raw = process.env.WHATSAPP_DELIVERY_POLL_MS;
+    if (raw) {
+        const parsed = raw.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 0);
+        if (parsed.length) return parsed;
+    }
+    return [500, 1000, 2000, 3000];
+}
+
+// Unsent alerts younger than this are retried on every detection tick (the
+// engine never retried WhatsApp before — an alert that failed to deliver was
+// silently lost, the gap behind the 2026-07-16 cable-theft investigation).
+const UNSENT_RETRY_WINDOW_MS = 30 * 60 * 1000;
 
 // Freshness guard
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send alerts older than 10 minutes
@@ -39,10 +78,150 @@ const DEBOUNCE_WINDOW = 60 * 60 * 1000; // 1 hour
 const QUERY_WINDOW = 5 * 60 * 1000; // Last 5 minutes
 const CORRELATION_WINDOW = 30 * 1000; // ±30 seconds for correlation
 
+/** Strip query/hash noise so grouping and debounce operate on the actual route. */
+function normalizeEndpoint(endpoint) {
+    if (endpoint == null) return null;
+    const raw = String(endpoint).trim();
+    if (!raw) return null;
+    try {
+        if (/^https?:\/\//i.test(raw)) return new URL(raw).pathname || '/';
+    } catch (_) {
+        // Fall through to the safe relative-path handling below.
+    }
+    return raw.split(/[?#]/, 1)[0] || null;
+}
+
+function getVercel5xxGroupKey(endpoint) {
+    if (/^\/api\/monitor\/(?:heatmap-data|online-users|recent-locations)$/.test(endpoint || '')) {
+        return '/api/monitor/mobile-telemetry';
+    }
+    return endpoint;
+}
+
+function groupByNormalizedEndpoint(rows) {
+    return rows.reduce((groups, row) => {
+        const normalized = normalizeEndpoint(row.endpoint);
+        if (!normalized || normalized === 'null') return groups;
+        const groupKey = getVercel5xxGroupKey(normalized);
+        if (!groups[groupKey]) groups[groupKey] = [];
+        groups[groupKey].push(row);
+        return groups;
+    }, {});
+}
+
+/** Observability reads are useful warnings, but not one-message-per-error incidents. */
+function getVercel5xxAlertPolicy(endpoint, count) {
+    if (endpoint === '/api/monitor/mobile-telemetry') {
+        return {
+            shouldAlert: true,
+            severity: 'warning',
+            title: 'Instabilidade na telemetria móvel',
+        };
+    }
+    const isLogsRead = /^\/api\/ocpp-logs(?:-dev)?(?:\/|$)/.test(endpoint || '');
+    if (isLogsRead) {
+        return {
+            shouldAlert: count >= 3,
+            severity: 'warning',
+            title: 'Instabilidade no serviço de logs',
+        };
+    }
+    return { shouldAlert: true, severity: 'critical', title: null };
+}
+
+/**
+ * Return the newest row received by the OCPP collector. `ocpp_events` is
+ * filtered/throttled and may remain unchanged while raw charger logs continue,
+ * so the watchdog prefers `ocpp_raw` and falls back for legacy databases.
+ */
+function getLatestOcppIngestTimestamp(db) {
+    for (const table of ['ocpp_raw', 'ocpp_events']) {
+        try {
+            const row = db.prepare(`SELECT MAX(timestamp) AS max_ts FROM ${table}`).get();
+            const value = row?.max_ts;
+            if (typeof value === 'number') return value;
+            if (value != null && Number.isFinite(Number(value))) return Number(value);
+        } catch (_) {
+            // Try the legacy table when the preferred table is unavailable.
+        }
+    }
+    return null;
+}
+
+// --- Causal correlation gate (added 2026-06-12) --------------------------
+// A charger fault and a backend error are only CAUSALLY related when the
+// backend failure could actually have blocked a charge action on THAT charger
+// (e.g. user hit "start charge" → the start route 5xx'd → the charger never
+// started). Mere temporal coincidence — any 4xx/5xx anywhere in the ±30s
+// window — was the #1 false-critical source: a random `/api/stations/accessible
+// 403` + `/api/users/<uid> 404` got bundled as "backend afetou carregador".
+//
+// We now require BOTH:
+//   (a) the backend endpoint is a charge-ACTION route (start/stop/authorize/…),
+//   (b) it references THIS charger's id/serial in its path or query.
+// Generic reads (analytics, pricing, health, accessible, user lookups) and
+// errors on other chargers never escalate a fault to critical. Charger faults
+// and backend errors otherwise alert as two independent streams.
+const CHARGE_ACTION_ROUTE = /(remote[-_]?start|remote[-_]?stop|start[-_]?transaction|stop[-_]?transaction|\/authorize\b|\/pnc\/|\/charging\b|\/charge\b|\/sessions?\b)/i;
+
+function endpointReferencesCharger(endpoint, chargerId) {
+    if (!endpoint || !chargerId) return false;
+    return String(endpoint).includes(String(chargerId));
+}
+
+function isCausalBackendError(endpoint, chargerId) {
+    if (!endpoint) return false;
+    return CHARGE_ACTION_ROUTE.test(endpoint) && endpointReferencesCharger(endpoint, chargerId);
+}
+
 // Ingest watchdog (if no new rows, alert)
 const INGEST_STALL_OCPP_MS = 10 * 60 * 1000;
 const INGEST_STALL_VERCEL_MS = 10 * 60 * 1000;
 const INGEST_STALL_MOBILE_MS = 2 * 60 * 60 * 1000;
+
+// --- Escalating backoff for chronic charger faults (added 2026-07-07) -----
+// The flat 1h debounce re-alerts a charger stuck on the SAME fault forever.
+// One charger alone produced 165 of 306 alerts sent to the group in 7 days,
+// firing on the dot every hour non-stop — that's what trains people to stop
+// reading the channel. Back off the re-alert cadence the longer the same
+// charger+error persists; a chronic fault becomes a daily heartbeat instead
+// of an hourly ping. `afterStreak` is the number of PRIOR alerts already
+// sent for this key before the tier applies.
+const CHARGER_FAULT_BACKOFF_TIERS = [
+    { afterStreak: 0, windowMs: 60 * 60 * 1000 },       // alerts 1-3: hourly
+    { afterStreak: 3, windowMs: 6 * 60 * 60 * 1000 },   // alerts 4-8: every 6h
+    { afterStreak: 8, windowMs: 24 * 60 * 60 * 1000 },  // alerts 9+: daily
+];
+const CHARGER_FAULT_BACKOFF_FILE = path.join(__dirname, '..', 'history', 'charger_fault_backoff.json');
+
+// --- Cable-theft (HighTemperature) burst-then-silence (added 2026-07-18) ------
+// A cut DC cable severs the connector's temperature sensor → HighTemperature
+// fault, which the charger re-reports every ~5 min for as long as it stays
+// broken (Metrópole 3: 03:53 → 18:51 BRT, 15h straight). The escalating backoff
+// above kept re-paging the URGENTE group across that whole span — but once the
+// team knows the cable is stolen, further pings are pure noise ("we already
+// know"). Instead: on a FRESH incident fire a short BURST (grab attention
+// immediately), then stay SILENT for that charger+connector until it actually
+// RECOVERS (reports an operational status again). A later theft on the same
+// connector, after a recovery, is a fresh incident and bursts again.
+const CABLE_THEFT_BURST_COUNT = Number(process.env.ALERT_CABLE_THEFT_BURST_COUNT) || 5;
+const CABLE_THEFT_BURST_INTERVAL_MS = Number(process.env.ALERT_CABLE_THEFT_BURST_INTERVAL_MS) || 10 * 1000;
+const CABLE_THEFT_STATE_FILE = path.join(__dirname, '..', 'history', 'cable_theft_incidents.json');
+// OCPP statuses that mean the connector is genuinely usable again (mirrors the
+// Next.js OPERATIONAL_STATUSES set). Anything else (Faulted/Unavailable) keeps
+// the incident OPEN, so a stuck or self-disabled connector never reads as
+// recovered and re-bursts.
+const OPERATIONAL_OCPP_STATUSES = new Set([
+    'available', 'preparing', 'charging', 'suspendedev', 'suspendedevse', 'finishing', 'reserved',
+]);
+
+function windowForStreak(streak) {
+    let win = CHARGER_FAULT_BACKOFF_TIERS[0].windowMs;
+    for (const tier of CHARGER_FAULT_BACKOFF_TIERS) {
+        if (streak >= tier.afterStreak) win = tier.windowMs;
+    }
+    return win;
+}
 
 class AlertEngine {
     constructor() {
@@ -57,12 +236,18 @@ class AlertEngine {
         this.vercelDb.pragma('journal_mode = WAL');
         this.mobileDb.pragma('journal_mode = WAL');
 
+        this.ocppDb.pragma('busy_timeout = 5000');
+        this.vercelDb.pragma('busy_timeout = 5000');
+        this.mobileDb.pragma('busy_timeout = 5000');
+
         // Alerts DB (write)
         this.alertsDb = new Database(ALERTS_DB_PATH);
         this.alertsDb.pragma('journal_mode = WAL'); // Better concurrent performance
         this.initAlertsSchema();
 
         this.debounceCache = this.loadDebounceCache();
+        this.chargerFaultBackoff = this.loadChargerFaultBackoff();
+        this.cableTheftState = this.loadCableTheftState();
 
         // NOTE: Startup replay disabled.
         // This process is meant to be long-running (interval loop). Replaying on restart caused
@@ -83,18 +268,23 @@ class AlertEngine {
                 vercel_log_ids TEXT,
                 evidence_json TEXT,
                 sent BOOLEAN DEFAULT 0,
-                sent_at INTEGER
+                sent_at INTEGER,
+                wa_message_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_alerts_ts ON alerts(created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_alerts_sent ON alerts(sent);
         `);
 
-        // Backfill/migrate older DBs that predate evidence_json
+        // Backfill/migrate older DBs that predate evidence_json / wa_message_id
         try {
             const cols = this.alertsDb.prepare(`PRAGMA table_info(alerts)`).all().map(r => r.name);
             if (!cols.includes('evidence_json')) {
                 this.alertsDb.exec('ALTER TABLE alerts ADD COLUMN evidence_json TEXT');
                 console.log('🧱 Migrated alerts DB: added evidence_json column');
+            }
+            if (!cols.includes('wa_message_id')) {
+                this.alertsDb.exec('ALTER TABLE alerts ADD COLUMN wa_message_id TEXT');
+                console.log('🧱 Migrated alerts DB: added wa_message_id column');
             }
         } catch (e) {
             console.error('⚠️ Failed to migrate alerts schema:', e.message);
@@ -140,6 +330,213 @@ class AlertEngine {
         return true;
     }
 
+    loadChargerFaultBackoff() {
+        try {
+            if (fs.existsSync(CHARGER_FAULT_BACKOFF_FILE)) {
+                return JSON.parse(fs.readFileSync(CHARGER_FAULT_BACKOFF_FILE, 'utf8'));
+            }
+        } catch (e) {
+            console.error('⚠️ Error loading charger fault backoff cache:', e.message);
+        }
+        return {};
+    }
+
+    saveChargerFaultBackoff() {
+        try {
+            fs.writeFileSync(CHARGER_FAULT_BACKOFF_FILE, JSON.stringify(this.chargerFaultBackoff, null, 2));
+        } catch (e) {
+            console.error('⚠️ Error saving charger fault backoff cache:', e.message);
+        }
+    }
+
+    /**
+     * Escalating debounce for repeat charger+error faults (see
+     * CHARGER_FAULT_BACKOFF_TIERS). Returns `false` to skip, or
+     * `{ streak, windowMs }` when the alert should send.
+     *
+     * A gap since the last alert bigger than 2x the window last used resets
+     * the streak — the charger likely recovered in between, so the next
+     * fault is treated as a fresh incident rather than the same chronic one.
+     */
+    shouldSendChargerFaultAlert(dedupeKey) {
+        const now = Date.now();
+        const state = this.chargerFaultBackoff[dedupeKey] || { lastSent: 0, streak: 0, lastWindow: 0 };
+
+        if (state.lastSent) {
+            const sinceLast = now - state.lastSent;
+            if (sinceLast < state.lastWindow) {
+                console.log(`🔇 Debounced (backoff): ${dedupeKey} (${Math.round(sinceLast / 60000)}m of ${Math.round(state.lastWindow / 60000)}m window)`);
+                return false;
+            }
+            if (sinceLast > 2 * state.lastWindow) {
+                console.log(`♻️ Backoff reset for ${dedupeKey} (${Math.round(sinceLast / 60000)}m gap — treating as a fresh incident)`);
+                state.streak = 0;
+            }
+        }
+
+        const windowMs = windowForStreak(state.streak);
+        const streak = state.streak + 1;
+        this.chargerFaultBackoff[dedupeKey] = { lastSent: now, streak, lastWindow: windowMs };
+        this.saveChargerFaultBackoff();
+        return { streak, windowMs };
+    }
+
+    /**
+     * Drop backoff entries untouched for >7 days (charger long recovered).
+     */
+    cleanupChargerFaultBackoff() {
+        const now = Date.now();
+        const weekMs = 7 * 24 * 60 * 60 * 1000;
+        let cleaned = 0;
+
+        Object.keys(this.chargerFaultBackoff).forEach(key => {
+            if (now - this.chargerFaultBackoff[key].lastSent > weekMs) {
+                delete this.chargerFaultBackoff[key];
+                cleaned++;
+            }
+        });
+
+        if (cleaned > 0) {
+            this.saveChargerFaultBackoff();
+            console.log(`🧹 Cleaned ${cleaned} old charger-fault backoff entries`);
+        }
+    }
+
+    loadCableTheftState() {
+        try {
+            if (fs.existsSync(CABLE_THEFT_STATE_FILE)) {
+                return JSON.parse(fs.readFileSync(CABLE_THEFT_STATE_FILE, 'utf8'));
+            }
+        } catch (e) {
+            console.error('⚠️ Error loading cable-theft incident state:', e.message);
+        }
+        return {};
+    }
+
+    saveCableTheftState() {
+        try {
+            fs.writeFileSync(CABLE_THEFT_STATE_FILE, JSON.stringify(this.cableTheftState, null, 2));
+        } catch (e) {
+            console.error('⚠️ Error saving cable-theft incident state:', e.message);
+        }
+    }
+
+    /** True when an OCPP status string means the connector is usable again. */
+    isOperationalOcppStatus(status) {
+        return OPERATIONAL_OCPP_STATUSES.has(String(status || '').trim().toLowerCase());
+    }
+
+    /**
+     * True when the given connector reported an OPERATIONAL status after
+     * `sinceMs` — i.e. the cable-theft incident was resolved (repaired) and any
+     * new fault is a fresh incident. Checked PER-CONNECTOR so a healthy
+     * connector 1 charging normally never masks a stolen cable on connector 2
+     * (the exact Metrópole 3 shape: conn 1 charging, conn 2 Faulted). Reuses the
+     * detection parser so the status format can't drift. On a query error,
+     * returns false (assume still-open) — under-notifying beats re-spamming.
+     */
+    hasConnectorRecoveredSince(chargerId, connectorId, sinceMs) {
+        try {
+            const rows = this.ocppDb.prepare(`
+                SELECT message FROM ocpp_events
+                WHERE charger_id = ? AND timestamp > ? AND message LIKE '%status=%'
+                ORDER BY timestamp DESC LIMIT 500
+            `).all(chargerId, sinceMs);
+            for (const r of rows) {
+                const p = parseStatusNotif(r.message);
+                // When both connector ids are known, require a match; a null on
+                // either side falls back to "any operational status counts".
+                if (connectorId != null && p.connectorId != null && p.connectorId !== connectorId) continue;
+                if (this.isOperationalOcppStatus(p.status)) return true;
+            }
+            return false;
+        } catch (e) {
+            console.error('⚠️ cable-theft recovery check failed:', e.message);
+            return false;
+        }
+    }
+
+    /**
+     * Burst-then-silence gate for a cable-theft suspect. Returns true (and
+     * records the incident) only for a FRESH incident: no prior record for this
+     * charger+connector, or the connector has RECOVERED since the last alert.
+     * An ongoing incident (still faulted, no recovery) returns false — no
+     * re-burst, no re-ping. This replaces the escalating backoff for
+     * cable-theft faults only.
+     */
+    shouldAlertCableTheft(chargerId, connectorId) {
+        const key = `${chargerId}::${connectorId != null ? connectorId : 'x'}`;
+        const prev = this.cableTheftState[key];
+        if (prev && prev.alertedAt) {
+            if (!this.hasConnectorRecoveredSince(chargerId, connectorId, prev.alertedAt)) {
+                // Touch the record so an incident that is STILL OPEN can never
+                // age out of the GC window and replay the burst (see
+                // cleanupCableTheftState). Metrópole 3 connector 2 stayed faulted
+                // for 30 days, the record expired, and the same never-resolved
+                // fault re-paged the URGENTE group as if it were brand new.
+                prev.lastSeenAt = Date.now();
+                if (prev.chargerId == null) prev.chargerId = chargerId;
+                this.saveCableTheftState();
+                console.log(`🔇 Cable-theft still open (no recovery since last burst): ${key}`);
+                return false;
+            }
+            console.log(`♻️ Cable-theft new incident after recovery: ${key}`);
+        }
+        const nowTs = Date.now();
+        this.cableTheftState[key] = {
+            alertedAt: nowTs,
+            lastSeenAt: nowTs,
+            chargerId,
+            connectorId: connectorId != null ? connectorId : null,
+        };
+        this.saveCableTheftState();
+        return true;
+    }
+
+    /**
+     * Drop cable-theft incident records untouched for >30 days — but ONLY once
+     * the connector has actually RECOVERED. The record is what keeps the burst
+     * silent; expiring it while the fault is still open makes the next tick read
+     * a 30-day-old unresolved theft as a brand-new one and re-page the URGENTE
+     * group (Metrópole 3 connector 2, 2026-08-18 02:00 UTC — the team had known
+     * since 18/07). Age is measured from `lastSeenAt`, refreshed on every
+     * suppressed tick, so an ongoing incident never ages out at all;
+     * `alertedAt` is the fallback for records written before that field existed.
+     */
+    cleanupCableTheftState() {
+        const now = Date.now();
+        const monthMs = 30 * 24 * 60 * 60 * 1000;
+        let cleaned = 0;
+        let held = 0;
+        Object.keys(this.cableTheftState).forEach(key => {
+            const rec = this.cableTheftState[key] || {};
+            const lastTouch = rec.lastSeenAt || rec.alertedAt || 0;
+            if (now - lastTouch <= monthMs) return;
+
+            const sep = key.lastIndexOf('::');
+            const chargerId = rec.chargerId || (sep > 0 ? key.slice(0, sep) : key);
+            const rawConn = sep > 0 ? key.slice(sep + 2) : '';
+            const connectorId = rec.connectorId != null
+                ? rec.connectorId
+                : (rawConn === 'x' || rawConn === '' ? null : Number(rawConn));
+
+            // Still faulted with no recovery → keep the silence, do NOT expire.
+            if (!this.hasConnectorRecoveredSince(chargerId, connectorId, rec.alertedAt || 0)) {
+                held++;
+                return;
+            }
+            delete this.cableTheftState[key];
+            cleaned++;
+        });
+        if (held > 0) {
+            console.log(`🔒 Kept ${held} unresolved cable-theft incident(s) past the GC window (no recovery yet)`);
+        }
+        if (cleaned > 0) {
+            this.saveCableTheftState();
+            console.log(`🧹 Cleaned ${cleaned} old cable-theft incident entries`);
+        }
+    }
+
     /**
      * Ingest watchdog: detect if any source DB stopped receiving new rows.
      */
@@ -156,7 +553,7 @@ class AlertEngine {
             }
         };
 
-        const ocppMax = getMaxTs(this.ocppDb, 'SELECT MAX(timestamp) AS max_ts FROM ocpp_events');
+        const ocppMax = getLatestOcppIngestTimestamp(this.ocppDb);
         const vercelMax = getMaxTs(this.vercelDb, 'SELECT MAX(timestamp) AS max_ts FROM vercel_logs');
         const mobileMax = getMaxTs(this.mobileDb, 'SELECT MAX(received_at) AS max_ts FROM mobile_events');
 
@@ -206,15 +603,18 @@ class AlertEngine {
     detectVercel5xxErrors() {
         const cutoff = Date.now() - QUERY_WINDOW;
         
+        // Catch 5xx on ANY endpoint (was previously scoped to /api/ocpp, which
+        // silently missed /api/payments/process etc. — the PIX incident).
+        // Grouping by endpoint + shouldSendAlert (1h debounce per endpoint) keeps
+        // a storm to one alert per endpoint.
         const query = `
             SELECT id, timestamp, endpoint, status_code, duration_ms, meta
             FROM vercel_logs
             WHERE status_code >= 500
               AND status_code < 600
-              AND endpoint LIKE '%/api/ocpp%'
               AND timestamp > ?
             ORDER BY timestamp DESC
-            LIMIT 10
+            LIMIT 50
         `;
 
         const errors = this.vercelDb.prepare(query).all(cutoff);
@@ -222,18 +622,15 @@ class AlertEngine {
         if (errors.length === 0) return [];
 
         // Group by endpoint to avoid spam
-        const groupedByEndpoint = errors.reduce((acc, err) => {
-            if (!acc[err.endpoint]) {
-                acc[err.endpoint] = [];
-            }
-            acc[err.endpoint].push(err);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(errors);
 
         const alerts = [];
         for (const [endpoint, errs] of Object.entries(groupedByEndpoint)) {
             const firstError = errs[0];
             const count = errs.length;
+            const policy = getVercel5xxAlertPolicy(endpoint, count);
+
+            if (!policy.shouldAlert) continue;
 
             if (!this.shouldSendAlert('vercel_5xx', endpoint)) {
                 continue;
@@ -241,10 +638,11 @@ class AlertEngine {
 
             const alert = {
                 type: 'vercel_5xx',
-                severity: 'critical',
-                title: `Erro ${firstError.status_code} no backend OCPP`,
+                severity: policy.severity,
+                title: policy.title || `Erro ${firstError.status_code} no backend`,
                 description: `${count} erro(s) 5xx em ${endpoint} nos últimos 5 minutos`,
                 endpoint: endpoint,
+                sample_endpoint: firstError.endpoint,
                 status_code: firstError.status_code,
                 count: count,
                 vercel_log_ids: JSON.stringify(errs.map(e => e.id)),
@@ -279,13 +677,7 @@ class AlertEngine {
 
         if (timeouts.length === 0) return [];
 
-        const groupedByEndpoint = timeouts.reduce((acc, timeout) => {
-            if (!acc[timeout.endpoint]) {
-                acc[timeout.endpoint] = [];
-            }
-            acc[timeout.endpoint].push(timeout);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(timeouts);
 
         const alerts = [];
         for (const [endpoint, tmouts] of Object.entries(groupedByEndpoint)) {
@@ -343,13 +735,7 @@ class AlertEngine {
 
         if (slowRequests.length < 5) return []; // Only alert if multiple slow requests
 
-        const groupedByEndpoint = slowRequests.reduce((acc, req) => {
-            if (!acc[req.endpoint]) {
-                acc[req.endpoint] = [];
-            }
-            acc[req.endpoint].push(req);
-            return acc;
-        }, {});
+        const groupedByEndpoint = groupByNormalizedEndpoint(slowRequests);
 
         const alerts = [];
         for (const [endpoint, reqs] of Object.entries(groupedByEndpoint)) {
@@ -437,7 +823,7 @@ class AlertEngine {
 
         // Get recent OCPP errors
         const ocppErrorsQuery = `
-            SELECT id, timestamp, charger_id, event_type, meta
+            SELECT id, timestamp, charger_id, event_type, meta, message
             FROM ocpp_events
             WHERE charger_id IS NOT NULL
               AND (
@@ -457,22 +843,35 @@ class AlertEngine {
         const alerts = [];
 
         for (const ocppError of ocppErrors) {
-            // Look for Vercel errors within ±30s
-            // NOTE: we exclude 405 by default from correlation (low-signal/method mismatch noise).
+            // Emergency-stop presses are operator actions, not charger faults
+            // (they have their own dedicated WhatsApp alert). Don't escalate them
+            // into critical Charger+Backend correlations — #1 false-critical source.
+            const ocppFault = parseStatusNotif(ocppError.message);
+            if (isEmergencyStopFault(ocppFault, ocppError.message)) {
+                continue;
+            }
+
+            // Pull backend errors within ±30s, then keep ONLY the ones that are
+            // causally linked to THIS charger (charge-action route + references
+            // this charger id). 405 excluded (low-signal method mismatch noise).
+            // Temporal-only matches are dropped here — that was the bogus-alert
+            // source the screenshots showed.
             const vercelErrorsQuery = `
-                SELECT id, timestamp, endpoint, status_code, duration_ms
+                SELECT id, timestamp, endpoint, method, status_code, duration_ms
                 FROM vercel_logs
                 WHERE status_code >= 400
                   AND status_code != 405
                   AND timestamp BETWEEN ? AND ?
                 ORDER BY timestamp
-                LIMIT 10
+                LIMIT 50
             `;
 
-            const vercelErrors = this.vercelDb.prepare(vercelErrorsQuery).all(
+            const vercelCandidates = this.vercelDb.prepare(vercelErrorsQuery).all(
                 ocppError.timestamp - CORRELATION_WINDOW,
                 ocppError.timestamp + CORRELATION_WINDOW
             );
+
+            const vercelErrors = vercelCandidates.filter(v => isCausalBackendError(v.endpoint, ocppError.charger_id));
 
             if (vercelErrors.length > 0) {
                 // Found correlation!
@@ -496,7 +895,7 @@ class AlertEngine {
                     type: 'ocpp_vercel_correlation',
                     severity: 'critical',
                     title: `Erro correlacionado: Charger + Backend`,
-                    description: `Erro OCPP (${ocppError.event_type}) correlacionado com ${vercelErrors.length} erro(s) backend`,
+                    description: `Erro OCPP (${ocppError.event_type}${ocppFault.error ? `: ${ocppFault.error}` : ''}${ocppFault.info ? ` / ${ocppFault.info}` : ''}) correlacionado com ${vercelErrors.length} erro(s) backend`,
                     charger_id: ocppError.charger_id,
                     event_type: ocppError.event_type,
                     vercel_errors: vercelErrors.length,
@@ -509,6 +908,118 @@ class AlertEngine {
 
                 alerts.push(alert);
             }
+        }
+
+        return alerts;
+    }
+
+    /**
+     * Standalone charger-fault alerts (added 2026-06-12).
+     *
+     * Before this, an OCPP fault only surfaced if it coincided with a backend
+     * error within ±30s (detectOcppVercelCorrelation). Real faults with no
+     * backend coincidence were therefore SILENT, while coincidental noise made
+     * false "backend afetou carregador" criticals. Charger faults and backend
+     * errors are now independent streams; this detector owns the charger side.
+     * e-stop presses are excluded (operator action, has its own alert).
+     */
+    detectChargerFaults() {
+        const cutoff = Date.now() - QUERY_WINDOW;
+
+        const faults = this.ocppDb.prepare(`
+            SELECT id, timestamp, charger_id, event_type, meta, message
+            FROM ocpp_events
+            WHERE charger_id IS NOT NULL
+              AND (
+                  event_type LIKE '%fault%'
+                  OR event_type LIKE '%error%'
+                  OR event_type LIKE '%failed%'
+              )
+              AND timestamp > ?
+            ORDER BY timestamp DESC
+            LIMIT 50
+        `).all(cutoff);
+
+        if (faults.length === 0) return [];
+
+        const alerts = [];
+        const seen = new Set();
+
+        for (const ev of faults) {
+            const parsed = parseStatusNotif(ev.message);
+            if (isEmergencyStopFault(parsed, ev.message)) continue;
+
+            // One alert per charger+errorCode per run; shouldSendChargerFaultAlert
+            // debounces with an escalating backoff so a chronic flapper doesn't
+            // spam hourly forever (see CHARGER_FAULT_BACKOFF_TIERS).
+            const errKey = parsed.error || ev.event_type || 'fault';
+            const dedupeKey = `${ev.charger_id}::${errKey}`;
+            if (seen.has(dedupeKey)) continue;
+            seen.add(dedupeKey);
+
+            // Cable-theft (HighTemperature) faults follow BURST-THEN-SILENCE
+            // (shouldAlertCableTheft): one burst per incident, then silence until
+            // the connector recovers — instead of the escalating backoff that
+            // re-pinged the URGENTE group for 15h straight. Every other fault
+            // keeps the escalating backoff.
+            const cableTheftSuspect = isCableTheftSuspectFault(parsed, ev.message);
+            let backoff = null;
+            if (cableTheftSuspect) {
+                if (!this.shouldAlertCableTheft(ev.charger_id, parsed.connectorId)) continue;
+            } else {
+                backoff = this.shouldSendChargerFaultAlert(dedupeKey);
+                if (!backoff) continue;
+            }
+
+            // Evidence shaped like the correlation alert so formatAlertMessage's
+            // OCPP-details block renders (it parses ocpp.event.message). No
+            // `vercel` key → no "Backend afetado" section.
+            const evidence = {
+                kind: 'charger_fault',
+                ocpp: {
+                    event: {
+                        id: ev.id,
+                        timestamp: ev.timestamp,
+                        charger_id: ev.charger_id,
+                        event_type: ev.event_type,
+                        message: ev.message,
+                    },
+                    meta: null,
+                    raw: null,
+                },
+            };
+
+            const detailBits = [
+                parsed.status ? `status=${parsed.status}` : null,
+                parsed.error ? `erro=${parsed.error}` : null,
+                parsed.info ? `info=${parsed.info}` : null,
+            ].filter(Boolean).join(', ');
+
+            alerts.push({
+                type: 'charger_fault',
+                severity: cableTheftSuspect ? 'critical' : 'warning',
+                urgent: cableTheftSuspect,
+                // Signals the dispatch loop to send the URGENTE burst (5x/10s)
+                // instead of a single urgent message.
+                cableTheftBurst: cableTheftSuspect,
+                title: cableTheftSuspect
+                    ? `Falha de temperatura — possível roubo de cabo`
+                    : `Carregador em falha`,
+                description: `Carregador reportou falha${detailBits ? ` (${detailBits})` : ` (${ev.event_type})`}`,
+                charger_id: ev.charger_id,
+                event_type: ev.event_type,
+                ocpp_log_ids: JSON.stringify([ev.id]),
+                evidence_json: JSON.stringify(evidence),
+                event_ts: ev.timestamp,
+                timestamp: Date.now(),
+                // Pre-parsed fault fields forwarded to partner-fault-notifier to
+                // avoid re-parsing the StatusNotification message a second time.
+                parsed_fault: parsed,
+                // Backoff bookkeeping (non-cable-theft only; cable-theft uses the
+                // burst-then-silence incident gate, no backoff streak).
+                backoff_streak: backoff ? backoff.streak : undefined,
+                backoff_window_ms: backoff ? backoff.windowMs : undefined,
+            });
         }
 
         return alerts;
@@ -605,6 +1116,8 @@ class AlertEngine {
                 msg += `🆔 ${alert.charger_id}\\n\\n`;
             } else {
                 msg += `🔌 *Carregador: ${alert.charger_id}*\\n\\n`;
+                // Surface unknown chargers so we can backfill station-lookup.
+                console.warn(`⚠️ Charger sem cadastro no station-lookup: ${alert.charger_id}`);
             }
         }
 
@@ -616,12 +1129,15 @@ class AlertEngine {
             try {
                 const ev = JSON.parse(alert.evidence_json);
                 const ocppMeta = ev && ev.ocpp && ev.ocpp.meta ? ev.ocpp.meta : null;
+                // Collector stores fault detail as free-text `message` (meta=null),
+                // so fall back to parsing the StatusNotification line.
+                const parsedMsg = parseStatusNotif(ev && ev.ocpp && ev.ocpp.event ? ev.ocpp.event.message : '');
 
-                const connectorId = ocppMeta?.connectorId ?? ocppMeta?.connector_id;
-                const status = ocppMeta?.status;
-                const errorCode = ocppMeta?.errorCode ?? ocppMeta?.error_code;
-                const info = ocppMeta?.info;
-                const vendorErrorCode = ocppMeta?.vendorErrorCode ?? ocppMeta?.vendor_error_code;
+                const connectorId = ocppMeta?.connectorId ?? ocppMeta?.connector_id ?? parsedMsg.connectorId;
+                const status = ocppMeta?.status ?? parsedMsg.status;
+                const errorCode = ocppMeta?.errorCode ?? ocppMeta?.error_code ?? parsedMsg.error;
+                const info = ocppMeta?.info ?? parsedMsg.info;
+                const vendorErrorCode = ocppMeta?.vendorErrorCode ?? ocppMeta?.vendor_error_code ?? parsedMsg.vendorError;
 
                 const hasAny = connectorId != null || status || errorCode || info || vendorErrorCode;
                 if (hasAny) {
@@ -631,6 +1147,31 @@ class AlertEngine {
                     if (errorCode) msg += `- errorCode: ${errorCode}\\n`;
                     if (vendorErrorCode) msg += `- vendorErrorCode: ${vendorErrorCode}\\n`;
                     if (info) msg += `- info: ${String(info).slice(0, 160)}\\n`;
+                }
+                // For correlation alerts, surface WHICH backend endpoints failed.
+                // The evidence carries the full Vercel rows but they were never rendered.
+                const vercelRows = ev && Array.isArray(ev.vercel) ? ev.vercel : [];
+                if (vercelRows.length > 0) {
+                    // Group by "METHOD endpoint → status" so repeats collapse into a count.
+                    const groups = new Map();
+                    for (const v of vercelRows) {
+                        if (!v) continue;
+                        const method = v.method ? `${String(v.method).toUpperCase()} ` : '';
+                        const endpoint = v.endpoint || '(endpoint desconhecido)';
+                        const status = v.status_code != null ? ` → ${v.status_code}` : '';
+                        const key = `${method}${endpoint}${status}`;
+                        const g = groups.get(key) || { key, count: 0, maxDur: 0 };
+                        g.count += 1;
+                        if (typeof v.duration_ms === 'number') g.maxDur = Math.max(g.maxDur, v.duration_ms);
+                        groups.set(key, g);
+                    }
+
+                    msg += `\\n🌐 *Backend afetado*\\n`;
+                    for (const g of groups.values()) {
+                        const times = g.count > 1 ? ` (${g.count}x)` : '';
+                        const slow = g.maxDur >= 1000 ? ` ⏱️${Math.round(g.maxDur)}ms` : '';
+                        msg += `- ${g.key}${times}${slow}\\n`;
+                    }
                 }
             } catch (_) {
                 // ignore parse errors
@@ -671,6 +1212,19 @@ class AlertEngine {
             case 'ocpp_vercel_correlation':
                 msg += `\\n⚡ Ação: Problema no backend afetou carregador - prioridade!`;
                 break;
+            case 'charger_fault':
+                if (alert.urgent) {
+                    msg += `\\n⚡ Ação: Possível roubo de cabo (assinatura de temperatura) - verificar câmeras/local AGORA. Aviso enviado ao grupo URGENTE.`;
+                } else {
+                    msg += `\\n⚡ Ação: Verificar carregador (pode ter limpado sozinho - confira o status atual)`;
+                }
+                // Once the backoff has escalated past the first tier, say so —
+                // otherwise a 6h/24h-spaced alert reads like a brand new incident.
+                if (alert.backoff_streak > 3) {
+                    const hours = Math.round(alert.backoff_window_ms / (60 * 60 * 1000));
+                    msg += `\\n🔁 Falha persistente (alerta #${alert.backoff_streak} para este erro; próximos a cada ${hours}h enquanto não resolver)`;
+                }
+                break;
         }
 
         return msg;
@@ -697,6 +1251,187 @@ class AlertEngine {
                 resolve(true);
             });
         });
+    }
+
+    /**
+     * Send alert to the WhatsApp alerts group ("Notificações Turbo Station").
+     * A 2xx from the support API only means the message was QUEUED — so after
+     * the POST we confirm the message's delivery_status and only report
+     * delivered=true on a confirmed 'sent'. Returns { delivered, messageId }:
+     * messageId is the upstream id whenever the POST was accepted, so callers
+     * can late-confirm an unconfirmed send without re-posting.
+     */
+    async sendWhatsappAlert(message, conversationId = WHATSAPP_CONV) {
+        if (!conversationId || !SUPPORT_API_SECRET) return { delivered: false, messageId: null };
+        // formatAlertMessage emits literal "\n" (for the Telegram CLI); convert to
+        // real newlines for the JSON/Evolution path.
+        const text = message.replace(/\\n/g, '\n');
+        try {
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?brandId=${encodeURIComponent(WHATSAPP_BRAND)}`;
+            const res = await fetch(url, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'x-api-secret': SUPPORT_API_SECRET,
+                    'x-brand-id': WHATSAPP_BRAND,
+                },
+                body: JSON.stringify({ body: text, source: 'system' }),
+            });
+            if (!res.ok) {
+                console.error(`❌ Error sending WhatsApp: support API ${res.status}`);
+                return { delivered: false, messageId: null };
+            }
+            const json = await res.json().catch(() => null);
+            const messageId = json && typeof json.id === 'string' ? json.id : null;
+            if (!messageId) {
+                // Accepted but nothing to confirm against — don't trust the 2xx;
+                // leave the alert unsent so the retry pass picks it up.
+                console.error('⚠️ WhatsApp POST accepted but returned no message id; treating as unconfirmed');
+                return { delivered: false, messageId: null };
+            }
+            const status = await this.confirmWhatsappDelivery(conversationId, messageId);
+            if (status === 'sent') {
+                console.log('✅ Alert sent to WhatsApp (delivery confirmed)');
+                return { delivered: true, messageId };
+            }
+            console.error(`❌ WhatsApp delivery not confirmed (status=${status}) conv=${conversationId} msg=${messageId}`);
+            return { delivered: false, messageId };
+        } catch (e) {
+            console.error(`❌ Error sending WhatsApp: ${e && e.message}`);
+            return { delivered: false, messageId: null };
+        }
+    }
+
+    /**
+     * One GET of the conversation's recent messages; returns the message's
+     * delivery_status ('sent' | 'failed' | 'pending'), or null when the inbox
+     * is unreachable or the message isn't visible yet. Never throws.
+     */
+    async fetchWhatsappDeliveryStatus(conversationId, messageId) {
+        try {
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?limit=50`;
+            const res = await fetch(url, { headers: { 'x-api-secret': SUPPORT_API_SECRET } });
+            if (!res.ok) return null;
+            const json = await res.json().catch(() => null);
+            const messages = json && Array.isArray(json.messages) ? json.messages : [];
+            const msg = messages.find((m) => m && m.id === messageId);
+            return msg ? (msg.delivery_status || 'pending') : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /**
+     * Poll for the terminal delivery_status of a just-posted message with a
+     * short backoff (deliveryPollScheduleMs). Returns 'sent' / 'failed' once
+     * upstream resolves the Evolution send, or 'unconfirmed' if it's still
+     * pending (or the inbox is unreachable) after the whole window.
+     */
+    async confirmWhatsappDelivery(conversationId, messageId) {
+        for (const waitMs of deliveryPollScheduleMs()) {
+            await new Promise((r) => setTimeout(r, waitMs));
+            const status = await this.fetchWhatsappDeliveryStatus(conversationId, messageId);
+            if (status === 'sent' || status === 'failed') return status;
+            // unreachable / not visible yet / still pending → keep polling
+        }
+        return 'unconfirmed';
+    }
+
+    /**
+     * Dispatch an alert message to every configured channel. Returns
+     * { sent, waMessageId }: sent=true only when at least one channel CONFIRMED
+     * the message (WhatsApp requires a confirmed delivery, not just a 2xx);
+     * waMessageId is the upstream WhatsApp message id whenever the POST was
+     * accepted, so an unconfirmed send can be late-confirmed before any retry.
+     */
+    async dispatchAlert(message) {
+        const [telegram, whatsapp] = await Promise.allSettled([
+            this.sendTelegramAlert(message),
+            this.sendWhatsappAlert(message),
+        ]);
+        const telegramOk = telegram.status === 'fulfilled' && telegram.value === true;
+        const wa = whatsapp.status === 'fulfilled' && whatsapp.value
+            ? whatsapp.value
+            : { delivered: false, messageId: null };
+        return { sent: telegramOk || wa.delivered === true, waMessageId: wa.messageId || null };
+    }
+
+    /**
+     * Copy an urgent alert (cable-theft suspect) to the "Turbo Station +
+     * URGENTE" WhatsApp group. Best-effort: failure here never blocks the
+     * normal alert path, and the alert is marked sent based on the regular
+     * channels only.
+     */
+    async sendUrgentWhatsappAlert(message) {
+        if (!URGENT_WHATSAPP_CONV) return false;
+        const { delivered } = await this.sendWhatsappAlert(message, URGENT_WHATSAPP_CONV);
+        return delivered;
+    }
+
+    /**
+     * Fire the URGENTE cable-theft BURST: CABLE_THEFT_BURST_COUNT messages,
+     * CABLE_THEFT_BURST_INTERVAL_MS apart, best-effort. Fire-and-forget — the
+     * spacing must NOT block the detection tick. Each message is numbered and
+     * the last one states no further alerts fire until the station normalizes,
+     * so the team reads the burst as intentional (not a loop bug) and knows the
+     * silence that follows is by design.
+     */
+    sendUrgentCableTheftBurst(alert) {
+        const total = CABLE_THEFT_BURST_COUNT;
+        void (async () => {
+            for (let i = 1; i <= total; i++) {
+                try {
+                    await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert, i, total));
+                } catch (e) {
+                    console.error('❌ Error sending cable-theft burst message:', e && e.message);
+                }
+                if (i < total) {
+                    await new Promise((r) => setTimeout(r, CABLE_THEFT_BURST_INTERVAL_MS));
+                }
+            }
+            console.log(`🚨 Cable-theft burst sent (${total}x) for ${alert.charger_id}`);
+        })();
+    }
+
+    /**
+     * Message for the urgent group: short, explicit about the suspicion, and
+     * self-contained (that group doesn't follow the technical alert stream).
+     * When `burstIndex`/`burstTotal` are given, appends a "N/M" footer so the
+     * burst reads as intentional and the final message announces the silence.
+     */
+    formatUrgentCableTheftMessage(alert, burstIndex, burstTotal) {
+        const parsed = alert.parsed_fault || {};
+        const station = alert.charger_id ? lookupStation(alert.charger_id) : null;
+
+        const dt = new Date(typeof alert.event_ts === 'number' ? alert.event_ts : Date.now());
+        const timeBrt = dt.toLocaleString('pt-BR', {
+            day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit',
+            hour12: false, timeZone: 'America/Sao_Paulo',
+        });
+
+        let msg = `🚨 *URGENTE — possível roubo de cabo* 🚨\\n\\n`;
+        if (station) {
+            msg += `🏢 *${station.name}*\\n`;
+            if (station.location) msg += `📍 ${station.location}\\n`;
+            msg += `🆔 ${alert.charger_id}\\n`;
+        } else if (alert.charger_id) {
+            msg += `🔌 *Carregador ${alert.charger_id}*\\n`;
+        }
+        if (parsed.connectorId != null) msg += `🔌 Conector ${parsed.connectorId}\\n`;
+        msg += `\\n📋 O carregador reportou falha de temperatura`;
+        const errBits = [parsed.error, parsed.info].filter(Boolean).join(' / ');
+        if (errBits) msg += ` (${errBits})`;
+        msg += ` — mesma assinatura de quando o cabo do Metrópole 1 foi roubado.\\n`;
+        msg += `🕐 ${timeBrt} (horário de Brasília)\\n`;
+        msg += `\\n⚡ Verificar câmeras e acionar alguém no local AGORA.`;
+        if (burstIndex && burstTotal) {
+            msg += `\\n\\n🔁 Aviso ${burstIndex}/${burstTotal}`;
+            if (burstIndex === burstTotal) {
+                msg += ` — não haverá novos avisos para esta estação até ela normalizar.`;
+            }
+        }
+        return msg;
     }
 
     /**
@@ -752,6 +1487,88 @@ class AlertEngine {
     }
 
     /**
+     * Record the upstream WhatsApp message id for an alert whose POST was
+     * accepted, so a later retry can late-confirm instead of re-sending.
+     */
+    recordWaMessageId(alertId, waMessageId) {
+        if (!waMessageId) return;
+        try {
+            this.alertsDb.prepare('UPDATE alerts SET wa_message_id = ? WHERE id = ?').run(waMessageId, alertId);
+        } catch (e) {
+            console.error(`❌ Error recording wa_message_id for alert ${alertId}:`, e.message);
+        }
+    }
+
+    /**
+     * Retry pass for alerts that were saved but never confirmed on any channel
+     * (support API down, Evolution instance disconnected, engine restart
+     * between save and send). Runs every detection tick. An alert with a
+     * recorded wa_message_id is re-checked first — if the earlier send actually
+     * delivered late, it's just marked sent (no duplicate message in the
+     * group). Only alerts younger than UNSENT_RETRY_WINDOW_MS are retried;
+     * anything older stays unsent by design (stale alerts are noise).
+     */
+    async retryUnsentAlerts() {
+        const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
+        if (!TELEGRAM_GROUP && !whatsappConfigured) return;
+
+        let rows;
+        try {
+            rows = this.alertsDb
+                .prepare(
+                    `SELECT id, created_at, charger_id, severity, title, description, ocpp_log_ids, vercel_log_ids, evidence_json, wa_message_id
+                     FROM alerts
+                     WHERE created_at >= ?
+                       AND (sent = 0 OR sent IS NULL)
+                     ORDER BY created_at ASC
+                     LIMIT 5`
+                )
+                .all(Date.now() - UNSENT_RETRY_WINDOW_MS);
+        } catch (e) {
+            console.error('⚠️ Error querying unsent alerts for retry:', e.message);
+            return;
+        }
+        if (!rows.length) return;
+
+        console.log(`🔁 Retrying ${rows.length} unsent alert(s)`);
+        for (const row of rows) {
+            try {
+                // The previous POST may have been accepted and delivered after the
+                // confirmation window closed — check before re-sending.
+                if (row.wa_message_id && whatsappConfigured) {
+                    const status = await this.fetchWhatsappDeliveryStatus(WHATSAPP_CONV, row.wa_message_id);
+                    if (status === 'sent') {
+                        console.log(`✅ Alert ${row.id} late-confirmed (msg=${row.wa_message_id})`);
+                        this.markAlertSent(row.id);
+                        continue;
+                    }
+                }
+
+                const message = this.formatAlertMessage({
+                    type: 'db_recent',
+                    event_ts: row.created_at,
+                    timestamp: row.created_at,
+                    charger_id: row.charger_id,
+                    severity: row.severity,
+                    title: row.title,
+                    description: row.description,
+                    ocpp_log_ids: row.ocpp_log_ids,
+                    vercel_log_ids: row.vercel_log_ids,
+                    evidence_json: row.evidence_json,
+                });
+                const { sent, waMessageId } = await this.dispatchAlert(message);
+                if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
+                if (sent) this.markAlertSent(row.id);
+
+                // Rate limit: 2 seconds between messages
+                await new Promise((r) => setTimeout(r, 2000));
+            } catch (e) {
+                console.error(`⚠️ Error retrying alert ${row.id}:`, e.message);
+            }
+        }
+    }
+
+    /**
      * Mark alert as sent in database
      */
     markAlertSent(alertId) {
@@ -774,6 +1591,15 @@ class AlertEngine {
      */
     async runDetection() {
         console.log(`\n🔍 Running alert detection at ${new Date().toISOString()}`);
+
+        // Flush recent unsent alerts first, so a transient support-API/Evolution
+        // outage delays an alert instead of silently losing it. Runs before the
+        // detectors (and regardless of whether they find anything new).
+        try {
+            await this.retryUnsentAlerts();
+        } catch (e) {
+            console.error('⚠️ Error in retryUnsentAlerts:', e && e.message);
+        }
 
         const runDetector = (name, fn) => {
             try {
@@ -821,6 +1647,7 @@ class AlertEngine {
             ...runDetector('detectVercel5xxErrors', () => this.detectVercel5xxErrors()),
             ...runDetector('detectVercelTimeouts', () => this.detectVercelTimeouts()),
             ...runDetector('detectHighLatency', () => this.detectHighLatency()),
+            ...runDetector('detectChargerFaults', () => this.detectChargerFaults()),
             ...runDetector('detectOcppVercelCorrelation', () => this.detectOcppVercelCorrelation())
         ];
 
@@ -849,13 +1676,40 @@ class AlertEngine {
                     continue;
                 }
 
-                // Format and send via Telegram
+                // Format and send to every configured channel (Telegram + WhatsApp)
                 const message = this.formatAlertMessage(alert);
-                const sent = await this.sendTelegramAlert(message);
+                const { sent, waMessageId } = await this.dispatchAlert(message);
+                if (waMessageId) this.recordWaMessageId(alertId, waMessageId);
 
-                // Mark as sent only if actually sent
+                // Mark as sent only on a CONFIRMED delivery; otherwise the
+                // retry pass re-attempts it for up to UNSENT_RETRY_WINDOW_MS.
                 if (sent) {
                     this.markAlertSent(alertId);
+                } else {
+                    console.log(`🔁 Alert ${alertId} not confirmed on any channel; will retry next tick`);
+                }
+
+                // Cable-theft suspects: BURST to the URGENTE group (5x, 10s
+                // apart) on a fresh incident, then this charger+connector stays
+                // silent until it recovers (gated in detectChargerFaults via
+                // shouldAlertCableTheft). Fire-and-forget so the 10s spacing
+                // never blocks the detection tick.
+                if (alert.cableTheftBurst) {
+                    this.sendUrgentCableTheftBurst(alert);
+                } else if (alert.urgent) {
+                    try {
+                        await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert));
+                    } catch (e) {
+                        console.error('❌ Error sending urgent alert:', e && e.message);
+                    }
+                }
+
+                // Partner-facing notification for charger faults (fire-and-forget;
+                // failure here never blocks the internal alert path above).
+                if (alert.type === 'charger_fault') {
+                    notifyPartnerFault(alert).catch(e =>
+                        console.error('[partner-alert] error:', e && e.message)
+                    );
                 }
 
                 // Rate limit: 2 seconds between messages
@@ -906,6 +1760,8 @@ async function main() {
         try {
             await engine.runDetection();
             engine.cleanupDebounceCache();
+            engine.cleanupChargerFaultBackoff();
+            engine.cleanupCableTheftState();
         } catch (e) {
             console.error('❌ Fatal error in tick:', e && e.stack ? e.stack : e);
         }
@@ -935,3 +1791,20 @@ if (require.main === module) {
 }
 
 module.exports = AlertEngine;
+// Pure helpers exported for unit tests (causal-correlation gate + fault parsing).
+// parseStatusNotif / isEmergencyStopFault now live in ocpp-utils.js; re-exported
+// here for backwards compatibility with any existing test imports.
+module.exports.isCausalBackendError = isCausalBackendError;
+module.exports.endpointReferencesCharger = endpointReferencesCharger;
+module.exports.CHARGE_ACTION_ROUTE = CHARGE_ACTION_ROUTE;
+module.exports.parseStatusNotif = parseStatusNotif;
+module.exports.isEmergencyStopFault = isEmergencyStopFault;
+module.exports.isCableTheftSuspectFault = isCableTheftSuspectFault;
+module.exports.windowForStreak = windowForStreak;
+module.exports.CHARGER_FAULT_BACKOFF_TIERS = CHARGER_FAULT_BACKOFF_TIERS;
+module.exports.deliveryPollScheduleMs = deliveryPollScheduleMs;
+module.exports.UNSENT_RETRY_WINDOW_MS = UNSENT_RETRY_WINDOW_MS;
+module.exports.getLatestOcppIngestTimestamp = getLatestOcppIngestTimestamp;
+module.exports.normalizeEndpoint = normalizeEndpoint;
+module.exports.groupByNormalizedEndpoint = groupByNormalizedEndpoint;
+module.exports.getVercel5xxAlertPolicy = getVercel5xxAlertPolicy;

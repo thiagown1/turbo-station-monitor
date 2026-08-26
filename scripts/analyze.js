@@ -49,7 +49,7 @@ const message = `${emoji} *Erro no Servidor OCPP*
 🕐 ${logData.timestamp}`;
 
 // Enviar alerta
-const target = '120363423472541295@g.us';
+const target = '120363426100393587@g.us';
 // Usando JSON stringify para escapar caracteres perigosos no shell
 const safeMessage = JSON.stringify(message);
 

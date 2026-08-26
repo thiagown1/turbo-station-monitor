@@ -11,7 +11,7 @@ pm2 start ecosystem.config.js
 echo ""
 echo "✅ OCPP Monitor System Online"
 echo "📊 Tracking: Transactions, Charger Health, User Issues"
-echo "📱 Alerts: WhatsApp Group 120363423472541295@g.us"
+echo "📱 Alerts: WhatsApp Group 120363426100393587@g.us"
 echo ""
 echo "Commands:"
 echo "  Status:  pm2 list"

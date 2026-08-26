@@ -16,7 +16,7 @@ const fs = require('fs');
 const path = require('path');
 
 const API_URL = 'https://turbostation.com.br/api/public/stations';
-const OUTPUT_FILE = path.join(__dirname, 'history', 'stations-map.json');
+const OUTPUT_FILE = path.join(__dirname, '..', 'history', 'stations-map.json');
 
 function fetchStations() {
   try {

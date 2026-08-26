@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to partner-alert-stations.json (gitignored) and fill in real values.",
+  "_comment2": "partnerId must match a row in group_partner_links (support-copilot SQLite).",
+  "_comment3": "groupName is display-only — used in the TESTE header so the team knows which group the live message would reach.",
+  "stations": {
+    "124030001957": {
+      "stationName": "Metrópole Shopping 1",
+      "partnerName": "Metrópole Shopping",
+      "partnerId": "TODO-metropole-partner-id",
+      "brandId": "turbo_station",
+      "groupName": "Turbo Station + Metrópole"
+    },
+    "VT2507030001": {
+      "stationName": "Estacionamento Caldas Novas",
+      "partnerName": "Caldas Novas Estacionamento",
+      "partnerId": "TODO-caldas-novas-partner-id",
+      "brandId": "turbo_station",
+      "groupName": "Turbo Station + Caldas Novas"
+    }
+  }
+}

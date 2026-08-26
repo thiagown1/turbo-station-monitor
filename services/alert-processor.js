@@ -6,7 +6,7 @@ const { lookupStation } = require('./station-lookup');
 
 const ALERTS_FILE = path.join(__dirname, '..', 'history/pending_alerts.json');
 const SENT_CACHE = path.join(__dirname, '..', 'history/sent_alerts.json');
-const WHATSAPP_GROUP = '120363423472541295@g.us';
+const WHATSAPP_GROUP = '120363426100393587@g.us';
 const DB_PATH = path.join(__dirname, '..', 'db/logs.db');
 
 // WhatsApp anti-spam / freshness guards

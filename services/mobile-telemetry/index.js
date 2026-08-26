@@ -12,12 +12,14 @@
  * Routes:
  *   GET  /health | /ping                   → liveness probe
  *   GET  /api/telemetry/online-users       → currently active users
+ *   GET  /api/telemetry/recent-locations   → last known location per device, any age
  *   GET  /api/telemetry/heatmap-data       → aggregated demand density
+ *   GET  /api/telemetry/events             → per-event query (deploy-monitor/funnel)
  *   POST /api/telemetry/mobile             → event ingestion
  */
 
 const express = require('express');
-const { PORT, LOG_TAG } = require('./lib/constants');
+const { PORT, BIND_HOST, LOG_TAG } = require('./lib/constants');
 const { db } = require('./lib/db'); // ensure DB is initialised before routes
 
 // ─── App Setup ──────────────────────────────────────────────────────────────────
@@ -26,7 +28,7 @@ const app = express();
 
 // ─── Middleware ──────────────────────────────────────────────────────────────────
 
-const { requireSecret } = require('./middleware/auth');
+const { requireSecret, requireTelemetryKey } = require('./middleware/auth');
 
 // ─── Routes ─────────────────────────────────────────────────────────────────────
 
@@ -35,13 +37,19 @@ app.use('/', require('./routes/health'));
 
 // Dashboard-facing routes (require shared secret)
 app.use('/api/telemetry/online-users', requireSecret, require('./routes/online-users'));
+app.use('/api/telemetry/recent-locations', requireSecret, require('./routes/recent-locations'));
 app.use('/api/telemetry/heatmap-data', requireSecret, require('./routes/heatmap-data'));
+app.use('/api/telemetry/events', requireSecret, require('./routes/events'));
+app.use('/api/telemetry/funnel-counts', requireSecret, require('./routes/funnel-counts'));
 
-// Mobile app ingestion (auth temporarily disabled — see routes/ingest.js)
-app.use('/api/telemetry/mobile', require('./routes/ingest'));
+// Mobile ingestion uses a dedicated build-time key. MONITOR_API_SECRET remains
+// an operational fallback for controlled backfills and diagnostics.
+app.use('/api/telemetry/mobile', requireTelemetryKey, require('./routes/ingest'));
 
 // User log dumps: POST is public (mobile submits), GET requires secret (admin queries)
 app.use('/api/telemetry/user-logs', require('./routes/user-logs'));
+
+app.use('/api/telemetry/health-summary', requireSecret, require('./routes/health-summary'));
 
 // ─── 404 Fallback ───────────────────────────────────────────────────────────────
 
@@ -59,19 +67,24 @@ app.use((err, _req, res, _next) => {
 // ─── Server (only when run directly, not when imported by tests) ────────────
 
 if (require.main === module) {
-    const server = app.listen(PORT, () => {
-        console.log(`${LOG_TAG} Server listening on port ${PORT}`);
+    require('./lib/retention').startRetentionSweeps();
+
+    const server = app.listen(PORT, BIND_HOST, () => {
+        console.log(`${LOG_TAG} Server listening on ${BIND_HOST}:${PORT}`);
         console.log(`${LOG_TAG} Routes:`);
         console.log(`${LOG_TAG}   GET  /health`);
         console.log(`${LOG_TAG}   GET  /ping`);
         console.log(`${LOG_TAG}   GET  /api/telemetry/online-users`);
+        console.log(`${LOG_TAG}   GET  /api/telemetry/recent-locations`);
         console.log(`${LOG_TAG}   GET  /api/telemetry/heatmap-data`);
+        console.log(`${LOG_TAG}   GET  /api/telemetry/events`);
         console.log(`${LOG_TAG}   POST /api/telemetry/mobile`);
     });
 
     process.on('SIGTERM', () => {
         console.log(`${LOG_TAG} SIGTERM received, closing server...`);
         server.close(() => {
+            require('./lib/heatmap-query-runner').heatmapQueryRunner.close();
             db.close();
             console.log(`${LOG_TAG} Server closed gracefully`);
             process.exit(0);

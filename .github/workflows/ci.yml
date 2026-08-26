@@ -1,0 +1,86 @@
+name: CI
+
+# Runs the full test surface for this repo on the self-hosted OpenClaw runner
+# (openclaw-monitor-runner). Nothing gated merges before this — see the repo's
+# branch protection rule requiring these checks on main.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-requires:
+    name: Require-resolution audit
+    runs-on: [self-hosted, linux, x64, monitor]
+    steps:
+      - uses: actions/checkout@v7
+      # Catches "recovered from prod but never committed" files before merge —
+      # the exact class of bug fixed in PR #19 (7 missing support-copilot modules).
+      - run: node scripts/ci/check-requires.js
+
+  syntax-check:
+    name: Syntax check
+    runs-on: [self-hosted, linux, x64, monitor]
+    steps:
+      - uses: actions/checkout@v7
+      - name: node -c every shipped .js/.cjs file
+        # Same scope as check-requires.js: shipped code only. test/, __tests__/,
+        # tests/, and scripts/ hold test harnesses and one-off/disposable tools
+        # (e.g. scripts/fix-info.js, a one-time text patcher for a file that has
+        # since moved on) that aren't part of what actually runs in production.
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            node -c "$f" || fail=1
+          done < <(find . -type f \( -name '*.js' -o -name '*.cjs' \) \
+            -not -path '*/node_modules/*' -not -path '*/.git/*' \
+            -not -path '*/__tests__/*' -not -path './test/*' -not -path '*/tests/*' -not -path './scripts/*' \
+            -print0)
+          exit $fail
+
+  test-root:
+    name: Root test suite
+    runs-on: [self-hosted, linux, x64, monitor]
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci
+      - run: npm test
+
+  test-support-copilot:
+    name: support-copilot test suite
+    runs-on: [self-hosted, linux, x64, monitor]
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci
+      - run: npm test
+        working-directory: services/support-copilot
+
+  smoke-support-copilot:
+    name: support-copilot boot smoke test
+    runs-on: [self-hosted, linux, x64, monitor]
+    needs: test-support-copilot
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci
+      # Starts the real service against a throwaway DB and asserts GET /health
+      # returns 200 — the direct regression test for a service that fails to
+      # boot at all (the incident behind this whole CI setup).
+      - run: node scripts/ci/smoke-support-copilot.js
+
+  test-mobile-telemetry:
+    name: mobile-telemetry test suite
+    runs-on: [self-hosted, linux, x64, monitor]
+    steps:
+      - uses: actions/checkout@v7
+      - run: npm ci
+      - run: node services/mobile-telemetry/tests/test-all.js
