@@ -79,6 +79,8 @@ Rules:
 - Relative internal destinations are canonicalised to root-relative paths
   before validation (`faq` becomes `/faq`); invalid relatives are unwrapped.
   Schemed and protocol-relative external links are preserved unchanged.
+- Standard Markdown link titles are parsed without bypassing validation; the
+  title is preserved when the destination itself is valid.
 - Only the bare canonical post path counts. A trailing slash, a query or an
   extra segment gets unwrapped, on purpose: only the exact path is provably real.
 - External links and images are untouched.

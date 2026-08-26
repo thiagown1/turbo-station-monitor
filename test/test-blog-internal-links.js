@@ -88,6 +88,18 @@ test('leaves protocol-relative external links completely alone', () => {
     keeps('Segundo a [ANEEL](//www.aneel.gov.br), a regra e essa.');
 });
 
+test('validates internal links that carry an optional Markdown title', () => {
+    assert.strictEqual(
+        sanitizeInternalLinks('[FAQ](faq "Dúvidas frequentes")', related),
+        '[FAQ](/faq "Dúvidas frequentes")',
+    );
+    assert.strictEqual(
+        sanitizeInternalLinks('[Contato](/contato "Fale conosco")', related),
+        'Contato',
+    );
+    keeps('[ANEEL](https://www.aneel.gov.br "Agência reguladora")');
+});
+
 test('does not mangle an image whose path is invalid', () => {
     // Without the `!` lookbehind this produced a dangling "!alt" in the body.
     const md = '![diagrama](/imagens/nao-existe.png)';

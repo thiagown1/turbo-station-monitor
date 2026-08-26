@@ -350,7 +350,8 @@ const VALID_STATIC_ROUTES = new Set([
 function sanitizeInternalLinks(markdown, related) {
   const validSlugs = new Set((related || []).map((p) => p.slug));
 
-  return markdown.replace(/(?<!!)\[([^\]]+)\]\(([^)\s]+)\)/g, (match, text, href) => {
+  const linkPattern = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
+  return markdown.replace(linkPattern, (match, text, href, title = '') => {
     // Schemed, protocol-relative and same-page destinations are not routes
     // owned by this allowlist. Leave them exactly as authored.
     if (
@@ -364,9 +365,9 @@ function sanitizeInternalLinks(markdown, related) {
     // root-relative before validation so a model cannot bypass the allowlist
     // merely by omitting the leading slash.
     const normalizedHref = href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}`;
-    if (VALID_STATIC_ROUTES.has(normalizedHref)) return `[${text}](${normalizedHref})`;
+    if (VALID_STATIC_ROUTES.has(normalizedHref)) return `[${text}](${normalizedHref}${title})`;
     const post = /^\/blog\/([^/?#]+)$/.exec(normalizedHref);
-    if (post && validSlugs.has(post[1])) return `[${text}](${normalizedHref})`;
+    if (post && validSlugs.has(post[1])) return `[${text}](${normalizedHref}${title})`;
     return text;
   });
 }
