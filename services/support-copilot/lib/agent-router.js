@@ -67,9 +67,26 @@ function recentContext(conversationId) {
     .all(conversationId).reverse().map(m => `[${m.direction}]: ${m.body}`).join('\n');
 }
 
-function partnerForGroup(groupJid) {
-  const rows = db.prepare('SELECT partner_id FROM group_partner_links WHERE group_jid = ? AND enabled = 1 ORDER BY linked_at ASC').all(groupJid);
-  return rows.length === 1 ? rows[0].partner_id : undefined;
+function partnerLinksForGroup(groupJid) {
+  return db.prepare('SELECT partner_id, partner_name FROM group_partner_links WHERE group_jid = ? AND enabled = 1 ORDER BY linked_at ASC').all(groupJid);
+}
+
+function normalizePartnerName(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function resolvePartnerId(partnerLinks, result) {
+  if (partnerLinks.length === 1) return partnerLinks[0].partner_id;
+  if (result?.kind !== 'partner_payment_receipt') return undefined;
+  const payee = normalizePartnerName(result.payee);
+  if (!payee) return undefined;
+  const matches = partnerLinks.filter(link => normalizePartnerName(link.partner_name) === payee);
+  return matches.length === 1 ? matches[0].partner_id : undefined;
 }
 
 function generalLimitReached(brandId, limit) {
@@ -150,7 +167,8 @@ async function routeInboundMessage(input) {
   const config = await loadConfig(input.brandId);
   if (!config?.enabled) return { skipped: 'disabled' };
   const accountingPriority = (config.accountingGroupConversationIds || []).includes(input.conversationId);
-  const partnerPriority = Boolean(input.groupJid && partnerForGroup(input.groupJid));
+  const partnerLinks = input.groupJid ? partnerLinksForGroup(input.groupJid) : [];
+  const partnerPriority = partnerLinks.length > 0;
   const partnerReceiptPriority = Boolean(
     partnerPriority
     && config.agents?.partnerReceipts
@@ -194,7 +212,7 @@ async function routeInboundMessage(input) {
   const now = nowIso();
   const attempts = Number(existing?.attempts || 0) + 1;
   const eventDeferred = shouldDeferEnergyInvoice(input, result);
-  const partnerId = input.groupJid ? partnerForGroup(input.groupJid) : undefined;
+  const partnerId = resolvePartnerId(partnerLinks, result);
   const eventPayload = result.status === 'ok' ? {
     brandId: input.brandId,
     kind: result.kind,

@@ -565,6 +565,78 @@ test('does not spend a model call on partner media from a non-allowlisted sender
   }
 });
 
+test('routes receipts from a multi-partner group only when the extracted payee identifies one partner', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-multi-partner-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        const modelReplies = [
+          { amount: 'R$ 7.686,85', transaction_id: 'E2E-ARENA', payee: 'ARENA ENERGIA E CORRETORA' },
+          { amount: 'R$ 5.326,47', transaction_id: 'E2E-DAMIAO', payee: 'Damiao de Jesus Ramos' },
+          { amount: 'R$ 9.999,99', transaction_id: 'E2E-UNKNOWN', payee: 'Outro favorecido' },
+        ];
+        const events = [];
+        let modelCalls = 0;
+        global.fetch = async (url, init) => {
+          if (String(url).includes('/api/agents/config')) {
+            return { ok: true, json: async () => ({ config: {
+              enabled: true,
+              model: 'openai/gpt-4o-mini',
+              dailyGeneralAnalysisLimit: 0,
+              allowedPartnerReceiptSenderIds: ['5511999999999'],
+              accountingGroupConversationIds: [],
+              agents: { partnerReceipts: true, supportTriage: false },
+            } }) };
+          }
+          if (String(url).includes('openrouter.ai')) {
+            const reply = modelReplies[modelCalls++];
+            return { ok: true, json: async () => ({
+              choices: [{ message: { content: JSON.stringify({
+                kind: 'partner_payment_receipt', summary: 'Comprovante PIX', confidence: 0.99,
+                needs_attention: true, ...reply,
+              }) } }],
+              usage: { prompt_tokens: 100, completion_tokens: 20, cost: 0.00001 },
+            }) };
+          }
+          if (String(url).includes('/api/agents/events')) {
+            events.push(JSON.parse(init.body));
+            return { ok: true, status: 202, text: async () => '{"ok":true}' };
+          }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const now = nowIso();
+        db.prepare("INSERT INTO conversations (id, brand_id, channel, customer_phone, status, created_at, updated_at) VALUES ('conv-arena','turbo_station','whatsapp-group','arena@g.us','open',?,?)").run(now, now);
+        const insertLink = db.prepare("INSERT INTO group_partner_links (group_jid, conversation_id, brand_id, partner_id, partner_user_id, partner_name, enabled, linked_at) VALUES ('arena@g.us','conv-arena','turbo_station',?,?,?,1,?)");
+        insertLink.run('partner-arena', 'user-arena', 'ARENA ENERGIA E CORRETORA', now);
+        insertLink.run('partner-damiao', 'user-damiao', 'Damião de Jesus Ramos', now);
+        const router = require('./lib/agent-router');
+        for (const [index, messageId] of ['msg-arena', 'msg-damiao', 'msg-unknown'].entries()) {
+          const result = await router.routeInboundMessage({
+            messageId, externalMessageId: 'WA-' + index, conversationId: 'conv-arena',
+            brandId: 'turbo_station', groupJid: 'arena@g.us', senderId: '5511999999999',
+            body: '[Yves]: comprovante PIX', media: { media_type: 'image' }, receivedAt: now,
+          });
+          if (result.kind !== 'partner_payment_receipt') throw new Error('receipt was skipped before classification');
+        }
+        await router.deliverDueEvents();
+        if (modelCalls !== 3 || events.length !== 3) throw new Error('unexpected analysis/delivery counts');
+        if (events[0].partnerId !== 'partner-arena') throw new Error('Arena receipt resolved to wrong partner');
+        if (events[1].partnerId !== 'partner-damiao') throw new Error('accent-insensitive Damião match failed');
+        if (Object.hasOwn(events[2], 'partnerId')) throw new Error('unknown payee must remain unbound');
+        console.log('agent-multi-partner-receipts-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-multi-partner-receipts-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
 test('station requests use the tool-backed support suggestion and still require central review', () => {
   const dbPath = path.join(os.tmpdir(), `agent-router-station-${process.pid}-${Date.now()}.sqlite`);
   try {
