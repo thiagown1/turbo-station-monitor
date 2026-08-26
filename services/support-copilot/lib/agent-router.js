@@ -3,6 +3,11 @@ const { db, nowIso, randomId } = require('./db');
 const { MEDIA_DIR } = require('./receipt-extractor');
 const { classifyMessage } = require('./agent-media-classifier');
 const { parseExpenseDecision, parseExpenseBrlAmount } = require('./expense-decision');
+const {
+  queueFinancialApprovalProposal,
+  processFinancialApprovalWork,
+  recoverInterruptedFinancialApprovalWork,
+} = require('./financial-approval');
 
 const configCache = new Map();
 let worker = null;
@@ -74,13 +79,12 @@ function generalLimitReached(brandId, limit) {
   return Number(row?.count || 0) >= limit;
 }
 
-function queueEvent(messageId, brandId, payload) {
+function persistEvent(messageId, brandId, payload) {
   const now = nowIso();
   db.prepare(`INSERT OR IGNORE INTO agent_event_outbox
     (id, message_id, brand_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
     VALUES (?, ?, ?, ?, 'pending', 0, ?, ?, ?)`)
     .run(randomId('agent_evt'), messageId, brandId, JSON.stringify(payload), now, now, now);
-  void deliverDueEvents();
 }
 
 function isPdfInput(input) {
@@ -190,25 +194,8 @@ async function routeInboundMessage(input) {
   const now = nowIso();
   const attempts = Number(existing?.attempts || 0) + 1;
   const eventDeferred = shouldDeferEnergyInvoice(input, result);
-  db.transaction(() => {
-    db.prepare(`INSERT INTO agent_media_analyses
-      (message_id, conversation_id, brand_id, kind, status, result_json, model, input_tokens, output_tokens, estimated_cost_usd, attempts, analyzed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,result_json=excluded.result_json,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,estimated_cost_usd=excluded.estimated_cost_usd,attempts=excluded.attempts,analyzed_at=excluded.analyzed_at`)
-      .run(input.messageId, input.conversationId, input.brandId, result.kind || 'other', result.status, JSON.stringify(result), result.cost?.model || null, result.cost?.inputTokens || 0, result.cost?.outputTokens || 0, result.cost?.estimatedCostUsd || 0, attempts, now);
-    if (eventDeferred) deferredContadorJob(input, result);
-  })();
-  if (result.status !== 'ok') return result;
-
-  // Populate the legacy receipt cache too, so the manual sweep remains a free,
-  // zero-extra-model-call fallback during rollout.
-  if (result.kind === 'partner_payment_receipt' || result.kind === 'expense_receipt') {
-    db.prepare(`INSERT INTO receipt_extractions (message_id, conversation_id, status, amount_cents, receipt_ref, model, attempts, extracted_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,amount_cents=excluded.amount_cents,receipt_ref=excluded.receipt_ref,model=excluded.model,extracted_at=excluded.extracted_at`)
-      .run(input.messageId, input.conversationId, result.amountCents ? 'ok' : 'error', result.amountCents || null, result.receiptRef || null, result.cost?.model || null, now);
-  }
   const partnerId = input.groupJid ? partnerForGroup(input.groupJid) : undefined;
-  const eventPayload = {
+  const eventPayload = result.status === 'ok' ? {
     brandId: input.brandId,
     kind: result.kind,
     sourceMessageId: input.externalMessageId || input.messageId,
@@ -230,9 +217,42 @@ async function routeInboundMessage(input) {
     suggestedReply: result.suggestedReply,
     partnerId,
     cost: result.cost,
+  } : null;
+  let financialApproval = { handled: false };
+  db.transaction(() => {
+    db.prepare(`INSERT INTO agent_media_analyses
+      (message_id, conversation_id, brand_id, kind, status, result_json, model, input_tokens, output_tokens, estimated_cost_usd, attempts, analyzed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET kind=excluded.kind,status=excluded.status,result_json=excluded.result_json,model=excluded.model,input_tokens=excluded.input_tokens,output_tokens=excluded.output_tokens,estimated_cost_usd=excluded.estimated_cost_usd,attempts=excluded.attempts,analyzed_at=excluded.analyzed_at`)
+      .run(input.messageId, input.conversationId, input.brandId, result.kind || 'other', result.status, JSON.stringify(result), result.cost?.model || null, result.cost?.inputTokens || 0, result.cost?.outputTokens || 0, result.cost?.estimatedCostUsd || 0, attempts, now);
+    if (eventDeferred) deferredContadorJob(input, result);
+    if (result.status === 'ok' && (result.kind === 'partner_payment_receipt' || result.kind === 'expense_receipt')) {
+      db.prepare(`INSERT INTO receipt_extractions (message_id, conversation_id, status, amount_cents, receipt_ref, model, attempts, extracted_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?) ON CONFLICT(message_id) DO UPDATE SET status=excluded.status,amount_cents=excluded.amount_cents,receipt_ref=excluded.receipt_ref,model=excluded.model,extracted_at=excluded.extracted_at`)
+        .run(input.messageId, input.conversationId, result.amountCents ? 'ok' : 'error', result.amountCents || null, result.receiptRef || null, result.cost?.model || null, now);
+    }
+    if (result.status === 'ok' && !eventDeferred && eventPayload) {
+      financialApproval = queueFinancialApprovalProposal({
+        sourceMessageId: eventPayload.sourceMessageId,
+        sourceConversationId: input.conversationId,
+        instance: input.instance,
+        eventPayload,
+      });
+      if (!financialApproval.handled) persistEvent(input.messageId, input.brandId, eventPayload);
+    }
+  })();
+  if (result.status !== 'ok') return result;
+  if (!eventDeferred) {
+    if (financialApproval.handled) void processFinancialApprovalWork();
+    else void deliverDueEvents();
+  }
+  return {
+    ...result,
+    eventDeferred,
+    contadorJobPersisted: eventDeferred,
+    financialApprovalQueued: financialApproval.handled === true,
+    financialApprovalStatus: financialApproval.status,
   };
-  if (!eventDeferred) queueEvent(input.messageId, input.brandId, eventPayload);
-  return { ...result, eventDeferred, contadorJobPersisted: eventDeferred };
 }
 
 function persistMediaJob(input) {
@@ -498,13 +518,16 @@ function startAgentEventWorker() {
       WHERE status = 'processing'`).run(recoveredAt, recoveredAt);
     mediaJobsRecovered = true;
   }
+  recoverInterruptedFinancialApprovalWork();
   worker = setInterval(() => {
     void deliverDueEvents();
     void deliverDueMediaJobs();
+    void processFinancialApprovalWork();
   }, 30_000);
   worker.unref?.();
   void deliverDueEvents();
   void deliverDueMediaJobs();
+  void processFinancialApprovalWork();
 }
 
 module.exports = {

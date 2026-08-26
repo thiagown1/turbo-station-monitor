@@ -472,6 +472,60 @@ try {
   console.warn(`${LOG_TAG} contador monthly retry index migration:`, err.message);
 }
 
+// Personal, operator-approved financial classifications. These tables never
+// move money or create accounting entries: they retain the immutable proposal,
+// its one-use confirmation and the resulting local classification marker. The
+// feature is separately opt-in and defaults off.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contador_financial_proposals (
+      id TEXT PRIMARY KEY,
+      proposal_code TEXT NOT NULL UNIQUE,
+      source_message_id TEXT NOT NULL UNIQUE,
+      source_conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      source_sender_id TEXT,
+      operator_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      action_payload_json TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL,
+      send_attempts INTEGER NOT NULL DEFAULT 0,
+      execution_attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      outbound_message_id TEXT,
+      confirmation_message_id TEXT UNIQUE,
+      confirmed_by TEXT,
+      expires_at TEXT NOT NULL,
+      sent_at TEXT,
+      confirmed_at TEXT,
+      rejected_at TEXT,
+      executed_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contador_financial_proposals_due
+      ON contador_financial_proposals(status, next_attempt_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS contador_financial_classifications (
+      source_message_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL UNIQUE,
+      brand_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      action_payload_json TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      classified_by TEXT NOT NULL,
+      classified_at TEXT NOT NULL
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador financial approval migrations:`, err.message);
+}
+safeAddColumn('contador_financial_proposals', 'send_attempts', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('contador_financial_proposals', 'execution_attempts', 'INTEGER NOT NULL DEFAULT 0');
+
 // One paid media classification per inbound message, plus a durable delivery
 // outbox to the Next.js action/review boundary. Neither table stores the media.
 try {
