@@ -28,6 +28,8 @@ const {
   formatApprovalProposal,
   prepareApprovalProposal,
   killSwitchAllowsActuation,
+  pendingProposalNeedsAttention,
+  approvalDeliveryAction,
 } = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
@@ -269,6 +271,32 @@ test('human-approved actuation still requires the current kill switch', () => {
   assert.equal(killSwitchAllowsActuation({ ks: { on: false } }), false);
   assert.equal(killSwitchAllowsActuation({ ks: { on: 'firestore-deferred' } }), false);
   assert.equal(killSwitchAllowsActuation({}), false);
+});
+
+test('pending proposal processing can outlive the attribution window but not its own expiry', () => {
+  const state = {
+    newSha: NEW_SHA,
+    prevSha: PREV_SHA,
+    pendingProposal: {
+      status: 'pending', releaseSha: NEW_SHA, targetSha: PREV_SHA,
+      expiresAtMs: NOW + 60_000, deliveryStatus: 'pending', evaluation: { critical: true },
+    },
+    pendingConfirmation: null,
+  };
+  assert.equal(pendingProposalNeedsAttention(state, NOW), true);
+  state.pendingProposal.deliveryStatus = 'sent';
+  assert.equal(pendingProposalNeedsAttention(state, NOW), false);
+  state.pendingConfirmation = { proposalId: 'rbp_test' };
+  assert.equal(pendingProposalNeedsAttention(state, NOW), true);
+  assert.equal(pendingProposalNeedsAttention(state, NOW + 60_001), false);
+});
+
+test('proposal delivery never reposts while an accepted message is still pending', () => {
+  assert.equal(approvalDeliveryAction(null, null), 'post');
+  assert.equal(approvalDeliveryAction('msg-1', 'failed'), 'post');
+  assert.equal(approvalDeliveryAction('msg-1', 'pending'), 'wait');
+  assert.equal(approvalDeliveryAction('msg-1', null), 'wait');
+  assert.equal(approvalDeliveryAction('msg-1', 'sent'), 'confirmed');
 });
 
 test('post-deploy evaluation excludes failures recorded before the cutover', () => {

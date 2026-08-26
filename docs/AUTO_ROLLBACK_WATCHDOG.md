@@ -87,7 +87,14 @@ signal has already cleared; candidate readiness and release safety are still
 checked again immediately before action. The current kill switch must also be
 ON for a human-approved rollback; confirmation never bypasses it. Expired
 proposals never resume, and a replacement proposal receives new credentials and
-is delivered instead of being suppressed by the previous proposal's dedupe. The
+is delivered instead of being suppressed by the previous proposal's dedupe.
+Proposal delivery is deduped only after the support relay reports `sent`; an
+accepted `pending` message is late-confirmed without duplicate posting, while a
+confirmed `failed` message is retried with the same unexpired credentials. An
+active proposal may finish delivery or consume a confirmation after the detector
+window closes, but never after its own displayed expiry. Candidate health and
+kill-switch state remain live checks; the release-safety file is re-read while
+its freshness remains bound to the proposal creation time. The
 agent/LLM may summarize evidence and recommend an outcome, but it cannot write
 the trusted receipt, change a rollout phase, access the rollback token, or invoke
 the Vercel rollback endpoint.

@@ -168,12 +168,80 @@ function personalApprovalDestinationValid() {
   );
 }
 
-async function sendApprovalProposal(text) {
+function approvalDeliveryAction(existingMessageId, status) {
+  if (!existingMessageId || status === 'failed') return 'post';
+  if (status === 'sent') return 'confirmed';
+  return 'wait';
+}
+
+function approvalDeliveryPollScheduleMs() {
+  const raw = process.env.ROLLBACK_APPROVAL_DELIVERY_POLL_MS || process.env.WHATSAPP_DELIVERY_POLL_MS;
+  if (raw) {
+    const parsed = raw.split(',').map(v => Number(v.trim())).filter(v => Number.isFinite(v) && v >= 0);
+    if (parsed.length) return parsed;
+  }
+  return [500, 1000, 2000, 3000];
+}
+
+async function fetchApprovalDeliveryStatus(messageId) {
+  try {
+    const url = new URL(`/api/support/conversations/${encodeURIComponent(PERSONAL_APPROVAL_CONVERSATION_ID)}/messages`, SUPPORT_BASE);
+    url.searchParams.set('limit', '50');
+    const res = await fetch(url.toString(), { headers: { 'x-api-secret': MONITOR_API_SECRET } });
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    const message = (json?.messages || []).find(item => item?.id === messageId);
+    return message ? (message.delivery_status || 'pending') : null;
+  } catch {
+    return null;
+  }
+}
+
+async function confirmApprovalDelivery(messageId) {
+  for (const waitMs of approvalDeliveryPollScheduleMs()) {
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    const status = await fetchApprovalDeliveryStatus(messageId);
+    if (status === 'sent' || status === 'failed') return status;
+  }
+  return 'unconfirmed';
+}
+
+async function sendApprovalProposal(text, existingMessageId = null) {
   if (!personalApprovalDestinationValid()) {
     log('approval proposal blocked: personal WhatsApp allowlist is incomplete or points to the alerts conversation');
-    return false;
+    return { delivered: false, messageId: null, status: 'invalid-destination' };
   }
-  return sendWhatsAppToConversation(text, PERSONAL_APPROVAL_CONVERSATION_ID);
+  if (DRY_TELEGRAM) {
+    log('[dry-send] WOULD approval WhatsApp:\n' + text);
+    return { delivered: true, messageId: existingMessageId || 'dry-run', status: 'sent' };
+  }
+
+  if (existingMessageId) {
+    const status = await fetchApprovalDeliveryStatus(existingMessageId);
+    const action = approvalDeliveryAction(existingMessageId, status);
+    if (action === 'confirmed') return { delivered: true, messageId: existingMessageId, status };
+    if (action === 'wait') return { delivered: false, messageId: existingMessageId, status: status || 'unconfirmed' };
+  }
+
+  if (!MONITOR_API_SECRET) return { delivered: false, messageId: null, status: 'missing-secret' };
+  const url = new URL(`/api/support/conversations/${encodeURIComponent(PERSONAL_APPROVAL_CONVERSATION_ID)}/messages`, SUPPORT_BASE);
+  url.searchParams.set('brandId', ALERTS_BRAND);
+  try {
+    const res = await fetch(url.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'x-brand-id': ALERTS_BRAND, 'x-api-secret': MONITOR_API_SECRET },
+      body: JSON.stringify({ body: text, source: 'auto-rollback-watchdog' }),
+    });
+    if (!res.ok) return { delivered: false, messageId: null, status: `post-${res.status}` };
+    const json = await res.json().catch(() => null);
+    const messageId = typeof json?.id === 'string' ? json.id : null;
+    if (!messageId) return { delivered: false, messageId: null, status: 'missing-message-id' };
+    const status = await confirmApprovalDelivery(messageId);
+    return { delivered: status === 'sent', messageId, status };
+  } catch (e) {
+    log('approval proposal relay unreachable:', e.message);
+    return { delivered: false, messageId: null, status: 'unreachable' };
+  }
 }
 
 // ─── Deploy detection (poll /api/version, like nextjs-deploy-trigger.js) ──────
@@ -443,7 +511,7 @@ async function resolveKillSwitch() {
   return ks;
 }
 
-async function buildReadiness(state, nowMs = Date.now()) {
+async function buildReadiness(state, nowMs = Date.now(), options = {}) {
   const ks = await resolveKillSwitch();
   let selection = { target: null, reason: 'VERCEL_ROLLBACK_TOKEN unset; previous candidate cannot be verified' };
   if (process.env.VERCEL_ROLLBACK_TOKEN && state.prevSha) {
@@ -460,7 +528,9 @@ async function buildReadiness(state, nowMs = Date.now()) {
       smokeStatus: selection.smokeStatus || null,
       smokeSha: selection.smokeSha || null,
     },
-    changeSafety: loadReleaseSafetyAttestation(state, nowMs),
+    // For an unexpired proposal, keep the attestation freshness decision bound
+    // to proposal creation while still re-reading its current exact-release flags.
+    changeSafety: loadReleaseSafetyAttestation(state, options.attestationAsOfMs || nowMs),
     guardrails: {
       killSwitchAllows: ks.on === true && DIRECT_ROLLBACK_ENABLED,
       dedupeAvailable: true,
@@ -584,9 +654,9 @@ function prepareApprovalProposal(state, evaluation, nowMs = Date.now()) {
   return true;
 }
 
-function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
+function pendingProposalEvaluation(state = {}, nowMs = Date.now()) {
   const proposal = state.pendingProposal;
-  if (!state.pendingConfirmation || !proposal) return null;
+  if (!proposal) return null;
   if (
     proposal.status !== 'pending'
     || proposal.releaseSha !== state.newSha
@@ -595,6 +665,15 @@ function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
   if (!Number.isFinite(Number(proposal.expiresAtMs)) || nowMs > Number(proposal.expiresAtMs)) return null;
   const evaluation = proposal.evaluation;
   return evaluation?.critical === true ? evaluation : null;
+}
+
+function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
+  return state.pendingConfirmation ? pendingProposalEvaluation(state, nowMs) : null;
+}
+
+function pendingProposalNeedsAttention(state = {}, nowMs = Date.now()) {
+  if (!pendingProposalEvaluation(state, nowMs)) return false;
+  return Boolean(state.pendingConfirmation) || state.pendingProposal.deliveryStatus !== 'sent';
 }
 
 function formatApprovalProposal(proposal, reasonStr) {
@@ -656,12 +735,16 @@ async function tick() {
     }
   }
 
-  // 2) Evaluate within the heightened window only.
+  // 2) Detect only inside the heightened window. A release-bound proposal may
+  // still finish delivery or consume a confirmation until its own shorter TTL.
   const inWindow = state.deployStartMs && now - state.deployStartMs <= HEIGHTENED_WINDOW_MS;
-  if (!inWindow) { db.close(); return; }
+  const proposalNeedsAttention = pendingProposalNeedsAttention(state, now);
+  if (!inWindow && !proposalNeedsAttention) { db.close(); return; }
 
-  let ev = evaluate(db, now, state);
-  const resumedEvaluation = !ev.critical ? pendingConfirmationEvaluation(state, now) : null;
+  let ev = inWindow ? evaluate(db, now, state) : null;
+  const resumedEvaluation = !inWindow
+    ? pendingProposalEvaluation(state, now)
+    : (!ev.critical && proposalNeedsAttention ? pendingProposalEvaluation(state, now) : null);
   if (resumedEvaluation) {
     ev = resumedEvaluation;
     decisionLog({
@@ -670,7 +753,7 @@ async function tick() {
     });
   }
 
-  if (!ev.critical) { db.close(); log(`ok — ${ev.reasons[0]}`); return; }
+  if (!ev?.critical) { db.close(); log(`ok — ${ev?.reasons?.[0] || 'no active proposal or critical signal'}`); return; }
 
   // CRITICAL: log every critical evaluation.
   decisionLog({ phase: 'critical-eval', rolloutPhase: ROLLBACK_ROLLOUT_PHASE, newSha: state.newSha, prevSha: state.prevSha, recommendation: ev.recommendation, failureClass: ev.failureClass, reasons: ev.reasons, blockers: ev.blockers, evidence: ev.evidence });
@@ -686,7 +769,9 @@ async function tick() {
   // A rollback recommendation is not enough: verify the previous deployment,
   // smoke its own URL, load the exact release safety attestation, and re-run the
   // deterministic policy with guardrail evidence.
-  const readiness = await buildReadiness(state, now);
+  const readiness = await buildReadiness(state, now, {
+    attestationAsOfMs: resumedEvaluation ? state.pendingProposal.createdAtMs : now,
+  });
   if (!resumedEvaluation) ev = evaluate(db, now, state, readiness);
   db.close();
   const reasonStr = reasonString(ev);
@@ -767,8 +852,16 @@ async function tick() {
   if (state.lastShadowAlertSha === state.newSha) { log('approval proposal already sent for this deploy — skipping'); return; }
   const expiresAt = new Date(state.pendingProposal.expiresAtMs).toISOString();
   const proposalText = formatApprovalProposal(state.pendingProposal, reasonStr);
-  const sent = await sendApprovalProposal(proposalText);
-  if (!sent) {
+  const delivery = await sendApprovalProposal(proposalText, state.pendingProposal.deliveryMessageId);
+  state.pendingProposal.deliveryMessageId = delivery.messageId || null;
+  state.pendingProposal.deliveryStatus = delivery.status;
+  saveState(state);
+  if (!delivery.delivered) {
+    decisionLog({
+      phase: 'approval-proposal-delivery-unconfirmed', proposalId: state.pendingProposal.id,
+      newSha: state.newSha, prevSha: state.prevSha, messageId: delivery.messageId, status: delivery.status,
+    });
+    if (delivery.messageId) return; // accepted/pending: late-confirm without duplicate POST
     await alertBlockedOnce(state, ev, 'proposta não enviada: destino pessoal allowlisted ou transporte confirmado indisponível');
     return;
   }
@@ -868,6 +961,8 @@ module.exports = {
   readinessBlocksBeforeAction,
   killSwitchAllowsActuation,
   prepareApprovalProposal,
+  pendingProposalNeedsAttention,
+  approvalDeliveryAction,
   pendingConfirmationEvaluation,
   formatApprovalProposal,
 };
