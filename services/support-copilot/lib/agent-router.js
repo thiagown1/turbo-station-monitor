@@ -10,6 +10,8 @@ let delivering = false;
 let deliveringMediaJobs = false;
 let mediaJobsRecovered = false;
 const MEDIA_JOB_MAX_ATTEMPTS = 5;
+const MODEL_WAIT_RETRY_MS = 15 * 60_000;
+let mediaModelUnavailableUntil = 0;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
@@ -331,7 +333,7 @@ async function enrichSuccessfulDirectMedia(input, result) {
 async function processMediaJob(messageId) {
   const claimed = db.prepare(`UPDATE agent_media_jobs
     SET status = 'processing', attempts = attempts + 1, updated_at = ?
-    WHERE message_id = ? AND status IN ('pending', 'retry')
+    WHERE message_id = ? AND status IN ('pending', 'retry', 'waiting_model')
       AND datetime(next_attempt_at) <= datetime('now')`)
     .run(nowIso(), messageId);
   if (!claimed.changes) return { queued: true, duplicate: true };
@@ -339,7 +341,11 @@ async function processMediaJob(messageId) {
   try {
     const input = JSON.parse(row.payload_json);
     const result = await routeInboundMessage(input);
-    if (result?.status === 'error') throw new Error(result.error || 'media_classification_failed');
+    if (result?.status === 'error') {
+      const error = new Error(result.reason || result.error || 'media_classification_failed');
+      if (result.environmental === true) error.modelUnavailable = true;
+      throw error;
+    }
     const fallback = result?.skipped ? await deliverSkippedMediaFallback(input) : { handled: false };
     const supportHandoff = result?.skipped
       ? { handled: false }
@@ -358,6 +364,17 @@ async function processMediaJob(messageId) {
     };
   } catch (error) {
     const attempts = Number(row.attempts || 1);
+    if (error.modelUnavailable === true) {
+      const waitUntil = new Date(Date.now() + MODEL_WAIT_RETRY_MS).toISOString();
+      const updatedAt = nowIso();
+      mediaModelUnavailableUntil = Date.parse(waitUntil);
+      db.prepare(`UPDATE agent_media_jobs
+        SET status = 'waiting_model', attempts = MAX(attempts - 1, 0), next_attempt_at = ?,
+            model_waits = model_waits + 1, last_model_wait_at = ?, last_error = ?, updated_at = ?
+        WHERE message_id = ?`)
+        .run(waitUntil, updatedAt, String(error?.message || error).slice(0, 500), updatedAt, messageId);
+      throw error;
+    }
     const retryable = attempts < MEDIA_JOB_MAX_ATTEMPTS;
     const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts, 8)));
     const updatedAt = nowIso();
@@ -371,18 +388,26 @@ async function processMediaJob(messageId) {
 
 function routeInboundMessageDurably(input) {
   persistMediaJob(input);
+  if (Date.now() < mediaModelUnavailableUntil) {
+    return Promise.resolve({ queued: true, waitingForModel: true });
+  }
   return processMediaJob(input.messageId);
 }
 
 async function deliverDueMediaJobs() {
-  if (deliveringMediaJobs) return;
+  if (deliveringMediaJobs || Date.now() < mediaModelUnavailableUntil) return;
   deliveringMediaJobs = true;
   try {
     const due = db.prepare(`SELECT message_id FROM agent_media_jobs
-      WHERE status IN ('pending', 'retry') AND datetime(next_attempt_at) <= datetime('now')
+      WHERE status IN ('pending', 'retry', 'waiting_model') AND datetime(next_attempt_at) <= datetime('now')
       ORDER BY datetime(created_at) ASC LIMIT 5`).all();
     for (const row of due) {
-      try { await processMediaJob(row.message_id); } catch (_) { /* retry state persisted */ }
+      try {
+        await processMediaJob(row.message_id);
+      } catch (error) {
+        if (error.modelUnavailable === true) break;
+        // Other retry state is already persisted; continue with the next job.
+      }
     }
   } finally {
     deliveringMediaJobs = false;

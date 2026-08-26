@@ -200,14 +200,20 @@ function createContadorModelRunner(options) {
       rememberTurn(turnState, prompt, response);
       return response;
     } catch (primaryError) {
-      if (!codexFallbackEnabled || !isProviderCapacityError(primaryError)) throw primaryError;
+      const primaryCapacityExhausted = isProviderCapacityError(primaryError);
+      if (!codexFallbackEnabled || !primaryCapacityExhausted) {
+        if (primaryCapacityExhausted) primaryError.modelUnavailable = true;
+        throw primaryError;
+      }
       logger.warn?.(`[contador] primary model capacity exhausted; trying configured Codex fallback ${codexFallbackModel}`);
       try {
         const response = await runCodexFallback(fallbackPrompt(prompt, turnState));
         rememberTurn(turnState, prompt, response);
         return response;
       } catch (fallbackError) {
-        throw new Error(`Contador model chain failed: primary=${primaryError.message}; fallback=${fallbackError.message}`);
+        const chainError = new Error(`Contador model chain failed: primary=${primaryError.message}; fallback=${fallbackError.message}`);
+        if (isProviderCapacityError(fallbackError)) chainError.modelUnavailable = true;
+        throw chainError;
       }
     }
   }

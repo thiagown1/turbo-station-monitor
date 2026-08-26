@@ -6,7 +6,12 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
-const { estimateCost, extractFinancialFields, extractEnergyBill } = require('../lib/agent-media-classifier');
+const {
+  estimateCost,
+  extractFinancialFields,
+  extractEnergyBill,
+  isProviderUnavailableStatus,
+} = require('../lib/agent-media-classifier');
 const { parseExpenseDecision, parseExpenseBrlAmount } = require('../lib/expense-decision');
 
 let passed = 0;
@@ -26,6 +31,15 @@ test('falls back to configured token rates when provider cost is absent', () => 
   process.env.AGENT_INPUT_USD_PER_MILLION = '0.15';
   process.env.AGENT_OUTPUT_USD_PER_MILLION = '0.60';
   assert.equal(estimateCost({ prompt_tokens: 1_000_000, completion_tokens: 1_000_000 }), 0.75);
+});
+
+test('treats provider capacity and service outages as environmental failures', () => {
+  for (const status of [401, 403, 408, 429, 500, 502, 503, 504]) {
+    assert.equal(isProviderUnavailableStatus(status), true, `HTTP ${status}`);
+  }
+  for (const status of [400, 404, 422]) {
+    assert.equal(isProviderUnavailableStatus(status), false, `HTTP ${status}`);
+  }
 });
 
 test('does not invent a BRL value for a foreign-currency charge', () => {

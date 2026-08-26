@@ -18,9 +18,13 @@ The WhatsApp socket is entirely in this repository:
    after a PM2 restart. The successful
    `agent_media_analyses` row and its deferred `contador_jobs` row commit in the
    same SQLite transaction; a cached classification can also recover a missing
-   job without another paid model call. Configuration fetch failures and model
-   failures remain retryable; they do not create an extraction-less Contador
-   job. Media work stops after five failed attempts. Explicitly skipped work
+   job without another paid model call. A recognized model/provider outage moves
+   work to `waiting_model`, does not spend the message's five-attempt failure
+   budget and retries after a 15-minute cooldown. The first unavailable call
+   opens a process-wide circuit so later messages are only queued, rather than
+   fanning out more doomed provider calls. Data, policy, parsing and unrelated
+   infrastructure failures still stop after five failed attempts. No failure
+   creates an extraction-less Contador job. Explicitly skipped work
    completes only after the Contador or suggestion fallback has run. Successful
    `station_support`, `support_attention` and `other` group work uses the source
    message as the unique identity for its richer support suggestion across
@@ -202,8 +206,14 @@ monthly values into the workspace.
   responses and transport interruptions remain `delivery_unknown`; an operator
   must reconcile that run before retrying, which prefers a visible missing
   closing over a duplicate message;
-- failed model/API work is visible in `contador_jobs` with attempts and a
-  redacted error, and transient failures use bounded backoff. Each job fences
+- model-unavailable work is visible as `waiting_model` in `contador_jobs` or
+  `agent_media_jobs`, with `model_waits`, `last_model_wait_at`, the next probe and
+  a redacted error. It remains durable across restarts and resumes oldest-first
+  when the provider answers again. Capacity waits do not consume `attempts`;
+  malformed, policy and per-message errors retain the bounded five-attempt
+  backoff. Existing legacy rows already terminal as `failed` are not silently
+  revived by deployment and require an explicit, audited requeue;
+- each Contador job fences
   its WhatsApp reply before delivery and checkpoints the accepted external
   message id. A recovered `sent` reply completes without another send; an
   interruption while `sending` becomes `delivery_unknown` for operator
@@ -220,8 +230,10 @@ never choose a model, binary or workspace.
 The fallback does not bypass any Contador boundary: the model can only return
 the same bounded instruction contract, read tools still go through the scoped
 Next endpoint, and writes remain deterministic and revalidated by Next. If both
-providers fail, the job remains retryable and the ledger stores a bounded error
-that excludes the prompt.
+providers report capacity exhaustion, the job moves to `waiting_model`; one
+oldest item probes again after 15 minutes while newer messages stay queued. The
+ledger stores a bounded error that excludes the prompt. A successful probe drains
+the durable queue in order without bypassing reply or financial idempotency.
 
 If capacity is exhausted after one or more read-tool calls, the runner rebuilds
 only the current bounded turn for Codex: prior runtime prompts remain

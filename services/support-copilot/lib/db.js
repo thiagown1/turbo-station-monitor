@@ -392,6 +392,8 @@ try {
       last_error TEXT,
       reply_status TEXT,
       reply_external_message_id TEXT,
+      model_waits INTEGER NOT NULL DEFAULT 0,
+      last_model_wait_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -460,6 +462,8 @@ try {
 }
 safeAddColumn('contador_jobs', 'reply_status', 'TEXT DEFAULT NULL');
 safeAddColumn('contador_jobs', 'reply_external_message_id', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_jobs', 'model_waits', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('contador_jobs', 'last_model_wait_at', 'TEXT DEFAULT NULL');
 safeAddColumn('contador_monthly_runs', 'next_attempt_at', 'TEXT DEFAULT NULL');
 try {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_contador_monthly_runs_due
@@ -496,6 +500,8 @@ try {
       next_attempt_at TEXT NOT NULL,
       last_error TEXT,
       fallback_applied_at TEXT,
+      model_waits INTEGER NOT NULL DEFAULT 0,
+      last_model_wait_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -523,6 +529,8 @@ try {
   console.warn(`${LOG_TAG} agent router migration:`, err.message);
 }
 safeAddColumn('agent_media_jobs', 'fallback_applied_at', 'TEXT DEFAULT NULL');
+safeAddColumn('agent_media_jobs', 'model_waits', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('agent_media_jobs', 'last_model_wait_at', 'TEXT DEFAULT NULL');
 
 // Durable, idempotent orchestration for explicit @mention station requests.
 // Raw chat text is not copied here: only the structured context fingerprint,
