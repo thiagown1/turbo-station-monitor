@@ -256,6 +256,43 @@ check('pending WhatsApp delivery still retries Telegram independently', async ()
     assert.strictEqual(alertRow(engine, id).sent, 1, 'confirmed Telegram delivery completes the alert');
 });
 
+check('Telegram retry quota cannot suppress a newer actionable WhatsApp retry', async () => {
+    const engine = dbEngine();
+    const base = Date.now() - 10_000;
+    const pendingIds = [];
+    for (let i = 0; i < 5; i++) {
+        const messageId = `msg_pending_telegram_${i}`;
+        pendingIds.push(messageId);
+        insertAlert(engine, { createdAt: base + i, waMessageId: messageId });
+    }
+    const actionableId = insertAlert(engine, { createdAt: base + 100 });
+    let telegramAttempts = 0;
+    engine.sendTelegramAlert = async () => {
+        telegramAttempts += 1;
+        return false;
+    };
+    stubFetch({
+        post: { status: 200, json: { id: 'msg_actionable_after_telegram_quota' } },
+        get: (calls) => ({
+            status: 200,
+            json: {
+                messages: [
+                    ...pendingIds.map((id) => ({ id, delivery_status: 'pending' })),
+                    ...(calls.some((call) => call.method === 'POST')
+                        ? [{ id: 'msg_actionable_after_telegram_quota', delivery_status: 'sent' }]
+                        : []),
+                ],
+            },
+        }),
+    });
+
+    await engine.retryUnsentAlerts({ telegramConfigured: true });
+
+    assert.strictEqual(telegramAttempts, 5, 'Telegram has its own bounded retry quota');
+    assert.strictEqual(posts().length, 1, 'WhatsApp remains independently actionable');
+    assert.strictEqual(alertRow(engine, actionableId).sent, 1);
+});
+
 check('retry re-sends when the earlier message actually failed', async () => {
     const engine = dbEngine();
     const id = insertAlert(engine, { waMessageId: 'msg_failed' });

@@ -1359,10 +1359,14 @@ class AlertEngine {
      * waMessageId is the upstream WhatsApp message id whenever the POST was
      * accepted, so an unconfirmed send can be late-confirmed before any retry.
      */
-    async dispatchAlert(message) {
+    async dispatchAlert(message, options = {}) {
+        const telegramEnabled = options.telegramEnabled ?? true;
+        const whatsappEnabled = options.whatsappEnabled ?? true;
         const [telegram, whatsapp] = await Promise.allSettled([
-            this.sendTelegramAlert(message),
-            this.sendWhatsappAlert(message),
+            telegramEnabled ? this.sendTelegramAlert(message) : Promise.resolve(false),
+            whatsappEnabled
+                ? this.sendWhatsappAlert(message)
+                : Promise.resolve({ delivered: false, messageId: null }),
         ]);
         const telegramOk = telegram.status === 'fulfilled' && telegram.value === true;
         const wa = whatsapp.status === 'fulfilled' && whatsapp.value
@@ -1552,7 +1556,8 @@ class AlertEngine {
         const waStatuses = whatsappConfigured
             ? await this.fetchWhatsappDeliveryStatuses(WHATSAPP_CONV, rows.map((row) => row.wa_message_id))
             : new Map();
-        let dispatchAttempts = 0;
+        let whatsappAttempts = 0;
+        let telegramAttempts = 0;
         for (const row of rows) {
             try {
                 // The previous POST may have been accepted and delivered after the
@@ -1577,14 +1582,14 @@ class AlertEngine {
                             `(status=${status || 'unavailable'}, msg=${row.wa_message_id}); not re-sending`
                         );
                         if (!telegramConfigured) continue;
-                        if (dispatchAttempts >= UNSENT_RETRY_SEND_LIMIT) break;
+                        if (telegramAttempts >= UNSENT_RETRY_SEND_LIMIT) continue;
                         const telegramMessage = this.formatAlertMessage({
                             type: 'db_recent', event_ts: row.created_at, timestamp: row.created_at,
                             charger_id: row.charger_id, severity: row.severity, title: row.title,
                             description: row.description, ocpp_log_ids: row.ocpp_log_ids,
                             vercel_log_ids: row.vercel_log_ids, evidence_json: row.evidence_json,
                         });
-                        dispatchAttempts += 1;
+                        telegramAttempts += 1;
                         const telegramSent = await this.sendTelegramAlert(telegramMessage);
                         if (telegramSent) this.markAlertSent(row.id);
                         await new Promise((r) => setTimeout(r, 2000));
@@ -1592,7 +1597,9 @@ class AlertEngine {
                     }
                 }
 
-                if (dispatchAttempts >= UNSENT_RETRY_SEND_LIMIT) break;
+                const whatsappEnabled = whatsappConfigured && whatsappAttempts < UNSENT_RETRY_SEND_LIMIT;
+                const telegramEnabled = telegramConfigured && telegramAttempts < UNSENT_RETRY_SEND_LIMIT;
+                if (!whatsappEnabled && !telegramEnabled) continue;
 
                 const message = this.formatAlertMessage({
                     type: 'db_recent',
@@ -1606,8 +1613,12 @@ class AlertEngine {
                     vercel_log_ids: row.vercel_log_ids,
                     evidence_json: row.evidence_json,
                 });
-                dispatchAttempts += 1;
-                const { sent, waMessageId } = await this.dispatchAlert(message);
+                if (whatsappEnabled) whatsappAttempts += 1;
+                if (telegramEnabled) telegramAttempts += 1;
+                const { sent, waMessageId } = await this.dispatchAlert(message, {
+                    whatsappEnabled,
+                    telegramEnabled,
+                });
                 if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
                 if (sent) this.markAlertSent(row.id);
 
