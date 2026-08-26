@@ -232,7 +232,28 @@ check('pending rows do not prevent newer actionable alerts from being retried', 
     await engine.retryUnsentAlerts();
 
     assert.strictEqual(posts().length, 1, 'the newer alert without a message id must still be retried');
+    assert.strictEqual(gets().length, 2, 'one batched backlog lookup plus one confirmation lookup');
     assert.strictEqual(alertRow(engine, actionableId).sent, 1);
+});
+
+check('pending WhatsApp delivery still retries Telegram independently', async () => {
+    const engine = dbEngine();
+    const id = insertAlert(engine, { waMessageId: 'msg_pending_with_telegram' });
+    let telegramAttempts = 0;
+    engine.sendTelegramAlert = async () => {
+        telegramAttempts += 1;
+        return true;
+    };
+    stubFetch({
+        post: { status: 200, json: { id: 'msg_duplicate' } },
+        get: { status: 200, json: { messages: [{ id: 'msg_pending_with_telegram', delivery_status: 'pending' }] } },
+    });
+
+    await engine.retryUnsentAlerts({ telegramConfigured: true });
+
+    assert.strictEqual(telegramAttempts, 1);
+    assert.strictEqual(posts().length, 0, 'stored pending WhatsApp message is not posted again');
+    assert.strictEqual(alertRow(engine, id).sent, 1, 'confirmed Telegram delivery completes the alert');
 });
 
 check('retry re-sends when the earlier message actually failed', async () => {

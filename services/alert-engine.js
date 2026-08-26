@@ -1303,23 +1303,37 @@ class AlertEngine {
         }
     }
 
+    /** Fetch the recent conversation page once and resolve every requested id. */
+    async fetchWhatsappDeliveryStatuses(conversationId, messageIds) {
+        const ids = new Set((messageIds || []).filter(Boolean));
+        const statuses = new Map([...ids].map((id) => [id, null]));
+        if (!conversationId || !SUPPORT_API_SECRET || ids.size === 0) return statuses;
+        try {
+            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?limit=50`;
+            const res = await fetch(url, { headers: { 'x-api-secret': SUPPORT_API_SECRET } });
+            if (!res.ok) return statuses;
+            const json = await res.json().catch(() => null);
+            const messages = json && Array.isArray(json.messages) ? json.messages : [];
+            for (const message of messages) {
+                if (message && ids.has(message.id)) {
+                    statuses.set(message.id, message.delivery_status || 'pending');
+                }
+            }
+        } catch {
+            // Keep every status unknown. Callers fail closed and never re-post
+            // an accepted WhatsApp message without explicit terminal failure.
+        }
+        return statuses;
+    }
+
     /**
      * One GET of the conversation's recent messages; returns the message's
      * delivery_status ('sent' | 'failed' | 'pending'), or null when the inbox
      * is unreachable or the message isn't visible yet. Never throws.
      */
     async fetchWhatsappDeliveryStatus(conversationId, messageId) {
-        try {
-            const url = `${SUPPORT_API_BASE}/api/support/conversations/${encodeURIComponent(conversationId)}/messages?limit=50`;
-            const res = await fetch(url, { headers: { 'x-api-secret': SUPPORT_API_SECRET } });
-            if (!res.ok) return null;
-            const json = await res.json().catch(() => null);
-            const messages = json && Array.isArray(json.messages) ? json.messages : [];
-            const msg = messages.find((m) => m && m.id === messageId);
-            return msg ? (msg.delivery_status || 'pending') : null;
-        } catch {
-            return null;
-        }
+        const statuses = await this.fetchWhatsappDeliveryStatuses(conversationId, [messageId]);
+        return statuses.get(messageId) || null;
     }
 
     /**
@@ -1512,9 +1526,10 @@ class AlertEngine {
      * UNSENT_RETRY_WINDOW_MS are retried; anything older stays unsent by
      * design (stale alerts are noise).
      */
-    async retryUnsentAlerts() {
+    async retryUnsentAlerts(options = {}) {
         const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
-        if (!TELEGRAM_GROUP && !whatsappConfigured) return;
+        const telegramConfigured = options.telegramConfigured ?? Boolean(TELEGRAM_GROUP);
+        if (!telegramConfigured && !whatsappConfigured) return;
 
         let rows;
         try {
@@ -1534,13 +1549,16 @@ class AlertEngine {
         if (!rows.length) return;
 
         console.log(`🔁 Checking ${rows.length} unsent alert(s) for retry`);
+        const waStatuses = whatsappConfigured
+            ? await this.fetchWhatsappDeliveryStatuses(WHATSAPP_CONV, rows.map((row) => row.wa_message_id))
+            : new Map();
         let dispatchAttempts = 0;
         for (const row of rows) {
             try {
                 // The previous POST may have been accepted and delivered after the
                 // confirmation window closed — check before re-sending.
                 if (row.wa_message_id && whatsappConfigured) {
-                    const status = await this.fetchWhatsappDeliveryStatus(WHATSAPP_CONV, row.wa_message_id);
+                    const status = waStatuses.get(row.wa_message_id) || null;
                     if (status === 'sent') {
                         console.log(`✅ Alert ${row.id} late-confirmed (msg=${row.wa_message_id})`);
                         this.markAlertSent(row.id);
@@ -1558,6 +1576,18 @@ class AlertEngine {
                             `⏳ Alert ${row.id} delivery still unconfirmed ` +
                             `(status=${status || 'unavailable'}, msg=${row.wa_message_id}); not re-sending`
                         );
+                        if (!telegramConfigured) continue;
+                        if (dispatchAttempts >= UNSENT_RETRY_SEND_LIMIT) break;
+                        const telegramMessage = this.formatAlertMessage({
+                            type: 'db_recent', event_ts: row.created_at, timestamp: row.created_at,
+                            charger_id: row.charger_id, severity: row.severity, title: row.title,
+                            description: row.description, ocpp_log_ids: row.ocpp_log_ids,
+                            vercel_log_ids: row.vercel_log_ids, evidence_json: row.evidence_json,
+                        });
+                        dispatchAttempts += 1;
+                        const telegramSent = await this.sendTelegramAlert(telegramMessage);
+                        if (telegramSent) this.markAlertSent(row.id);
+                        await new Promise((r) => setTimeout(r, 2000));
                         continue;
                     }
                 }
