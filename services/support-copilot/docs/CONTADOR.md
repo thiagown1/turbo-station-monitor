@@ -69,6 +69,13 @@ The Codex capacity fallback is a third, independent opt-in. It remains inert
 unless `CONTADOR_CODEX_FALLBACK_ENABLED=true`; deploying the runner alone does
 not change the active model or consume the ChatGPT subscription.
 
+Personal approval of proposed receipt classifications is a fourth independent
+opt-in and remains inert unless `CONTADOR_FINANCIAL_APPROVAL_ENABLED=true` plus
+an exact personal target and matching sender allowlist are configured. It writes
+only a local classification marker after an exact, quoted, one-use response;
+it does not call the Next expense/loan write paths. See
+[`CONTADOR_FINANCIAL_APPROVAL.md`](./CONTADOR_FINANCIAL_APPROVAL.md).
+
 The model can call only the eight read-only tools exposed by
 `/api/accounting/energy-agent/query`, with at most five tool calls per turn.
 The only writes are the deterministic intake keyed by the original WhatsApp
@@ -128,6 +135,10 @@ asset to rotate if this box is ever suspect.
 | `CONTADOR_SESSION_ID` | no | persistent group session, default `contador-contas` |
 | `CONTADOR_HEARTBEAT_HOUR` | no | local São Paulo hour, default `8` |
 | `CONTADOR_MONTHLY_DAY` | no | monthly closing day, default `3` (clamped to 1..28) |
+| `CONTADOR_FINANCIAL_APPROVAL_ENABLED` | no | default `false`; enables personal approval proposals for new expense receipts only |
+| `CONTADOR_FINANCIAL_APPROVAL_OPERATOR_JID` | yes for personal approval | exact personal WhatsApp target; group JIDs fail closed |
+| `CONTADOR_FINANCIAL_APPROVAL_ALLOWED_SENDER_IDS` | yes for personal approval | comma-separated sender digits; target must also be allowlisted |
+| `CONTADOR_FINANCIAL_APPROVAL_TTL_MINUTES` | no | one-use confirmation TTL, default `15`, clamped to 5..60 |
 | `SUPPORT_COPILOT_MEDIA_DIR` | no | shared media directory; must be readable by ingest and worker |
 | `CONTADOR_REGULARIZACAO_DIAS` | no | intervalo mínimo entre cobranças de regularização, em dias (default `3`) |
 
