@@ -222,8 +222,8 @@ function knowledgeDirForBrand(brandId) {
 
   // Try multiple naming patterns (OpenClaw isn't 100% consistent)
   const candidates = [
-    `workspace-${agentId.replace(/_/, '-')}`, // support_turbo_station → workspace-support-turbo_station
-    `workspace-${agentId}`,                    // workspace-support_turbo_station (literal)
+    `workspace-${agentId.replace(/_/, '-')}`, // support_brand_alpha → workspace-support-brand_alpha
+    `workspace-${agentId}`,                    // workspace-support_brand_alpha (literal)
     `workspace-${agentId.replace(/_/g, '-')}`, // workspace-support-turbo-station (all hyphens)
   ];
 
