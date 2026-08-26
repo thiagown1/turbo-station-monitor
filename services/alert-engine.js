@@ -65,6 +65,7 @@ function deliveryPollScheduleMs() {
 // engine never retried WhatsApp before — an alert that failed to deliver was
 // silently lost, the gap behind the 2026-07-16 cable-theft investigation).
 const UNSENT_RETRY_WINDOW_MS = 30 * 60 * 1000;
+const UNSENT_RETRY_SEND_LIMIT = 5;
 
 // Freshness guard
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send alerts older than 10 minutes
@@ -1505,8 +1506,11 @@ class AlertEngine {
      * between save and send). Runs every detection tick. An alert with a
      * recorded wa_message_id is re-checked first — if the earlier send actually
      * delivered late, it's just marked sent (no duplicate message in the
-     * group). Only alerts younger than UNSENT_RETRY_WINDOW_MS are retried;
-     * anything older stays unsent by design (stale alerts are noise).
+     * group). Once a POST has a wa_message_id, only an explicit 'failed'
+     * status may trigger a replacement POST; pending/unavailable statuses are
+     * checked again without re-sending. Only alerts younger than
+     * UNSENT_RETRY_WINDOW_MS are retried; anything older stays unsent by
+     * design (stale alerts are noise).
      */
     async retryUnsentAlerts() {
         const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
@@ -1520,8 +1524,7 @@ class AlertEngine {
                      FROM alerts
                      WHERE created_at >= ?
                        AND (sent = 0 OR sent IS NULL)
-                     ORDER BY created_at ASC
-                     LIMIT 5`
+                     ORDER BY created_at ASC`
                 )
                 .all(Date.now() - UNSENT_RETRY_WINDOW_MS);
         } catch (e) {
@@ -1530,7 +1533,8 @@ class AlertEngine {
         }
         if (!rows.length) return;
 
-        console.log(`🔁 Retrying ${rows.length} unsent alert(s)`);
+        console.log(`🔁 Checking ${rows.length} unsent alert(s) for retry`);
+        let dispatchAttempts = 0;
         for (const row of rows) {
             try {
                 // The previous POST may have been accepted and delivered after the
@@ -1542,7 +1546,23 @@ class AlertEngine {
                         this.markAlertSent(row.id);
                         continue;
                     }
+
+                    // The support API accepted the previous POST and gave us a
+                    // stable message id. A pending or temporarily unreadable
+                    // delivery status is not evidence that the message failed;
+                    // posting again here creates a visible duplicate every
+                    // detection tick. Only an explicit terminal failure may
+                    // create a replacement message.
+                    if (status !== 'failed') {
+                        console.log(
+                            `⏳ Alert ${row.id} delivery still unconfirmed ` +
+                            `(status=${status || 'unavailable'}, msg=${row.wa_message_id}); not re-sending`
+                        );
+                        continue;
+                    }
                 }
+
+                if (dispatchAttempts >= UNSENT_RETRY_SEND_LIMIT) break;
 
                 const message = this.formatAlertMessage({
                     type: 'db_recent',
@@ -1556,6 +1576,7 @@ class AlertEngine {
                     vercel_log_ids: row.vercel_log_ids,
                     evidence_json: row.evidence_json,
                 });
+                dispatchAttempts += 1;
                 const { sent, waMessageId } = await this.dispatchAlert(message);
                 if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
                 if (sent) this.markAlertSent(row.id);

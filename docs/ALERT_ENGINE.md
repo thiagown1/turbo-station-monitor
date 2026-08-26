@@ -98,10 +98,15 @@ fires async and the message's `delivery_status` can still flip to `failed`
    `delivery_status` with a short backoff (default `500/1000/2000/3000` ms,
    tunable via `WHATSAPP_DELIVERY_POLL_MS`).
 3. Marks the alert `sent=1` only on a confirmed `sent`.
-4. Unconfirmed/failed alerts stay `sent=0`; each detection tick retries
-   alerts younger than 30 min (max 5 per tick). A retried alert with a
-   recorded `wa_message_id` is late-confirmed first, so a slow-but-successful
-   delivery never produces a duplicate message in the group.
+4. Unconfirmed/failed alerts stay `sent=0`; each detection tick revisits
+   alerts younger than 30 min (max 5 delivery attempts per tick). Status-only
+   checks do not consume that delivery limit, so old `pending` rows cannot
+   block newer actionable alerts. Alerts without a message id
+   may be POSTed again, and an explicit terminal `failed` status permits one
+   replacement POST. A recorded message that is still `pending`, missing from
+   the lookup, or temporarily unreadable is only checked again — it is never
+   re-POSTed. This keeps a slow or uncertain delivery from producing a new
+   WhatsApp message every two-minute detection tick.
 
 This mirrors `confirmDelivery` in the Next.js `whatsapp-notifier` and closes
 the silent-loss window found in the 2026-07-16 cable-theft investigation.
