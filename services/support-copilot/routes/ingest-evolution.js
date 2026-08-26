@@ -29,14 +29,26 @@ const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
-const { LOG_TAG, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
+const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
+const {
+  enqueueContadorMessage,
+  canRouteContadorEvent,
+  isQuotedContadorDraftReply,
+  sendReply,
+} = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
+const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
+const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const {
+  handleFinancialApprovalReply,
+  sendFinancialApprovalAcknowledgement,
+  processFinancialApprovalWork,
+} = require('../lib/financial-approval');
 
 const router = Router();
-const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
 // Ensure media directory exists
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
@@ -184,9 +196,53 @@ function extractMedia(message) {
   return null;
 }
 
+function quotedMessageId(message) {
+  const candidates = [
+    message?.extendedTextMessage?.contextInfo,
+    message?.imageMessage?.contextInfo,
+    message?.documentMessage?.contextInfo,
+    message?.videoMessage?.contextInfo,
+  ];
+  return candidates.find(Boolean)?.stanzaId || null;
+}
+
+function quotedOutboundMessage(message, conversationId) {
+  const stanzaId = quotedMessageId(message);
+  if (!stanzaId) return null;
+  const row = db.prepare(`
+    SELECT body, source, media_json FROM messages
+    WHERE conversation_id = ? AND external_message_id = ?
+      AND direction = 'outbound' AND source IN ('contador', 'system')
+    LIMIT 1
+  `).get(conversationId, stanzaId) || null;
+  if (!row) return null;
+  let draftId = null;
+  try {
+    const metadata = row.media_json ? JSON.parse(row.media_json) : null;
+    if (metadata?.contador?.kind === 'draft_prompt' && typeof metadata.contador.draftId === 'string') {
+      draftId = metadata.contador.draftId;
+    }
+  } catch (_) {
+    // Legacy or malformed metadata is never trusted to authorize a write.
+  }
+  return { ...row, draftId };
+}
+
+function recentConversationContext(conversationId) {
+  try {
+    const recentMsgs = db.prepare(
+      'SELECT direction, body FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 5'
+    ).all(conversationId);
+    return recentMsgs.reverse().map(m => {
+      const role = m.direction === 'inbound' ? 'Cliente' : 'Operador';
+      return `[${role}]: ${m.body}`;
+    }).join('\n');
+  } catch { return ''; }
+}
+
 // ─── Main webhook handler ───────────────────────────────────────────────────
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   const { event, instance, data } = req.body;
 
   // Only process messages.upsert events
@@ -230,6 +286,7 @@ router.post('/', (req, res) => {
   if (!body) {
     return res.json({ ok: true, skipped: true, reason: 'no extractable body' });
   }
+  const whatsappContext = extractWhatsappMessageContext(message, messageTimestamp);
 
   // Extract media info (if any)
   const media = extractMedia(message || {});
@@ -260,6 +317,7 @@ router.post('/', (req, res) => {
     // The sender is tracked via pushName in the message body prefix
     const groupJid = key.remoteJid;
     const senderName = pushName || (key.participant ? phoneFromJid(key.participant) : null) || 'Unknown';
+    const senderId = key.participant ? normalizePhone(phoneFromJid(key.participant)) : null;
 
     // Find or create group conversation by group JID
     let existing = db.prepare(
@@ -310,22 +368,63 @@ router.post('/', (req, res) => {
       fetchGroupName(instance, groupJid, conversationId);
     }
 
-    // Dedup by external_message_id
+    const groupBody = direction === 'inbound' ? `[${senderName}]: ${body}` : body;
+
+    // Dedup by external_message_id. If a crash happened after the inbound
+    // message commit but before durable media routing, the provider replay is
+    // also the recovery path for the missing media/Contador job.
     if (externalMessageId) {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
-      if (dup) return res.json({ id: dup.id, conversationId, duplicate: true });
+      if (dup) {
+        if (direction === 'inbound') {
+          void routeStationInvestigation({ messageId: externalMessageId, conversationId, brandId, groupJid,
+            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext })
+            .catch(err => console.warn(`${LOG_TAG} duplicate investigator recovery failed for ${dup.id}:`, err.message));
+          const quoted = quotedOutboundMessage(message, conversationId);
+          const contadorEvent = {
+            messageId: externalMessageId,
+            conversationId,
+            brandId,
+            groupJid,
+            instance,
+            direction,
+            sender: senderName,
+            senderId,
+            body,
+            media,
+            replyToContador: quoted?.source === 'contador',
+            quotedContadorDraftId: quoted?.draftId || null,
+          };
+          if (isQuotedContadorDraftReply(contadorEvent)) {
+            enqueueContadorMessage(contadorEvent);
+          } else if (media && ['image', 'document'].includes(media.media_type)) {
+            const { routeInboundMessageDurably } = require('../lib/agent-router');
+            routeInboundMessageDurably({
+              messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
+              instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+              replyToContador: contadorEvent.replyToContador,
+              quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+              deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+            }).catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
+          }
+        }
+        return res.json({ id: dup.id, conversationId, duplicate: true });
+      }
     }
 
     // Insert message — prefix body with sender name for group context
     const msgId = randomId('msg');
     const mediaJson = media ? JSON.stringify(media) : null;
-    const groupBody = direction === 'inbound' ? `[${senderName}]: ${body}` : body;
 
     db.transaction(() => {
       db.prepare(`
-        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
-        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?)
-      `).run(msgId, conversationId, brandId, direction, groupBody, null, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, now);
+        INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, raw_body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name,
+          provider_timestamp, quoted_message_id, quoted_sender_id, mentioned_jids_json, is_forwarded, forwarding_score, created_at)
+        VALUES (?, ?, ?, ?, 'evolution', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(msgId, conversationId, brandId, direction, groupBody, body, null, externalMessageId || null, mediaJson,
+        direction === 'outbound' ? 'sent' : null, senderId, senderName, whatsappContext.providerTimestamp,
+        whatsappContext.quotedMessageId, whatsappContext.quotedSenderId, JSON.stringify(whatsappContext.mentionedJids),
+        whatsappContext.isForwarded ? 1 : 0, whatsappContext.forwardingScore, now);
 
       if (direction === 'inbound') {
         db.prepare('UPDATE conversations SET last_message_at = ?, last_inbound_at = ?, unread_count = unread_count + 1, updated_at = ? WHERE id = ?')
@@ -390,9 +489,92 @@ router.post('/', (req, res) => {
       } : null,
     });
 
-    // Pre-generate a copilot suggestion for the dashboard (groups: suggest-only).
+    // Media/station requests first enter the reviewed central router. If that
+    // router is explicitly disabled or ineligible, fall back to the pre-existing
+    // Contador/group-suggestion behavior. A successful central classification
+    // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
-      scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+      void routeStationInvestigation({
+        messageId: externalMessageId || msgId, conversationId, brandId, groupJid, instance,
+        senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
+      }).catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+      const quoted = quotedOutboundMessage(message, conversationId);
+      // Which agent serves this group is decided in the Agent Center, not here.
+      // undefined means the central was unreachable, and classifyInbound then
+      // falls back to CONTADOR_GROUP_CONVERSATION_ID.
+      const { isAccountingGroup } = require('../lib/agent-router');
+      const accountingGroup = await isAccountingGroup(brandId, conversationId);
+      const contadorEvent = {
+        messageId: externalMessageId || msgId,
+        conversationId,
+        brandId,
+        groupJid,
+        instance,
+        direction,
+        sender: senderName,
+        senderId,
+        body,
+        media,
+        accountingGroup,
+        replyToContador: quoted?.source === 'contador',
+        quotedContadorDraftId: quoted?.draftId || null,
+      };
+      if (quoted?.body && /\bEXP-[A-F0-9]{8}\b/i.test(quoted.body)) {
+        const { routeExpenseDecisionReply } = require('../lib/agent-router');
+        const decision = await routeExpenseDecisionReply({
+          messageId: msgId, externalMessageId, conversationId, brandId, senderId,
+          body, quotedBody: quoted.body,
+        });
+        if (decision.handled) {
+          // decision.silent = not an accounting conversation; the agent must
+          // not speak there at all, not even to refuse.
+          if (!decision.silent && decision.reply) await sendReply(decision.reply, contadorEvent).catch((err) => console.warn(`${LOG_TAG} expense decision reply failed:`, err.message));
+          return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
+        }
+      }
+      // Central media router: every image/PDF is classified once. Text-only
+      // messages use a free deterministic gate and invoke the model only when
+      // they look like a request to inspect a charger.
+      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
+      if (isQuotedContadorDraftReply(contadorEvent)) {
+        // A quoted draft answer belongs to the Contador loop even when it says
+        // "estação". The Next boundary still revalidates the stable sender
+        // allowlist before accepting any financial mutation.
+        const contadorRoute = enqueueContadorMessage(contadorEvent);
+        if (contadorRoute.kind === 'ignored') {
+          scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+        }
+      } else if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
+        const { routeInboundMessageDurably } = require('../lib/agent-router');
+        routeInboundMessageDurably({
+          messageId: msgId, externalMessageId, conversationId, brandId, groupJid,
+          instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+          replyToContador: contadorEvent.replyToContador,
+          quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+          deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+        }).then(result => {
+          if ((result?.skipped || result?.status === 'error') && !result?.fallbackHandled) {
+            const contadorRoute = enqueueContadorMessage(contadorEvent);
+            if (contadorRoute.kind === 'ignored') {
+              scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
+            }
+          } else if (result?.kind === 'energy_invoice' && result.eventDeferred) {
+            // The router committed the Contador job in the same SQLite
+            // transaction as the classification. Nothing remains to enqueue in
+            // this post-response callback.
+          }
+        }).catch(err => {
+          console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message);
+          // The durable media job owns transient configuration/classification
+          // failures and will retry. Do not reserve the Contador message id with
+          // an extraction-less fallback while that retry is pending.
+        });
+      } else {
+        const contadorRoute = enqueueContadorMessage(contadorEvent);
+        if (contadorRoute.kind === 'ignored') {
+          scheduleGroupSuggestion(conversationId, brandId, { media: false });
+        }
+      }
     }
 
     return res.status(201).json({
@@ -592,6 +774,19 @@ router.post('/', (req, res) => {
   if (externalMessageId) {
     const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
     if (dup) {
+      if (direction === 'inbound' && media && ['image', 'document'].includes(media.media_type)) {
+        const { routeInboundMessageDurably } = require('../lib/agent-router');
+        routeInboundMessageDurably({
+          messageId: dup.id,
+          externalMessageId,
+          conversationId,
+          brandId,
+          senderId: normalizedPhone,
+          body,
+          media,
+          receivedAt: now,
+        }).catch(err => console.warn(`${LOG_TAG} duplicate direct media recovery failed for ${dup.id}:`, err.message));
+      }
       return res.json({ id: dup.id, conversationId, duplicate: true });
     }
 
@@ -619,9 +814,9 @@ router.post('/', (req, res) => {
 
   db.transaction(() => {
     db.prepare(`
-      INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, created_at)
-      VALUES (?, ?, ?, ?, 'evolution', ?, NULL, ?, ?, ?, ?)
-    `).run(msgId, conversationId, brandId, direction, body, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, now);
+      INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, author_id, external_message_id, media_json, delivery_status, sender_id, sender_name, created_at)
+      VALUES (?, ?, ?, ?, 'evolution', ?, NULL, ?, ?, ?, ?, ?, ?)
+    `).run(msgId, conversationId, brandId, direction, body, externalMessageId || null, mediaJson, direction === 'outbound' ? 'sent' : null, normalizedPhone, pushName || null, now);
 
     if (direction === 'inbound') {
       db.prepare(`
@@ -685,30 +880,57 @@ router.post('/', (req, res) => {
     } : null,
   });
 
+  // Personal financial confirmations use an exact-code protocol and are
+  // consumed before generic Copilot/media paths. This prevents free-form,
+  // unauthorized, expired or duplicate replies from reaching a broader agent.
+  if (direction === 'inbound') {
+    const financialDecision = handleFinancialApprovalReply({
+      messageId: msgId,
+      externalMessageId,
+      conversationId,
+      brandId,
+      instance,
+      senderId: normalizedPhone,
+      body,
+      quotedMessageId: whatsappContext.quotedMessageId,
+    });
+    if (financialDecision.handled) {
+      if (financialDecision.confirmed) void processFinancialApprovalWork();
+      if (!financialDecision.silent && financialDecision.reply) {
+        void sendFinancialApprovalAcknowledgement({
+          conversationId,
+          brandId,
+          instance,
+          senderId: normalizedPhone,
+        }, financialDecision.reply).catch(() => {
+          console.warn(`${LOG_TAG} financial approval acknowledgement failed`);
+        });
+      }
+      return res.status(201).json({
+        id: msgId,
+        conversationId,
+        created,
+        duplicate: false,
+        source: 'evolution',
+        financialApproval: true,
+      });
+    }
+  }
+
   // NOTE: We no longer inject every message into the agent session here.
   // The incremental prompt system in generateSuggestion() handles sending
   // all pending messages when the operator clicks Copilot. This avoids
   // wasting tokens on messages the operator may not need help with.
 
-  // Process media in background (transcribe audio, describe images/video)
-  if (media && media.url && direction === 'inbound') {
+  // Process audio/video through the legacy media pipeline. Images and PDFs are
+  // handled by the central router below so they incur exactly one vision call.
+  if (media && media.url && direction === 'inbound' && !['image', 'document'].includes(media.media_type)) {
     const { processMedia } = require('../lib/media-processor');
     const mediaFilePath = path.join(MEDIA_DIR, path.basename(media.url));
     const mediaType = media.media_type; // audio, image, video, document, sticker
 
     // Build recent conversation context for the media describer
-    let conversationContext = '';
-    try {
-      const recentMsgs = db.prepare(
-        'SELECT direction, body FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 5'
-      ).all(conversationId);
-      if (recentMsgs.length > 0) {
-        conversationContext = recentMsgs.reverse().map(m => {
-          const role = m.direction === 'inbound' ? 'Cliente' : 'Operador';
-          return `[${role}]: ${m.body}`;
-        }).join('\n');
-      }
-    } catch { /* ignore */ }
+    const conversationContext = recentConversationContext(conversationId);
 
     // Fire-and-forget: process and update message body
     processMedia(mediaFilePath, mediaType, { conversationContext }).then(description => {
@@ -723,6 +945,14 @@ router.post('/', (req, res) => {
     }).catch(err => {
       console.warn(`${LOG_TAG} Media processing failed for msg ${msgId}:`, err.message);
     });
+  }
+
+  if (media && direction === 'inbound' && ['image', 'document'].includes(media.media_type)) {
+    const { routeInboundMessageDurably } = require('../lib/agent-router');
+    routeInboundMessageDurably({
+      messageId: msgId, externalMessageId, conversationId, brandId,
+      senderId: normalizedPhone, body, media, receivedAt: now,
+    }).catch(err => console.warn(`${LOG_TAG} agent router failed for ${msgId}:`, err.message));
   }
 
   res.status(201).json({

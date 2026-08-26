@@ -60,8 +60,15 @@ try {
       direction TEXT NOT NULL,
       source TEXT NOT NULL,
       body TEXT NOT NULL,
+      raw_body TEXT,
       author_id TEXT,
       external_message_id TEXT,
+      provider_timestamp TEXT,
+      quoted_message_id TEXT,
+      quoted_sender_id TEXT,
+      mentioned_jids_json TEXT,
+      is_forwarded INTEGER NOT NULL DEFAULT 0,
+      forwarding_score INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL
     );
 
@@ -72,6 +79,7 @@ try {
       status TEXT NOT NULL DEFAULT 'pending',
       suggestion_text TEXT NOT NULL,
       model_name TEXT,
+      source_message_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       decided_by TEXT,
@@ -121,6 +129,12 @@ safeAddColumn('conversations', 'escalated_at', 'TEXT DEFAULT NULL');
 safeAddColumn('conversations', 'escalated_to', 'TEXT DEFAULT NULL');
 // Learning from edits
 safeAddColumn('suggestions', 'edited_text', 'TEXT DEFAULT NULL');
+safeAddColumn('suggestions', 'source_message_id', 'TEXT DEFAULT NULL');
+try {
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestions_source_message ON suggestions(source_message_id) WHERE source_message_id IS NOT NULL');
+} catch (err) {
+  console.warn(`${LOG_TAG} suggestions source-message migration:`, err.message);
+}
 
 // Session context tracking — remembers what was sent to the agent to avoid repeating
 try {
@@ -148,6 +162,32 @@ safeAddColumn('conversations', 'pending_validation_code', 'TEXT DEFAULT NULL');
 // same customer (must exist before the findConvByAlias/findDuplicateConv
 // prepared statements below, which reference this column).
 safeAddColumn('conversations', 'phone_aliases', 'TEXT DEFAULT NULL');
+
+// Conversation tags: comma-separated list, set via PATCH /:id/tags
+// (routes/conversations.js) and auto-tag [TAGS:...] parsing (lib/copilot.js).
+safeAddColumn('conversations', 'tags', 'TEXT DEFAULT NULL');
+
+// Message delivery status: pending/sent/failed, written by every outbound-send
+// call site (routes/conversations.js, routes/ingest-evolution.js).
+safeAddColumn('messages', 'delivery_status', 'TEXT DEFAULT NULL');
+
+// Media reference ({media_type, mimetype, url, filename, caption}), written by
+// routes/ingest-evolution.js and routes/conversations.js since the media
+// pipeline shipped — but the column only ever existed in prod via an ad-hoc
+// ALTER; fresh DBs lacked it (same class of gap as phone_aliases/tags above).
+safeAddColumn('messages', 'media_json', 'TEXT DEFAULT NULL');
+// Stable group-participant/phone identity. Display names are not authorization.
+safeAddColumn('messages', 'sender_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'sender_name', 'TEXT DEFAULT NULL');
+// Structured WhatsApp context used by the station investigator. The visible
+// body stays backward-compatible; raw_body avoids reparsing the group prefix.
+safeAddColumn('messages', 'raw_body', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'provider_timestamp', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'quoted_message_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'quoted_sender_id', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'mentioned_jids_json', 'TEXT DEFAULT NULL');
+safeAddColumn('messages', 'is_forwarded', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('messages', 'forwarding_score', 'INTEGER NOT NULL DEFAULT 0');
 
 // Copilot settings — per-brand configuration for the AI assistant
 try {
@@ -285,6 +325,302 @@ try {
   console.warn(`${LOG_TAG} copilot_knowledge_docs migration:`, err.message);
 }
 
+// Conversation outcomes — one row per close event, classifying how the
+// conversation ended (resolved by bot/operator, escalated, unresolved,
+// abandoned, spam) plus a root-cause + suggested fix for the non-resolved
+// ones. Feeds the "Desfechos" support metrics tab.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_outcomes (
+      id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      outcome TEXT NOT NULL,
+      closed_by TEXT NOT NULL,
+      root_cause TEXT,
+      analysis TEXT,
+      suggestion TEXT,
+      model_name TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outcome_conv ON conversation_outcomes(conversation_id);');
+  db.exec('CREATE INDEX IF NOT EXISTS idx_outcome_brand_created ON conversation_outcomes(brand_id, created_at DESC);');
+} catch (err) {
+  console.warn(`${LOG_TAG} conversation_outcomes migration:`, err.message);
+}
+
+// PIX receipt extractions — one row per media message the receipts endpoint
+// (routes/groups.js GET /receipts) has vision-read, so each file is read at
+// most once (plus capped retries on transient errors). Stores ONLY the
+// financial validation fields (amount in cents + transaction ref) — never
+// payer/payee names or any other receipt content (LGPD).
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS receipt_extractions (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      status TEXT NOT NULL,
+      amount_cents INTEGER,
+      receipt_ref TEXT,
+      model TEXT,
+      attempts INTEGER NOT NULL DEFAULT 1,
+      extracted_at TEXT NOT NULL
+    );
+  `);
+  db.exec('CREATE INDEX IF NOT EXISTS idx_receipt_extractions_conv ON receipt_extractions(conversation_id);');
+} catch (err) {
+  console.warn(`${LOG_TAG} receipt_extractions migration:`, err.message);
+}
+
+// Contador outbox + daily-run ledger. Incoming webhooks only enqueue work;
+// network/model calls run outside the request and can be retried safely.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contador_jobs (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL UNIQUE,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error TEXT,
+      reply_status TEXT,
+      reply_external_message_id TEXT,
+      model_waits INTEGER NOT NULL DEFAULT 0,
+      last_model_wait_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contador_jobs_due
+      ON contador_jobs(status, next_attempt_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS contador_daily_runs (
+      run_date TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    -- Rotina de regularização: o Contador varre os meses passados, deriva o
+    -- que ainda falta das próprias tools e cobra no grupo até a lacuna sumir.
+    -- Uma linha por rodada de cobrança; a lacuna some sozinha quando o
+    -- lançamento entra, então não existe "resolver" manual.
+    -- Memoria duravel do Contador: o que o grupo ensina sobre o negocio
+    -- ("HB Center e da Decathlon", "as estacoes de Goiania quem cuida e a
+    -- Prime"). Injetado em todo prompt, para ele nao reperguntar o que ja
+    -- foi dito. Fato errado se corrige marcando status='revogado'.
+    -- Perguntas que o Contador precisa fazer e que NAO dao para derivar das
+    -- tools (quanto cada fornecedor cobra de desagio, faturas que so existem
+    -- no papel). Ele repete na cobranca ate alguem responder; a resposta vira
+    -- fato em contador_fatos e a pergunta e encerrada.
+    CREATE TABLE IF NOT EXISTS contador_perguntas_abertas (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      pergunta TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'aberta',
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS contador_fatos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      fato TEXT NOT NULL UNIQUE,
+      categoria TEXT NOT NULL DEFAULT 'geral',
+      origem_message_id TEXT,
+      status TEXT NOT NULL DEFAULT 'ativo',
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS contador_regularizacao_runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      asked_at TEXT NOT NULL,
+      gaps_fingerprint TEXT NOT NULL,
+      gaps_json TEXT NOT NULL,
+      status TEXT NOT NULL,
+      last_error TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS contador_monthly_runs (
+      run_month TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador migrations:`, err.message);
+}
+safeAddColumn('contador_jobs', 'reply_status', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_jobs', 'reply_external_message_id', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_jobs', 'model_waits', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('contador_jobs', 'last_model_wait_at', 'TEXT DEFAULT NULL');
+safeAddColumn('contador_monthly_runs', 'next_attempt_at', 'TEXT DEFAULT NULL');
+try {
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_contador_monthly_runs_due
+    ON contador_monthly_runs(status, next_attempt_at, run_month);`);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador monthly retry index migration:`, err.message);
+}
+
+// Personal, operator-approved financial classifications. These tables never
+// move money or create accounting entries: they retain the immutable proposal,
+// its one-use confirmation and the resulting local classification marker. The
+// feature is separately opt-in and defaults off.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS contador_financial_proposals (
+      id TEXT PRIMARY KEY,
+      proposal_code TEXT NOT NULL UNIQUE,
+      source_message_id TEXT NOT NULL UNIQUE,
+      source_conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      source_sender_id TEXT,
+      operator_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      action_payload_json TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      status TEXT NOT NULL,
+      send_attempts INTEGER NOT NULL DEFAULT 0,
+      execution_attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT,
+      outbound_message_id TEXT,
+      confirmation_message_id TEXT UNIQUE,
+      confirmed_by TEXT,
+      expires_at TEXT NOT NULL,
+      sent_at TEXT,
+      confirmed_at TEXT,
+      rejected_at TEXT,
+      executed_at TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_contador_financial_proposals_due
+      ON contador_financial_proposals(status, next_attempt_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS contador_financial_classifications (
+      source_message_id TEXT PRIMARY KEY,
+      proposal_id TEXT NOT NULL UNIQUE,
+      brand_id TEXT NOT NULL,
+      action_type TEXT NOT NULL,
+      action_payload_json TEXT NOT NULL,
+      payload_hash TEXT NOT NULL,
+      classified_by TEXT NOT NULL,
+      classified_at TEXT NOT NULL
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} contador financial approval migrations:`, err.message);
+}
+safeAddColumn('contador_financial_proposals', 'send_attempts', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('contador_financial_proposals', 'execution_attempts', 'INTEGER NOT NULL DEFAULT 0');
+
+// One paid media classification per inbound message, plus a durable delivery
+// outbox to the Next.js action/review boundary. Neither table stores the media.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS agent_media_analyses (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      result_json TEXT,
+      model TEXT,
+      input_tokens INTEGER DEFAULT 0,
+      output_tokens INTEGER DEFAULT 0,
+      estimated_cost_usd REAL DEFAULT 0,
+      attempts INTEGER NOT NULL DEFAULT 1,
+      analyzed_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_media_brand_at ON agent_media_analyses(brand_id, analyzed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS agent_media_jobs (
+      message_id TEXT PRIMARY KEY,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      fallback_applied_at TEXT,
+      model_waits INTEGER NOT NULL DEFAULT 0,
+      last_model_wait_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_media_jobs_due
+      ON agent_media_jobs(status, next_attempt_at, created_at);
+
+    CREATE TABLE IF NOT EXISTS agent_event_outbox (
+      id TEXT PRIMARY KEY,
+      message_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      response_status INTEGER,
+      response_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      UNIQUE(message_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_outbox_due ON agent_event_outbox(status, next_attempt_at);
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} agent router migration:`, err.message);
+}
+safeAddColumn('agent_media_jobs', 'fallback_applied_at', 'TEXT DEFAULT NULL');
+safeAddColumn('agent_media_jobs', 'model_waits', 'INTEGER NOT NULL DEFAULT 0');
+safeAddColumn('agent_media_jobs', 'last_model_wait_at', 'TEXT DEFAULT NULL');
+
+// Durable, idempotent orchestration for explicit @mention station requests.
+// Raw chat text is not copied here: only the structured context fingerprint,
+// message references and bounded result returned by Next are retained.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS station_investigation_jobs (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      context_fingerprint TEXT,
+      context_message_ids_json TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      decision TEXT,
+      confidence TEXT,
+      station_ids_json TEXT,
+      result_json TEXT,
+      ack_sent_at TEXT,
+      ack_external_message_id TEXT,
+      response_sent_at TEXT,
+      response_external_message_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_station_investigation_jobs_due
+      ON station_investigation_jobs(status, next_attempt_at, created_at);
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} station investigator migration:`, err.message);
+}
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function nowIso() { return new Date().toISOString(); }
@@ -385,6 +721,15 @@ const stmts = {
        context_hash = excluded.context_hash,
        last_sent_at = excluded.last_sent_at,
        full_context_sent = excluded.full_context_sent`
+  ),
+  // Conversation outcomes
+  insertOutcome: db.prepare(
+    `INSERT INTO conversation_outcomes
+       (id, conversation_id, brand_id, outcome, closed_by, root_cause, analysis, suggestion, model_name, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ),
+  latestOutcomeForConv: db.prepare(
+    `SELECT * FROM conversation_outcomes WHERE conversation_id = ? ORDER BY datetime(created_at) DESC LIMIT 1`
   ),
 };
 

@@ -7,7 +7,8 @@
     "lib": "lib"
   },
   "scripts": {
-    "test": "node __tests__/db-fresh-schema.test.js && node __tests__/auto-respond-gate.test.js && node __tests__/auto-merge.test.js && node __tests__/suggest-outcome.test.js && node scripts/bot-eval.cjs --gate-only",
+    "test:station-investigator": "node __tests__/whatsapp-message-context.test.js && node __tests__/conversation-incident-context.test.js && node __tests__/station-investigator-runtime.test.js",
+    "test": "node __tests__/session-file.test.js && node __tests__/session-compact.test.js && node __tests__/db-fresh-schema.test.js && node --test __tests__/financial-approval.test.js && node __tests__/ingest-route.test.js && node __tests__/groups-receipts.test.js && node __tests__/contador.test.js && node --test __tests__/contador-model-runner.test.js && node --test __tests__/model-wait-queue.test.js && node __tests__/contador-runtime.test.js && node __tests__/contador-pdf-integration.test.js && node __tests__/agent-router.test.js && node __tests__/station-investigator-runtime.test.js && node __tests__/auto-respond-gate.test.js && node __tests__/auto-merge.test.js && node __tests__/outcome-prompt.test.js && node __tests__/outcome-stats.test.js && node __tests__/suggest-outcome.test.js && node scripts/bot-eval.cjs --gate-only",
     "eval": "node scripts/bot-eval.cjs",
     "eval:gate": "node scripts/bot-eval.cjs --gate-only",
     "eval:judge": "node scripts/bot-eval.cjs --judge"

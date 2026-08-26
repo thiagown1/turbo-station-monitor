@@ -15,12 +15,16 @@
 const http = require('http');
 const path = require('path');
 const crypto = require('crypto');
+const fs = require('fs');
+const { exec, execFile, spawn } = require('child_process');
+const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 
-const PORT = parseInt(process.env.PORT || '3002', 10);
-const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '1700081a5b367b04b35758df55a42b72d3c9ba65';
+const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
 
 const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '1700081a5b367b04b35758df55a42b72d3c9ba65';
+const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '';
+const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
 
 const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
@@ -32,11 +36,9 @@ const CODEX_REVIEW_DEBOUNCE_MS = parseInt(process.env.CODEX_REVIEW_DEBOUNCE_MS |
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads are small)
 
 function sendTelegramNotification(text, target = 'telegram:-5103508388') {
-  const { exec } = require('child_process');
-  // Use single-quote escaping (same pattern as alert-engine.js which works reliably)
-  const escaped = text.replace(/'/g, "'\\''");
-  exec(
-    `openclaw message send --channel telegram --target '${target}' --message '${escaped}'`,
+  execFile(
+    OPENCLAW_CLI,
+    ['message', 'send', '--channel', 'telegram', '--target', target, '--message', String(text)],
     { timeout: 10000 },
     (err) => {
       if (err) console.error(`[telegram-notify] CLI failed: ${err.message}`);
@@ -46,10 +48,9 @@ function sendTelegramNotification(text, target = 'telegram:-5103508388') {
 }
 
 function sendNightWorkersPing(text) {
-  const { exec } = require('child_process');
-  const escaped = text.replace(/"/g, '\\"').replace(/`/g, '\\`').replace(/\$/g, '\\$');
-  exec(
-    `openclaw message send --channel telegram --target telegram:-5143783696 -m "${escaped}"`,
+  execFile(
+    OPENCLAW_CLI,
+    ['message', 'send', '--channel', 'telegram', '--target', 'telegram:-5143783696', '--message', String(text)],
     { timeout: 10000 },
     (err) => {
       if (err) console.error(`[night-workers-ping] CLI failed: ${err.message}`);
@@ -167,11 +168,13 @@ function sendOpenClawAgent({ message, agentId, name, channel, to, wakeMode = 'no
 }
 
 function verifySignature({ rawBody, signatureHeader }) {
-  if (!GITHUB_WEBHOOK_SECRET || !signatureHeader) return true;
+  if (!GITHUB_WEBHOOK_SECRET || !signatureHeader) return false;
   const hmac = crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET);
   hmac.update(rawBody);
   const expected = 'sha256=' + hmac.digest('hex');
-  return crypto.timingSafeEqual(Buffer.from(signatureHeader), Buffer.from(expected));
+  const provided = Buffer.from(signatureHeader);
+  const wanted = Buffer.from(expected);
+  return provided.length === wanted.length && crypto.timingSafeEqual(provided, wanted);
 }
 
 function safeJsonParse(str) {
@@ -291,7 +294,9 @@ function dispatchBatchedCIWake(branchKey) {
 
 function handleHealth(req, res) {
   if (req.method === 'GET' && (req.url === '/health' || req.url === '/ping')) {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    // X-Service lets scripts/check-ports.js tell WHICH process owns this socket.
+    // Body stays 'OK\n' — several probes match on it.
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'X-Service': 'github-webhook' });
     res.end('OK\n');
     return true;
   }
@@ -324,14 +329,17 @@ function handleWebhook(req, res) {
     const signature = req.headers['x-hub-signature-256'];
 
     try {
-      if (GITHUB_WEBHOOK_SECRET && signature) {
-        const ok = verifySignature({ rawBody: body, signatureHeader: signature });
-        if (!ok) {
-          console.error('[github-webhook] Invalid signature');
-          res.writeHead(401, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'Invalid signature' }));
-          return;
-        }
+      if (!GITHUB_WEBHOOK_SECRET) {
+        console.error('[github-webhook] Secret not configured; request rejected');
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Webhook unavailable' }));
+        return;
+      }
+      if (!verifySignature({ rawBody: body, signatureHeader: signature })) {
+        console.error('[github-webhook] Invalid or missing signature');
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid signature' }));
+        return;
       }
 
       const parsed = safeJsonParse(body);
@@ -521,10 +529,15 @@ function handleWebhook(req, res) {
         }
       }
 
-      // ── PR Label-based agent wake ──────────────────────────────
-      // When a PR gets labeled with "needs:test-review" or "needs:sec-review",
-      // instantly wake the corresponding agent to perform the review.
-      if (event === 'pull_request' && webhookEvent.action === 'labeled' && !isShortTrader) {
+      // ── PR Label-based agent wake — MIGRATED TO GITHUB ACTIONS ─
+      // Replaced by .github/workflows/agent-test-review.yml,
+      // agent-sec-review.yml, agent-coder.yml in turbo_station repo.
+      // The check_run from those workflows shows up in the PR sidebar so
+      // it's visible whether the reviewer agent has responded or stalled —
+      // something this webhook dispatch couldn't surface.
+      // Re-enable by flipping the `if (false &&` below back to its original
+      // condition.
+      if (false && event === 'pull_request' && webhookEvent.action === 'labeled' && !isShortTrader) {
         const addedLabel = payload.label?.name;
         const prNumber = webhookEvent.pr_number;
         const prTitle = webhookEvent.pr_title || '';
@@ -710,104 +723,18 @@ function handleWebhook(req, res) {
         const shouldDeploy = shouldSendAck({ key: deployKey, windowMs: 30 * 1000 }); // 30s dedup
 
         if (shouldDeploy) {
-          const { exec } = require('child_process');
           const monitorDir = '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor';
           const commitMsg = (payload.head_commit?.message || '').substring(0, 80);
           const pusher = payload.pusher?.name || 'unknown';
-
-          console.log(`[auto-deploy] turbo-station-monitor push by ${pusher}: "${commitMsg}"`);
-
-          // Step 1: git pull
-          exec(`cd ${monitorDir} && git pull origin main`, { timeout: 30000 }, (pullErr, pullStdout) => {
-            if (pullErr) {
-              console.error(`[auto-deploy] git pull failed: ${pullErr.message}`);
-              sendTelegramNotification(
-                `❌ Auto-deploy falhou (git pull): ${pullErr.message.substring(0, 200)}`,
-                'telegram:-5103508388'
-              );
-              return;
-            }
-
-            console.log(`[auto-deploy] git pull: ${pullStdout.trim()}`);
-
-            // ── Auto-version: bump patch in package.json ──────────────
-            let version = '?.?.?';
-            try {
-              const pkgPath = `${monitorDir}/package.json`;
-              const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-              const parts = (pkg.version || '1.0.0').split('.').map(Number);
-              parts[2] = (parts[2] || 0) + 1; // bump patch
-              pkg.version = parts.join('.');
-              version = pkg.version;
-              fs.writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + '\n');
-              console.log(`[auto-deploy] Version bumped to ${version}`);
-            } catch (vErr) {
-              console.error(`[auto-deploy] Version bump failed: ${vErr.message}`);
-            }
-
-            // Step 2: Detect which services changed based on committed files
-            const changedFiles = (payload.commits || []).flatMap(c =>
-              [...(c.added || []), ...(c.modified || []), ...(c.removed || [])]
-            );
-
-            const serviceMap = {
-              'services/support-copilot/': 'support-copilot',
-              'services/whatsapp-gateway/': 'whatsapp-gateway',
-              'services/smart-collector.js': 'ocpp-collector',
-              'services/alert-processor.js': 'ocpp-alerts',
-              'services/vercel-drain.js': 'vercel-drain',
-              'services/github-webhook.js': 'github-webhook',
-              'services/mobile-telemetry/': 'mobile-telemetry',
-              'services/pagarme-status-webhook.js': 'pagarme-status-webhook',
-              'services/alert-engine.js': 'alert-engine',
-            };
-
-            const servicesToRestart = new Set();
-
-            // If ecosystem.config.js changed, restart everything
-            if (changedFiles.some(f => f === 'ecosystem.config.js' || f === '.env')) {
-              Object.values(serviceMap).forEach(s => servicesToRestart.add(s));
-            } else {
-              for (const file of changedFiles) {
-                for (const [prefix, service] of Object.entries(serviceMap)) {
-                  if (file.startsWith(prefix)) {
-                    servicesToRestart.add(service);
-                  }
-                }
-              }
-            }
-
-            if (servicesToRestart.size === 0) {
-              console.log('[auto-deploy] No service files changed, skipping restart');
-              sendTelegramNotification(
-                `📦 Monitor v${version} atualizado (sem restart): "${commitMsg}" by ${pusher}`,
-                'telegram:-5103508388'
-              );
-              return;
-            }
-
-            // Step 3: Send notification FIRST, then restart
-            // (If github-webhook itself is restarted, we'd lose the notification)
-            const services = [...servicesToRestart].join(', ');
-            sendTelegramNotification(
-              `🚀 Auto-deploy v${version}: "${commitMsg}" by ${pusher} | Reiniciando: ${services}`,
-              'telegram:-5103508388'
-            );
-
-            // Delay restart so the notification CLI has time to complete
-            const restartDelay = servicesToRestart.has('github-webhook') ? 5000 : 500;
-            setTimeout(() => {
-              const restartCmd = [...servicesToRestart].map(s => `pm2 restart ${s} --update-env`).join(' && ');
-              exec(restartCmd, { timeout: 30000 }, (restartErr) => {
-                if (restartErr) {
-                  console.error(`[auto-deploy] pm2 restart failed: ${restartErr.message}`);
-                } else {
-                  exec('pm2 save', { timeout: 10000 }, () => {});
-                  console.log(`[auto-deploy] ✅ v${version} — Restarted: ${services}`);
-                }
-              });
-            }, restartDelay);
+          const deployScript = path.join(monitorDir, 'scripts', 'deploy-monitor.js');
+          const child = spawn(process.execPath, [deployScript, payload.after, commitMsg, pusher], {
+            cwd: monitorDir,
+            env: process.env,
+            detached: true,
+            stdio: 'ignore',
           });
+          child.unref();
+          console.log(`[auto-deploy] worker started for ${String(payload.after || '').slice(0, 8)} by ${pusher}`);
         }
       }
 
@@ -977,13 +904,19 @@ function handleWebhook(req, res) {
           });
         }
 
-        if (!isShortTrader) {
-          // ── Debounced CI wake ──────────────────────────────────────
+        if (false && !isShortTrader) {
+          // ── Debounced CI wake — MIGRATED TO GITHUB ACTIONS ─────────
+          // Replaced by .github/workflows/agent-coder.yml fix-ci job
+          // (workflow_run trigger filtered on conclusion == 'failure').
+          // Concurrency `group: agent-coder-<branch>, cancel-in-progress:
+          // false` provides equivalent debouncing — multiple failing
+          // workflows on the same branch queue one fix-ci run after the
+          // current one. Re-enable by flipping `if (false &&` above.
+          //
+          // Original comment for reference:
           // Instead of waking the coder immediately for each failing
           // workflow, buffer failures per branch and dispatch a single
-          // batched wake after CI_DEBOUNCE_MS (default 60s). This way
-          // if 3 checks fail from the same push, the coder gets ONE
-          // wake with all 3 failures listed.
+          // batched wake after CI_DEBOUNCE_MS (default 60s).
           const pending = readJsonFileOrDefault(CI_PENDING_PATH, {});
           const branchKey = `${webhookEvent.repository}:${webhookEvent.head_branch}`;
 
@@ -1059,7 +992,7 @@ function requestHandler(req, res) {
   res.end(JSON.stringify({ error: 'Not found' }));
 }
 
-http.createServer(requestHandler).listen(PORT, () => {
-  console.log(`[github-webhook] Server listening on port ${PORT}`);
+http.createServer(requestHandler).listen(PORT, BIND_HOST, () => {
+  console.log(`[github-webhook] Server listening on ${BIND_HOST}:${PORT}`);
   console.log(`[github-webhook] Endpoint: http://localhost:${PORT}/api/github/webhook`);
 });

@@ -37,4 +37,29 @@ function isEmergencyStopFault(parsed, rawMessage) {
     return /emergency/i.test(hay);
 }
 
-module.exports = { parseStatusNotif, isEmergencyStopFault };
+/**
+ * True when the fault matches the cable-theft signature: a temperature error
+ * with the cable disconnected/cut. When the Metrópole Shopping 1 cable was
+ * stolen (2026-05-05), the charger reported
+ *   status=Faulted error=HighTemperature, info=DC OverTemp Connector, vendor_error=29
+ * every 5 minutes — the severed thermistor line reads as over-temperature.
+ * A genuine thermal event matches too; both deserve the urgent group.
+ *
+ * ⚠️ SIGNATURE DRIFT: this owns the URGENTE *WhatsApp* leg. The *FCM push* twin
+ * is `isHighTempFault` in the turbo_station repo
+ * (`next/lib/services/high-temp-critical-push.ts`). The two paths detect the
+ * SAME signal via independent data pipelines on purpose (this reads ocpp.db,
+ * Next.js reads the live webhook) so neither is a single point of failure — but
+ * a change to what counts as a theft-signature fault (e.g. another vendor's
+ * overtemp code) MUST be made in BOTH or the channels disagree. Keep in sync.
+ */
+function isCableTheftSuspectFault(parsed, rawMessage) {
+    const error = (parsed && parsed.error) || '';
+    const info = (parsed && parsed.info) || '';
+    if (/hightemperature/i.test(error)) return true;
+    if (/overtemp/i.test(info)) return true;
+    // Fallback for raw lines the parser couldn't split into fields.
+    return /error=HighTemperature/i.test(rawMessage || '');
+}
+
+module.exports = { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault };

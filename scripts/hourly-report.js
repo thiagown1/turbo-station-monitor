@@ -4,7 +4,7 @@ const { formatForWhatsApp } = require('../whatsapp-formatter/formatter');
 
 // Config
 const API_URL = 'https://logs.ocpp.turbostation.com.br/api/logs/history';
-const TARGET_GROUP = '120363423472541295@g.us';
+const TARGET_GROUP = '120363426100393587@g.us';
 
 async function generateReport() {
     // 1. Buscar erros da última hora

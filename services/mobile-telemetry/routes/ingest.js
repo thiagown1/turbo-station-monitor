@@ -115,9 +115,6 @@ function readBody(req) {
 }
 
 router.post('/', async (req, res) => {
-    // TODO: Re-enable auth once the next mobile build ships with
-    //       TELEMETRY_API_KEY baked in via --dart-define.
-
     try {
         const body = await readBody(req);
 
@@ -132,8 +129,21 @@ router.post('/', async (req, res) => {
             return res.status(400).json({ error: 'Invalid JSON body', detail: parseErr.message });
         }
 
-        if (!Array.isArray(payload.events)) {
+        if (!Array.isArray(payload.events) || payload.events.length > 250) {
             return res.status(400).json({ error: 'Invalid payload: events array required' });
+        }
+        const shortFields = ['session_id', 'device_id', 'app_version', 'platform', 'user_id', 'brand_id'];
+        if (shortFields.some((key) => payload[key] != null &&
+            (typeof payload[key] !== 'string' || payload[key].length > 200))) {
+            return res.status(400).json({ error: 'Invalid payload metadata' });
+        }
+        if (!payload.session_id || !payload.device_id || payload.events.some((event) =>
+            !event || typeof event !== 'object' || Array.isArray(event) ||
+            (event.event_type != null &&
+                (typeof event.event_type !== 'string' || event.event_type.length > 100)) ||
+            (event.data != null &&
+                (typeof event.data !== 'object' || Array.isArray(event.data))))) {
+            return res.status(400).json({ error: 'Invalid telemetry event' });
         }
 
         const receivedAt = Date.now();

@@ -76,6 +76,21 @@ pm2 logs mobile-telemetry       # Tail logs
 pm2 monit                       # Real-time dashboard
 ```
 
+## Automatic production deploy
+
+A signed GitHub `push` webhook for `main` starts `scripts/deploy-monitor.js` as
+an independent worker. The worker waits for the exact commit's `CI` push run to
+finish successfully, fetches and fast-forwards the production checkout, runs a
+clean dependency install, restarts only affected PM2 services, verifies their
+health endpoints, and records the deployed SHA.
+
+The production checkout must be clean. Local source edits make the deploy fail
+closed so operational hotfixes cannot be overwritten silently. See
+[`docs/AUTO_DEPLOY.md`](docs/AUTO_DEPLOY.md) for recovery and verification.
+
+`deploy-autowatch` is unrelated: it watches OCPP server versions after an OCPP
+production release; it does not publish this repository.
+
 ## Maintenance
 
 ```bash

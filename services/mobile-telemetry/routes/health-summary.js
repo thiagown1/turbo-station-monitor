@@ -58,7 +58,11 @@ router.get('/', (req, res) => {
     res.json({ freshnessMs: freshness && freshness.m != null ? freshness.m : null, windowMinutes, statusMix, endpoints });
   } catch (err) {
     console.error('[health-summary] query failed:', err.message);
-    res.status(500).json({ error: 'query failed' });
+    // vercel.db can exist (readonly open succeeds) before vercel-drain has
+    // created its schema yet — a fresh deploy race, not a real query bug.
+    // Same "not ready" case as the connection failing outright: 503, not 500.
+    const notReady = /no such table/i.test(err.message);
+    res.status(notReady ? 503 : 500).json({ error: notReady ? 'vercel.db unavailable' : 'query failed' });
   }
 });
 

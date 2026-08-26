@@ -13,6 +13,7 @@ const {
     isCausalBackendError,
     parseStatusNotif,
     isEmergencyStopFault,
+    getLatestOcppIngestTimestamp,
 } = require('../services/alert-engine');
 
 let failures = 0;
@@ -85,6 +86,23 @@ check('flags e-stop press so it is excluded from fault alerts', () => {
 check('a real OtherError fault is NOT treated as e-stop', () => {
     const msg = 'connector=2 status=Faulted error=OtherError, info=GQ_DIN_RECEIVED_CST';
     assert.strictEqual(isEmergencyStopFault(parseStatusNotif(msg), msg), false);
+});
+
+check('ingest watchdog prefers raw OCPP receipt time and falls back to legacy events', () => {
+    const preferred = {
+        prepare(sql) {
+            return { get: () => ({ max_ts: sql.includes('ocpp_raw') ? 200 : 100 }) };
+        },
+    };
+    assert.strictEqual(getLatestOcppIngestTimestamp(preferred), 200);
+
+    const legacy = {
+        prepare(sql) {
+            if (sql.includes('ocpp_raw')) throw new Error('no such table');
+            return { get: () => ({ max_ts: '100' }) };
+        },
+    };
+    assert.strictEqual(getLatestOcppIngestTimestamp(legacy), 100);
 });
 
 console.log('');

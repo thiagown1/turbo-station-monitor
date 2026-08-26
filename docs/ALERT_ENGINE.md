@@ -9,9 +9,10 @@ The Alert Engine is a proactive monitoring system that queries the unified SQLit
 ### Detection Queries
 
 1. **Vercel 5xx Errors** (`vercel_5xx`)
-   - Detects HTTP 500-599 errors on OCPP webhook endpoints
-   - Groups by endpoint to avoid spam
-   - Severity: **critical**
+   - Detects HTTP 500-599 errors on backend endpoints
+   - Strips query strings before grouping and applying the 1-hour debounce
+   - Ordinary backend errors remain **critical** from the first occurrence
+   - Read-only `/api/ocpp-logs/*` failures require ≥3 occurrences in 5 minutes and are **warning** severity
 
 2. **Vercel Timeouts** (`vercel_timeout`)
    - Detects requests with NULL/0 status and duration >10s
@@ -49,7 +50,8 @@ CREATE TABLE alerts (
   ocpp_log_ids TEXT,      -- JSON array of related OCPP log IDs
   vercel_log_ids TEXT,    -- JSON array of related Vercel log IDs
   sent BOOLEAN DEFAULT 0,
-  sent_at INTEGER
+  sent_at INTEGER,
+  wa_message_id TEXT      -- upstream WhatsApp message id (for late delivery confirmation)
 );
 ```
 
@@ -57,6 +59,17 @@ This enables:
 - Alert history and auditing
 - Traceability back to raw logs
 - Future dashboard/analytics
+
+### Endpoint-specific 5xx policy
+
+Backend 5xx events are normalized without query strings before grouping.
+Charging/payment routes remain critical on the first error. Observability reads
+use dedicated warning policies: OCPP log reads require three errors in five
+minutes, while the mobile-telemetry dashboard routes (`heatmap-data`,
+`online-users`, and `recent-locations`) are grouped into one
+`/api/monitor/mobile-telemetry` warning. This preserves detection without
+turning one blocked upstream service into multiple whole-backend critical
+alerts.
 
 ## WhatsApp Integration
 
@@ -74,10 +87,72 @@ Alerts are sent to the OCPP Alerts WhatsApp group using the existing alert forma
 ⚡ Ação: Verificar logs Vercel e backend
 ```
 
+### Delivery confirmation + retry (added 2026-07-18)
+
+A 2xx from the support API only means the message was **queued** — Evolution
+fires async and the message's `delivery_status` can still flip to `failed`
+(e.g. WhatsApp instance disconnected). The engine therefore:
+
+1. POSTs the message, keeps the returned message id (`wa_message_id`).
+2. Polls `GET .../conversations/{conv}/messages?limit=50` for that id's
+   `delivery_status` with a short backoff (default `500/1000/2000/3000` ms,
+   tunable via `WHATSAPP_DELIVERY_POLL_MS`).
+3. Marks the alert `sent=1` only on a confirmed `sent`.
+4. Unconfirmed/failed alerts stay `sent=0`; each detection tick retries
+   alerts younger than 30 min (max 5 per tick). A retried alert with a
+   recorded `wa_message_id` is late-confirmed first, so a slow-but-successful
+   delivery never produces a duplicate message in the group.
+
+This mirrors `confirmDelivery` in the Next.js `whatsapp-notifier` and closes
+the silent-loss window found in the 2026-07-16 cable-theft investigation.
+
+### Cable-theft alert: burst-then-silence (added 2026-07-18)
+
+A cut DC cable severs the connector's temperature sensor, so the charger
+reports `Faulted / HighTemperature / DC OverTemp Connector` (recognized by
+`isCableTheftSuspectFault`) and **keeps re-reporting it every ~5 min for as
+long as it stays broken** — Metrópole Shopping 3 did so from 03:53 to 18:51 BRT
+(15h). Under the normal escalating backoff that re-paged the "Turbo Station +
+URGENTE" group hourly, then every 6h. Once the team knows the cable is stolen,
+those repeats are pure noise.
+
+Cable-theft faults are therefore taken **off the escalating backoff** and gated
+by `shouldAlertCableTheft(chargerId, connectorId)` instead:
+
+1. **Fresh incident** (no prior record, OR the connector has recovered since the
+   last alert) → send a **burst** of `CABLE_THEFT_BURST_COUNT` messages
+   (default 5) `CABLE_THEFT_BURST_INTERVAL_MS` apart (default 10s) to the
+   URGENTE group. Each is numbered (`Aviso N/5`); the last states no further
+   alerts fire until the station normalizes. The burst is fire-and-forget so
+   its spacing never blocks the detection tick.
+2. **Ongoing incident** (still faulted, no recovery) → **silent**. No re-burst,
+   no re-ping.
+3. **Recovery** = the connector reports an OPERATIONAL status again
+   (`hasConnectorRecoveredSince`, per-connector so a healthy connector 1 never
+   masks a stolen connector 2). A later theft after a recovery is a fresh
+   incident and bursts again.
+
+Incident state persists in `history/cable_theft_incidents.json` (survives
+restarts). A record is pruned only after **both** 30 days have passed since it
+was last touched (`lastSeenAt`, refreshed on every suppressed tick) **and** the
+connector has actually recovered. An incident that is still open therefore never
+ages out — expiring it would make the next tick read the same unresolved theft
+as a brand-new one and re-burst. That is exactly what happened on
+**2026-08-18 02:00 UTC**: Metrópole 3 connector 2 had been faulted since 18/07,
+the record hit the flat 30-day GC, and the URGENTE group was re-paged for a
+theft the team had already handled. Env overrides:
+`ALERT_CABLE_THEFT_BURST_COUNT`, `ALERT_CABLE_THEFT_BURST_INTERVAL_MS`.
+
+The critical **FCM push** for the same fault is a separate, independent path in
+the Next.js repo (`high-temp-critical-push.ts`) — the VPS cannot send FCM. The
+two detect the same signal via independent pipelines on purpose (see the
+drift-warning comments on `isCableTheftSuspectFault` / `isHighTempFault`).
+
 ## Performance
 
 - **Query window:** Last 5 minutes (300,000ms)
 - **Query efficiency:** Uses indexes on `timestamp`, `status_code`, `endpoint`
+- **Grouping key:** Normalized route pathname (query parameters do not create new alert keys)
 - **Correlation window:** ±30 seconds
 - **Execution:** ~50-200ms per detection run
 - **PM2 schedule:** Every 2 minutes via `cron_restart`

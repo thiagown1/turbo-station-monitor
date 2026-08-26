@@ -44,7 +44,8 @@ class StateTracker {
                 consecutiveErrors: 0,
                 needsRestart: false,
                 restartReason: '',
-                lastStatusChange: new Date().toISOString()
+                lastStatusChange: new Date().toISOString(),
+                lastRecoveryAt: null
             };
         }
 
@@ -67,38 +68,41 @@ class StateTracker {
         
         // Check if charger has recovered
         const now = Date.now();
+        let recovered = false;
+        let reason = '';
         
         // Recovery signs:
         // 1. Recent heartbeat (<2min)
         if (charger.lastHeartbeat) {
             const timeSinceHeartbeat = now - new Date(charger.lastHeartbeat).getTime();
             if (timeSinceHeartbeat < 2 * 60 * 1000) {
-                console.log(`✅ Charger ${chargerId} recovered: recent heartbeat`);
-                charger.needsRestart = false;
-                charger.restartReason = '';
-                charger.consecutiveErrors = 0;
-                return;
+                recovered = true;
+                reason = 'recent heartbeat';
             }
         }
         
         // 2. Recent MeterValues (<2min)
-        if (charger.lastMeterValue) {
+        if (!recovered && charger.lastMeterValue) {
             const timeSinceMeterValue = now - new Date(charger.lastMeterValue).getTime();
             if (timeSinceMeterValue < 2 * 60 * 1000) {
-                console.log(`✅ Charger ${chargerId} recovered: recent MeterValues`);
-                charger.needsRestart = false;
-                charger.restartReason = '';
-                charger.consecutiveErrors = 0;
-                return;
+                recovered = true;
+                reason = 'recent MeterValues';
             }
         }
         
         // 3. Status is healthy (Available or Charging) and no errors
-        if ((charger.status === 'Available' || charger.status === 'Charging') && charger.consecutiveErrors === 0) {
-            console.log(`✅ Charger ${chargerId} recovered: healthy status (${charger.status})`);
+        if (!recovered && (charger.status === 'Available' || charger.status === 'Charging') && charger.consecutiveErrors === 0) {
+            recovered = true;
+            reason = `healthy status (${charger.status})`;
+        }
+
+        if (recovered) {
             charger.needsRestart = false;
             charger.restartReason = '';
-            return;
+            charger.consecutiveErrors = 0;
+            // Record recovery timestamp — prevents checkRestartCondition from re-flagging immediately
+            charger.lastRecoveryAt = new Date().toISOString();
+            console.log(`✅ Charger ${chargerId} recovered: ${reason}`);
         }
     }
 
@@ -107,6 +111,14 @@ class StateTracker {
         
         // Already flagged (and not recovered in checkChargerHealth)
         if (charger.needsRestart) return;
+
+        // COOLDOWN: If charger recovered recently, don't re-flag for 5 minutes
+        // This prevents the flip-flop cycle where recovery and re-flagging happen in the same tick
+        const RECOVERY_COOLDOWN_MS = 5 * 60 * 1000;
+        if (charger.lastRecoveryAt) {
+            const timeSinceRecovery = Date.now() - new Date(charger.lastRecoveryAt).getTime();
+            if (timeSinceRecovery < RECOVERY_COOLDOWN_MS) return;
+        }
 
         // Condition 1: 3+ consecutive errors
         if (charger.consecutiveErrors >= 3) {
@@ -128,7 +140,7 @@ class StateTracker {
             if (timeSinceHeartbeat > 5 * 60 * 1000) {
                 // Check if there's an active transaction
                 if (charger.activeTransaction) {
-                    console.log(`⏸️ Heartbeat timeout for ${chargerId}, but transaction active: ${charger.activeTransaction} - NOT flagging for restart`);
+                    // Silently skip — don't log to avoid spam
                     return;
                 }
                 
@@ -136,14 +148,14 @@ class StateTracker {
                 if (charger.lastMeterValue) {
                     const timeSinceMeterValue = Date.now() - new Date(charger.lastMeterValue).getTime();
                     if (timeSinceMeterValue < 5 * 60 * 1000) {
-                        // Charger is alive via MeterValues, silently skip (no log to avoid spam)
+                        // Charger is alive via MeterValues, silently skip
                         return;
                     }
                 }
                 
                 charger.needsRestart = true;
                 charger.restartReason = 'Heartbeat timeout (>5min)';
-                console.log(`⚠️ Heartbeat timeout for ${chargerId}, no active transaction and no recent MeterValues - flagging for restart`);
+                console.log(`⚠️ Heartbeat timeout for ${chargerId} - flagging for restart`);
                 return;
             }
         }

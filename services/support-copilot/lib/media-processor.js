@@ -19,9 +19,7 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
-const { LOG_TAG } = require('./constants');
-
-const MEDIA_DIR = path.join(__dirname, '..', '..', '..', 'db', 'media');
+const { LOG_TAG, MEDIA_DIR } = require('./constants');
 // Vision model for image description (OpenAI, same key as Whisper). Override
 // with SUPPORT_MEDIA_VISION_MODEL. gpt-4o-mini is cheap and reads error
 // screenshots / connector photos well enough for triage.
