@@ -15,7 +15,7 @@ const test = require('node:test');
 
 process.env.BLOG_API_KEY = process.env.BLOG_API_KEY || 'test-key';
 
-const { sanitizeInternalLinks, VALID_STATIC_ROUTES } = require('../services/blog-generator.js');
+const { sanitizeInternalLinks, VALID_STATIC_ROUTES, runRevise } = require('../services/blog-generator.js');
 
 const related = [
     { slug: 'recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma', title: 'Recarga DC vs AC' },
@@ -114,4 +114,52 @@ test('the editor is no longer told to police internal routes', () => {
         /já foi validado por código/.test(editorPrompt),
         'o editor deve ser informado de que os links ja foram validados por codigo',
     );
+});
+
+test('revision sanitizes internal links before editor review and storage', async () => {
+    const revisedMarkdown = `---
+title: "Post revisado"
+description: "Uma descrição suficientemente clara para o teste"
+category: "Guias"
+tags: ["recarga"]
+---
+Veja o [post publicado](/blog/publicado), o [contato inventado](/contato) e o [post inexistente](/blog/fantasma).`;
+    let editorInput = '';
+    let savedPost = null;
+
+    const request = async (method, route, body) => {
+        if (method === 'GET' && route === '/config') return { guidelines: '' };
+        if (method === 'GET' && route === '/admin/posts/post-atual') {
+            return {
+                title: 'Post atual', body: 'corpo antigo', date: '2026-08-22',
+                description: 'descrição', category: 'Guias', tags: [], status: 'draft', draft: true,
+            };
+        }
+        if (method === 'GET' && route === '/posts') {
+            return { posts: [{ slug: 'publicado', title: 'Post publicado' }] };
+        }
+        if (method === 'POST' && route === '/posts') {
+            savedPost = body;
+            return { ok: true };
+        }
+        throw new Error(`unexpected request ${method} ${route}`);
+    };
+    const ask = (prompt) => {
+        if (prompt.includes('Você é editor-chefe')) {
+            editorInput = prompt;
+            return JSON.stringify({ approved: true, reasons: [], fixes: [] });
+        }
+        return revisedMarkdown;
+    };
+
+    await runRevise('post-atual', { request, ask, record: async () => {} });
+
+    assert.ok(editorInput.includes('](/blog/publicado)'), 'published link reaches the editor');
+    assert.ok(!editorInput.includes('](/contato)'), 'invalid static route is removed before review');
+    assert.ok(!editorInput.includes('](/blog/fantasma)'), 'unpublished slug is removed before review');
+    assert.ok(savedPost.body.includes('](/blog/publicado)'));
+    assert.ok(!savedPost.body.includes('](/contato)'));
+    assert.ok(!savedPost.body.includes('](/blog/fantasma)'));
+    assert.match(savedPost.body, /contato inventado/);
+    assert.match(savedPost.body, /post inexistente/);
 });

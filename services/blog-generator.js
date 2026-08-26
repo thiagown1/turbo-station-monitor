@@ -401,21 +401,28 @@ async function runHumanize(slug) {
   log(`humanized "${slug}"`);
 }
 
-async function runRevise(slug) {
-  const cfg = await api('GET', '/config');
-  const post = await api('GET', `/admin/posts/${encodeURIComponent(slug)}`);
+async function runRevise(slug, deps = {}) {
+  const request = deps.request || api;
+  const ask = deps.ask || claude;
+  const record = deps.record || recordRun;
+  const cfg = await request('GET', '/config');
+  const post = await request('GET', `/admin/posts/${encodeURIComponent(slug)}`);
   log(`revising "${slug}"${post.revisionFeedback ? ' with operator feedback' : ''}`);
 
-  let markdown = claude(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
-  if (!markdown.startsWith('---')) markdown = claude(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
+  let markdown = ask(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
+  if (!markdown.startsWith('---')) markdown = ask(revisePrompt(post, post.revisionFeedback || '', cfg.guidelines));
   if (!markdown.startsWith('---')) {
     log('revise: writer output invalid; leaving post as draft');
-    await api('POST', `/posts/${encodeURIComponent(slug)}/unpublish`).catch(() => {});
+    await request('POST', `/posts/${encodeURIComponent(slug)}/unpublish`).catch(() => {});
     return;
   }
-  const verdict = extractJson(claude(editorPrompt(post.title, markdown, cfg.guidelines)));
+  const related = await request('GET', '/posts')
+    .then((result) => (result.posts || []).map((item) => ({ slug: item.slug, title: item.title })))
+    .catch(() => []);
+  markdown = sanitizeInternalLinks(markdown, related);
+  const verdict = extractJson(ask(editorPrompt(post.title, markdown, cfg.guidelines)));
   const { data: fm, body } = parseFrontmatter(markdown);
-  await api('POST', '/posts', {
+  await request('POST', '/posts', {
     slug, // keep the original slug so the revision replaces it in place
     title: (fm.title || post.title).toString(),
     description: (fm.description || post.description || '').toString(),
@@ -431,7 +438,7 @@ async function runRevise(slug) {
     generationModel: 'claude -p (revise)',
     generationSources: post.generationSources || [],
   });
-  await recordRun('revised', `editor_approved=${verdict?.approved}`, slug);
+  await record('revised', `editor_approved=${verdict?.approved}`, slug);
   log(`revised "${slug}" (editor approved=${verdict?.approved})`);
 }
 
@@ -650,6 +657,7 @@ module.exports = {
   SEED_TOPICS,
   sanitizeInternalLinks,
   VALID_STATIC_ROUTES,
+  runRevise,
 };
 
 if (require.main === module) {

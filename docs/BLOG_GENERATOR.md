@@ -57,6 +57,10 @@ Whether `/blog/<slug>` exists is a **fact**, not a judgement call, so
 editor. Every internal link that reaches the editor is therefore valid by
 construction, and the editor prompt explicitly says so.
 
+The operator-triggered `--revise` path loads the published-slug set and applies
+the same sanitiser before both editor review and storage. If that lookup fails,
+blog links fail closed and are unwrapped instead of being trusted.
+
 It used to police this too, and it was worse at it: the writer prompt tells the
 model to link 1-2 published posts, the editor prompt rejected "rotas
 inexistentes (as únicas válidas são /, /blog e /#contato)", and the two
