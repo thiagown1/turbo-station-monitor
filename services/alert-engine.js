@@ -92,18 +92,33 @@ function normalizeEndpoint(endpoint) {
     return raw.split(/[?#]/, 1)[0] || null;
 }
 
+function getVercel5xxGroupKey(endpoint) {
+    if (/^\/api\/monitor\/(?:heatmap-data|online-users|recent-locations)$/.test(endpoint || '')) {
+        return '/api/monitor/mobile-telemetry';
+    }
+    return endpoint;
+}
+
 function groupByNormalizedEndpoint(rows) {
     return rows.reduce((groups, row) => {
-        const endpoint = normalizeEndpoint(row.endpoint);
-        if (!endpoint || endpoint === 'null') return groups;
-        if (!groups[endpoint]) groups[endpoint] = [];
-        groups[endpoint].push(row);
+        const normalized = normalizeEndpoint(row.endpoint);
+        if (!normalized || normalized === 'null') return groups;
+        const groupKey = getVercel5xxGroupKey(normalized);
+        if (!groups[groupKey]) groups[groupKey] = [];
+        groups[groupKey].push(row);
         return groups;
     }, {});
 }
 
 /** Observability reads are useful warnings, but not one-message-per-error incidents. */
 function getVercel5xxAlertPolicy(endpoint, count) {
+    if (endpoint === '/api/monitor/mobile-telemetry') {
+        return {
+            shouldAlert: true,
+            severity: 'warning',
+            title: 'Instabilidade na telemetria móvel',
+        };
+    }
     const isLogsRead = /^\/api\/ocpp-logs(?:-dev)?(?:\/|$)/.test(endpoint || '');
     if (isLogsRead) {
         return {

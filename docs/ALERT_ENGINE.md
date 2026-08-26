@@ -60,6 +60,17 @@ This enables:
 - Traceability back to raw logs
 - Future dashboard/analytics
 
+### Endpoint-specific 5xx policy
+
+Backend 5xx events are normalized without query strings before grouping.
+Charging/payment routes remain critical on the first error. Observability reads
+use dedicated warning policies: OCPP log reads require three errors in five
+minutes, while the mobile-telemetry dashboard routes (`heatmap-data`,
+`online-users`, and `recent-locations`) are grouped into one
+`/api/monitor/mobile-telemetry` warning. This preserves detection without
+turning one blocked upstream service into multiple whole-backend critical
+alerts.
+
 ## WhatsApp Integration
 
 Alerts are sent to the OCPP Alerts WhatsApp group using the existing alert formatter pattern:

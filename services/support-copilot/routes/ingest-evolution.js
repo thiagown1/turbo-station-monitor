@@ -42,6 +42,11 @@ const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
 const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const {
+  handleFinancialApprovalReply,
+  sendFinancialApprovalAcknowledgement,
+  processFinancialApprovalWork,
+} = require('../lib/financial-approval');
 
 const router = Router();
 // Ensure media directory exists
@@ -874,6 +879,43 @@ router.post('/', async (req, res) => {
       tags: updatedConv.tags_json ? JSON.parse(updatedConv.tags_json) : [],
     } : null,
   });
+
+  // Personal financial confirmations use an exact-code protocol and are
+  // consumed before generic Copilot/media paths. This prevents free-form,
+  // unauthorized, expired or duplicate replies from reaching a broader agent.
+  if (direction === 'inbound') {
+    const financialDecision = handleFinancialApprovalReply({
+      messageId: msgId,
+      externalMessageId,
+      conversationId,
+      brandId,
+      instance,
+      senderId: normalizedPhone,
+      body,
+      quotedMessageId: whatsappContext.quotedMessageId,
+    });
+    if (financialDecision.handled) {
+      if (financialDecision.confirmed) void processFinancialApprovalWork();
+      if (!financialDecision.silent && financialDecision.reply) {
+        void sendFinancialApprovalAcknowledgement({
+          conversationId,
+          brandId,
+          instance,
+          senderId: normalizedPhone,
+        }, financialDecision.reply).catch(() => {
+          console.warn(`${LOG_TAG} financial approval acknowledgement failed`);
+        });
+      }
+      return res.status(201).json({
+        id: msgId,
+        conversationId,
+        created,
+        duplicate: false,
+        source: 'evolution',
+        financialApproval: true,
+      });
+    }
+  }
 
   // NOTE: We no longer inject every message into the agent session here.
   // The incremental prompt system in generateSuggestion() handles sending

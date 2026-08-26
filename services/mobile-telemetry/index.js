@@ -84,6 +84,7 @@ if (require.main === module) {
     process.on('SIGTERM', () => {
         console.log(`${LOG_TAG} SIGTERM received, closing server...`);
         server.close(() => {
+            require('./lib/heatmap-query-runner').heatmapQueryRunner.close();
             db.close();
             console.log(`${LOG_TAG} Server closed gracefully`);
             process.exit(0);
