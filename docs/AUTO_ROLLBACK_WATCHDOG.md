@@ -91,6 +91,9 @@ receive a valid confirmation.
 ## Loop and false-positive protections
 
 - Safe default and unknown configuration: `shadow`.
+- Shadow recommendations remain observable even when action-only candidate or
+  reversibility evidence is absent; those readiness gaps are reported as
+  blockers and can never authorize an action.
 - Hard-stop file overrides every other setting.
 - One rollback attempt per production release SHA.
 - The attempt is durably consumed before the Vercel call; a crash or ambiguous

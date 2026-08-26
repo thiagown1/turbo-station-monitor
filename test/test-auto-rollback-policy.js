@@ -20,7 +20,11 @@ const {
   validateApprovalConfirmation,
   consumeApprovalProposal,
 } = require('../services/lib/auto-rollback-policy');
-const { evaluate, alertBlockedOnce } = require('../services/auto-rollback-watchdog');
+const {
+  evaluate,
+  alertBlockedOnce,
+  readinessBlocksBeforeAction,
+} = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
 const PREV_SHA = '2222222222222222222222222222222222222222';
@@ -156,6 +160,26 @@ test('a catastrophic route requires its own clean pre-cutover baseline before an
   assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE);
   assert.equal(result.action, ACTION.ALERT_INVESTIGATE);
   assert.match(result.blockers.join(' '), /same-route baseline/i);
+});
+
+test('same-route baseline requires successful observations, not merely non-5xx responses', () => {
+  const result = assessRollback(fullContext({
+    rolloutPhase: ROLLOUT_PHASE.CATASTROPHIC_AUTO,
+    baseline: [metric('/api/version', { total: 2, c5xx: 0, success: 0 })],
+  }));
+  assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE);
+  assert.equal(result.action, ACTION.ALERT_INVESTIGATE);
+  assert.match(result.blockers.join(' '), /same-route baseline/i);
+});
+
+test('missing action readiness never suppresses an inert shadow report', () => {
+  const missingReadiness = {
+    selection: { target: null, reason: 'no verified candidate' },
+    changeSafety: {},
+  };
+  assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.SHADOW, missingReadiness), false);
+  assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.APPROVAL_REQUIRED, missingReadiness), true);
+  assert.equal(readinessBlocksBeforeAction(ROLLOUT_PHASE.CATASTROPHIC_AUTO, missingReadiness), true);
 });
 
 test('post-deploy evaluation excludes failures recorded before the cutover', () => {

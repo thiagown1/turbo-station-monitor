@@ -509,6 +509,11 @@ function rollbackIsReversible(readiness) {
   return safety.noIrreversibleActivation === true && safety.noMigration === true && safety.noRuntimeFlagChange === true;
 }
 
+function readinessBlocksBeforeAction(rolloutPhase, readiness = {}) {
+  if (normalizeRolloutPhase(rolloutPhase) === ROLLOUT_PHASE.SHADOW) return false;
+  return !readiness.selection?.target || !rollbackIsReversible(readiness);
+}
+
 async function alertBlockedOnce(state, ev, detail, deps = {}) {
   const send = deps.send || sendWhatsApp;
   const persist = deps.persist || saveState;
@@ -590,7 +595,7 @@ async function tick() {
     candidateReason: readiness.selection.reason, killSwitchSource: readiness.ks.source,
   });
 
-  if (!readiness.selection.target || !rollbackIsReversible(readiness)) {
+  if (readinessBlocksBeforeAction(ROLLBACK_ROLLOUT_PHASE, readiness)) {
     const detail = !readiness.selection.target
       ? `candidato anterior não verificável: ${readiness.selection.reason}`
       : 'release sem atestado verificável de ausência de migração, flag ou ativação irreversível';
@@ -749,4 +754,5 @@ if (require.main === module) {
 module.exports = {
   evaluate,
   alertBlockedOnce,
+  readinessBlocksBeforeAction,
 };

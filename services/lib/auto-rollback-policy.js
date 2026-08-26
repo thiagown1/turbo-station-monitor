@@ -142,8 +142,8 @@ function directEligibilityBlockers(input, catastrophicMetric, attributionBlocker
 
 function sameRouteBaselineBlocker(input, catastrophicMetric) {
   const baseline = metricFor(input.baseline, normalizeEndpoint(catastrophicMetric && catastrophicMetric.endpoint));
-  if (!baseline || Number(baseline.total || 0) < 2 || Number(baseline.c5xx || 0) !== 0) {
-    return 'same-route baseline lacks at least two clean pre-cutover observations';
+  if (!baseline || Number(baseline.success || 0) < 2 || Number(baseline.c5xx || 0) !== 0) {
+    return 'same-route baseline lacks at least two successful pre-cutover observations';
   }
   return null;
 }
