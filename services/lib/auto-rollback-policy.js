@@ -151,10 +151,16 @@ function sameRouteBaselineBlocker(input, catastrophicMetric) {
 function assessRollback(input = {}) {
   const post = input.post || [];
   const baselineSummary = aggregateMetrics(input.baseline || []);
-  const aggregate = input.aggregate || aggregateMetrics(post);
   const phase = normalizeRolloutPhase(input.rolloutPhase);
   const blockers = deployAttributionBlockers(input, baselineSummary);
   const reasons = [];
+  const routineRows = post.filter((row) => !classifyEndpoint(row.endpoint).critical);
+  const routineSummary = aggregateMetrics(routineRows);
+  const routineDistinct5xxEndpoints = new Set(
+    routineRows
+      .filter((row) => Number(row.c5xx || 0) > 0)
+      .map((row) => normalizeEndpoint(row.endpoint)),
+  ).size;
 
   const catastrophic = post.find((row) => {
     const cls = classifyEndpoint(row.endpoint);
@@ -172,10 +178,10 @@ function assessRollback(input = {}) {
       safeRatio(failures, Number(row.total || 0)) >= CRITICAL_ROUTE_MIN_RATIO;
   });
 
-  const routineAggregate = Number(aggregate.total || 0) >= ROUTINE_MIN_TOTAL &&
-    Number(aggregate.c5xx || 0) >= ROUTINE_MIN_5XX &&
-    safeRatio(Number(aggregate.c5xx || 0), Number(aggregate.total || 0)) >= ROUTINE_MIN_RATIO &&
-    Number(aggregate.distinct5xxEndpoints || 0) >= ROUTINE_MIN_ENDPOINTS;
+  const routineAggregate = routineSummary.total >= ROUTINE_MIN_TOTAL &&
+    routineSummary.c5xx >= ROUTINE_MIN_5XX &&
+    safeRatio(routineSummary.c5xx, routineSummary.total) >= ROUTINE_MIN_RATIO &&
+    routineDistinct5xxEndpoints >= ROUTINE_MIN_ENDPOINTS;
 
   if (ambiguousCritical) {
     const cls = classifyEndpoint(ambiguousCritical.endpoint);
@@ -207,6 +213,20 @@ function assessRollback(input = {}) {
     }
     const directBlockers = directEligibilityBlockers(input, catastrophic, attributionBlockers);
     const eligible = directBlockers.length === 0;
+    const guards = input.guardrails || {};
+    const nonOverridableBlockers = [];
+    if (guards.alreadyActedForRelease === true) nonOverridableBlockers.push('one rollback was already attempted for this release');
+    if (guards.cooldownElapsed === false) nonOverridableBlockers.push('rollback cooldown has not elapsed');
+    if (phase !== ROLLOUT_PHASE.SHADOW && nonOverridableBlockers.length > 0) {
+      return {
+        recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
+        failureClass: 'rollback_guardrail_blocked',
+        action: ACTION.ALERT_INVESTIGATE,
+        reasons,
+        blockers: nonOverridableBlockers,
+        directEligibility: { eligible: false, blockers: directBlockers },
+      };
+    }
     const action = phase === ROLLOUT_PHASE.SHADOW
       ? ACTION.SHADOW_REPORT
       : phase === ROLLOUT_PHASE.CATASTROPHIC_AUTO && eligible
@@ -223,7 +243,7 @@ function assessRollback(input = {}) {
   }
 
   if (routineAggregate) {
-    reasons.push(`aggregate 5xx threshold crossed: ${aggregate.c5xx}/${aggregate.total} across ${aggregate.distinct5xxEndpoints} endpoints`);
+    reasons.push(`routine aggregate 5xx threshold crossed: ${routineSummary.c5xx}/${routineSummary.total} across ${routineDistinct5xxEndpoints} endpoints`);
     if (blockers.length > 0) {
       return {
         recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
@@ -307,6 +327,7 @@ module.exports = {
   RECOMMENDATION,
   ACTION,
   classifyEndpoint,
+  normalizeEndpoint,
   normalizeRolloutPhase,
   assessRollback,
   createApprovalProposal,

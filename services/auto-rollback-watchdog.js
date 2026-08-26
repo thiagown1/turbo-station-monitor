@@ -47,6 +47,7 @@ const {
   ROLLOUT_PHASE,
   RECOMMENDATION,
   ACTION,
+  normalizeEndpoint,
   normalizeRolloutPhase,
   assessRollback,
   createApprovalProposal,
@@ -189,6 +190,44 @@ async function currentSha() {
 }
 
 // ─── Metrics from vercel.db (read-only) ──────────────────────────────
+function normalizeRouteRows(rows) {
+  const byRoute = new Map();
+  for (const row of rows || []) {
+    const endpoint = normalizeEndpoint(row.endpoint);
+    if (!endpoint) continue;
+    const merged = byRoute.get(endpoint) || {
+      endpoint, total: 0, c5xx: 0, success: 0, first5xxMs: null, last5xxMs: null,
+    };
+    merged.total += Number(row.total || 0);
+    merged.c5xx += Number(row.c5xx || 0);
+    merged.success += Number(row.success || 0);
+    if (row.first5xxMs != null) {
+      merged.first5xxMs = merged.first5xxMs == null
+        ? Number(row.first5xxMs)
+        : Math.min(merged.first5xxMs, Number(row.first5xxMs));
+    }
+    if (row.last5xxMs != null) {
+      merged.last5xxMs = merged.last5xxMs == null
+        ? Number(row.last5xxMs)
+        : Math.max(merged.last5xxMs, Number(row.last5xxMs));
+    }
+    byRoute.set(endpoint, merged);
+  }
+  return [...byRoute.values()];
+}
+
+function normalizeEndpointCounts(rows) {
+  const byRoute = new Map();
+  for (const row of rows || []) {
+    const endpoint = normalizeEndpoint(row.endpoint);
+    if (!endpoint) continue;
+    byRoute.set(endpoint, (byRoute.get(endpoint) || 0) + Number(row.c || 0));
+  }
+  return [...byRoute.entries()]
+    .map(([endpoint, c]) => ({ endpoint, c }))
+    .sort((a, b) => b.c - a.c);
+}
+
 function queryWindow(db, fromMs, toMs) {
   const total = db.prepare(
     'SELECT COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code IS NOT NULL'
@@ -196,7 +235,7 @@ function queryWindow(db, fromMs, toMs) {
   const c5xx = db.prepare(
     'SELECT COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code>=500'
   ).get(fromMs, toMs).c;
-  const endpoints = db.prepare(
+  const rawEndpoints = db.prepare(
     'SELECT endpoint, COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code>=500 ' +
     'AND endpoint IS NOT NULL GROUP BY endpoint ORDER BY c DESC'
   ).all(fromMs, toMs);
@@ -205,7 +244,7 @@ function queryWindow(db, fromMs, toMs) {
     "SELECT status_code, COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? " +
     "AND endpoint LIKE '%/api/version%' GROUP BY status_code"
   ).all(fromMs, toMs);
-  const routeRows = db.prepare(
+  const rawRouteRows = db.prepare(
     'SELECT endpoint, COUNT(*) total, ' +
     'SUM(CASE WHEN status_code>=500 THEN 1 ELSE 0 END) c5xx, ' +
     'SUM(CASE WHEN status_code>=200 AND status_code<400 THEN 1 ELSE 0 END) success, ' +
@@ -214,6 +253,8 @@ function queryWindow(db, fromMs, toMs) {
     'FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code IS NOT NULL ' +
     'AND endpoint IS NOT NULL GROUP BY endpoint'
   ).all(fromMs, toMs);
+  const endpoints = normalizeEndpointCounts(rawEndpoints);
+  const routeRows = normalizeRouteRows(rawRouteRows);
   return { total, c5xx, ratio: total ? c5xx / total : 0, endpoints, verRows, routeRows };
 }
 
@@ -594,6 +635,12 @@ async function tick() {
     failureClass: ev.failureClass, action: ev.action, directEligibility: ev.directEligibility,
     candidateReason: readiness.selection.reason, killSwitchSource: readiness.ks.source,
   });
+
+  if (ev.recommendation === RECOMMENDATION.ALERT_INVESTIGATE) {
+    const detail = (ev.blockers || []).join('; ') || 'rollback guardrail requires manual investigation';
+    await alertBlockedOnce(state, ev, detail);
+    return;
+  }
 
   if (readinessBlocksBeforeAction(ROLLBACK_ROLLOUT_PHASE, readiness)) {
     const detail = !readiness.selection.target

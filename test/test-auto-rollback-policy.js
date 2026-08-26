@@ -205,11 +205,9 @@ test('post-deploy evaluation excludes failures recorded before the cutover', () 
   }
 });
 
-test('kill switch, one-per-release, cooldown, and reversible-change gates fail independently', () => {
+test('kill switch and reversible-change gates fail independently', () => {
   const cases = [
     ['kill switch', { guardrails: { killSwitchAllows: false } }],
-    ['already acted', { guardrails: { alreadyActedForRelease: true } }],
-    ['cooldown', { guardrails: { cooldownElapsed: false } }],
     ['migration', { changeSafety: { noMigration: false } }],
     ['runtime flag', { changeSafety: { noRuntimeFlagChange: false } }],
     ['irreversible', { changeSafety: { noIrreversibleActivation: false } }],
@@ -218,6 +216,20 @@ test('kill switch, one-per-release, cooldown, and reversible-change gates fail i
     const result = assessRollback(fullContext({ rolloutPhase: ROLLOUT_PHASE.CATASTROPHIC_AUTO, ...overrides }));
     assert.equal(result.directEligibility.eligible, false, name);
     assert.equal(result.action, ACTION.PROPOSAL_REQUIRED, name);
+  }
+});
+
+test('dedupe and cooldown blockers never offer an unusable approval proposal', () => {
+  for (const [name, guardrails] of [
+    ['already acted', { alreadyActedForRelease: true }],
+    ['cooldown', { cooldownElapsed: false }],
+  ]) {
+    const result = assessRollback(fullContext({
+      rolloutPhase: ROLLOUT_PHASE.CATASTROPHIC_AUTO,
+      guardrails,
+    }));
+    assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE, name);
+    assert.equal(result.action, ACTION.ALERT_INVESTIGATE, name);
   }
 });
 
@@ -263,6 +275,43 @@ test('routine aggregate failures require the larger threshold and never go direc
   assert.equal(result.failureClass, 'aggregate_release_regression');
   assert.equal(result.directEligibility.eligible, false);
   assert.equal(result.action, ACTION.PROPOSAL_REQUIRED);
+});
+
+test('sensitive-route failures cannot be promoted through the routine aggregate', () => {
+  const post = Array.from({ length: 10 }, (_, i) =>
+    metric(`/api/payments/provider-${i}`, { total: 2, c5xx: 1, success: 1 }));
+  const result = assessRollback(fullContext({
+    post,
+    baseline: post.map((row) => metric(row.endpoint, { total: 2, c5xx: 0, success: 2 })),
+    aggregate: { total: 20, c5xx: 10, distinct5xxEndpoints: 10 },
+    rolloutPhase: ROLLOUT_PHASE.APPROVAL_REQUIRED,
+  }));
+  assert.notEqual(result.recommendation, RECOMMENDATION.ROLLBACK_RECOMMENDED);
+  assert.notEqual(result.action, ACTION.PROPOSAL_REQUIRED);
+});
+
+test('evaluation aggregates query variants as one logical route', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE vercel_logs (timestamp INTEGER, endpoint TEXT, status_code INTEGER)');
+  const insert = db.prepare('INSERT INTO vercel_logs (timestamp, endpoint, status_code) VALUES (?, ?, ?)');
+  insert.run(NOW - 120_000, '/api/version?probe=baseline-a', 200);
+  insert.run(NOW - 60_000, '/api/version?probe=baseline-b', 200);
+  insert.run(NOW + 10_000, '/api/version?probe=one', 500);
+  insert.run(NOW + 40_000, '/api/version?probe=two', 500);
+  insert.run(NOW + 70_000, '/api/version?probe=three', 500);
+
+  try {
+    const result = evaluate(db, NOW + 80_000, {
+      newSha: NEW_SHA,
+      prevSha: PREV_SHA,
+      currentSha: NEW_SHA,
+      deployStartMs: NOW,
+    });
+    assert.equal(result.recommendation, RECOMMENDATION.ROLLBACK_RECOMMENDED);
+    assert.equal(result.evidence.distinctEndpoints, 1);
+  } finally {
+    db.close();
+  }
 });
 
 test('small routine error volume stays in observation', () => {
