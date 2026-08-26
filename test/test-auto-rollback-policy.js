@@ -26,6 +26,8 @@ const {
   readinessBlocksBeforeAction,
   pendingConfirmationEvaluation,
   formatApprovalProposal,
+  prepareApprovalProposal,
+  killSwitchAllowsActuation,
 } = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
@@ -174,6 +176,30 @@ test('same-route baseline requires successful observations, not merely non-5xx r
   assert.match(result.blockers.join(' '), /same-route baseline/i);
 });
 
+test('uses a catastrophic canary that has qualifying same-route baseline evidence', () => {
+  const result = assessRollback(fullContext({
+    rolloutPhase: ROLLOUT_PHASE.APPROVAL_REQUIRED,
+    post: [
+      metric('/api/health', { total: 3, c5xx: 3, success: 0 }),
+      metric('/api/version', { total: 3, c5xx: 3, success: 0 }),
+    ],
+    baseline: cleanBaseline('/api/version'),
+  }));
+  assert.equal(result.recommendation, RECOMMENDATION.ROLLBACK_RECOMMENDED);
+  assert.equal(result.action, ACTION.PROPOSAL_REQUIRED);
+  assert.match(result.reasons.join(' '), /\/api\/version/);
+});
+
+test('honors the configured post-cutover attribution window', () => {
+  const result = assessRollback(fullContext({
+    nowMs: NOW,
+    heightenedWindowMs: 15 * 60_000,
+    deploy: { cutoverMs: NOW - 11 * 60_000 },
+  }));
+  assert.equal(result.recommendation, RECOMMENDATION.ROLLBACK_RECOMMENDED);
+  assert.doesNotMatch(result.blockers.join(' '), /outside/i);
+});
+
 test('missing action readiness never suppresses an inert shadow report', () => {
   const missingReadiness = {
     selection: { target: null, reason: 'no verified candidate' },
@@ -219,6 +245,30 @@ test('approval proposal tells the operator the exact action and nonce required b
   assert.match(text, /rbp_visible_contract/);
   assert.match(text, new RegExp(NEW_SHA));
   assert.match(text, new RegExp(PREV_SHA));
+});
+
+test('replacing an expired proposal clears delivery dedupe so new credentials are sent', () => {
+  const state = {
+    newSha: NEW_SHA,
+    prevSha: PREV_SHA,
+    lastShadowAlertSha: NEW_SHA,
+    pendingConfirmation: { proposalId: 'expired' },
+    pendingProposal: {
+      id: 'expired', status: 'pending', releaseSha: NEW_SHA, targetSha: PREV_SHA,
+      expiresAtMs: NOW - 1,
+    },
+  };
+  assert.equal(prepareApprovalProposal(state, { critical: true }, NOW), true);
+  assert.notEqual(state.pendingProposal.id, 'expired');
+  assert.equal(state.pendingConfirmation, null);
+  assert.equal(state.lastShadowAlertSha, null);
+});
+
+test('human-approved actuation still requires the current kill switch', () => {
+  assert.equal(killSwitchAllowsActuation({ ks: { on: true } }), true);
+  assert.equal(killSwitchAllowsActuation({ ks: { on: false } }), false);
+  assert.equal(killSwitchAllowsActuation({ ks: { on: 'firestore-deferred' } }), false);
+  assert.equal(killSwitchAllowsActuation({}), false);
 });
 
 test('post-deploy evaluation excludes failures recorded before the cutover', () => {

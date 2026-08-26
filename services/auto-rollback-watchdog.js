@@ -281,6 +281,7 @@ function evaluate(db, nowMs, state, readiness = {}) {
   const vh = versionHealth(m.verRows);
   const policy = assessRollback({
     nowMs,
+    heightenedWindowMs: HEIGHTENED_WINDOW_MS,
     rolloutPhase: ROLLBACK_ROLLOUT_PHASE,
     deploy: {
       newSha: state.newSha,
@@ -474,6 +475,10 @@ async function rollbackToTarget(state, evalResult, authorization, selectedTarget
   if (!authorization || !['deterministic-policy', 'trusted-human-confirmation'].includes(authorization.kind)) {
     return { acted: false, reason: 'missing trusted rollback authorization' };
   }
+  const currentKillSwitch = await resolveKillSwitch();
+  if (currentKillSwitch.on !== true) {
+    return { acted: false, reason: 'kill switch is not currently enabled' };
+  }
   if (authorization.kind === 'deterministic-policy' &&
       (ROLLBACK_ROLLOUT_PHASE !== ROLLOUT_PHASE.CATASTROPHIC_AUTO || !DIRECT_ROLLBACK_ENABLED ||
        evalResult.action !== ACTION.DIRECT_ROLLBACK_PERMITTED)) {
@@ -553,6 +558,30 @@ function rollbackIsReversible(readiness) {
 function readinessBlocksBeforeAction(rolloutPhase, readiness = {}) {
   if (normalizeRolloutPhase(rolloutPhase) === ROLLOUT_PHASE.SHADOW) return false;
   return !readiness.selection?.target || !rollbackIsReversible(readiness);
+}
+
+function killSwitchAllowsActuation(readiness = {}) {
+  return readiness.ks?.on === true;
+}
+
+function prepareApprovalProposal(state, evaluation, nowMs = Date.now()) {
+  const current = state.pendingProposal;
+  if (
+    current?.status === 'pending'
+    && current.releaseSha === state.newSha
+    && current.targetSha === state.prevSha
+    && Number(current.expiresAtMs) > nowMs
+  ) return false;
+
+  state.pendingProposal = createApprovalProposal({
+    releaseSha: state.newSha,
+    targetSha: state.prevSha,
+    nowMs,
+  });
+  state.pendingProposal.evaluation = JSON.parse(JSON.stringify(evaluation));
+  state.pendingConfirmation = null;
+  state.lastShadowAlertSha = null;
+  return true;
 }
 
 function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
@@ -705,12 +734,7 @@ async function tick() {
   // Approval-required is also the fallback for every non-minimal class in the
   // future catastrophic-auto phase. Only a trusted WhatsApp ingress may attach
   // pendingConfirmation; the agent/LLM never writes or consumes authorization.
-  if (!state.pendingProposal || state.pendingProposal.releaseSha !== state.newSha || state.pendingProposal.expiresAtMs <= now) {
-    state.pendingProposal = createApprovalProposal({ releaseSha: state.newSha, targetSha: state.prevSha, nowMs: now });
-    state.pendingProposal.evaluation = JSON.parse(JSON.stringify(ev));
-    state.pendingConfirmation = null;
-    saveState(state);
-  }
+  if (prepareApprovalProposal(state, ev, now)) saveState(state);
 
   if (state.pendingConfirmation) {
     const validation = validateApprovalConfirmation(state.pendingProposal, state.pendingConfirmation, {
@@ -719,11 +743,21 @@ async function tick() {
       personalApproverJid: PERSONAL_APPROVER_JID,
     }, now);
     if (validation.ok) {
+      if (!killSwitchAllowsActuation(readiness)) {
+        decisionLog({
+          phase: 'human-approval-blocked', proposalId: state.pendingProposal.id,
+          newSha: state.newSha, prevSha: state.prevSha, blocker: 'kill switch is OFF',
+        });
+        await alertBlockedOnce(state, ev, 'confirmação recebida, mas o kill switch está OFF');
+        return;
+      }
       state.pendingProposal = consumeApprovalProposal(state.pendingProposal, state.pendingConfirmation, now);
       state.pendingConfirmation = null;
       saveState(state); // consume before the external side effect (one-time)
       decisionLog({ phase: 'human-approval-consumed', proposalId: state.pendingProposal.id, newSha: state.newSha, prevSha: state.prevSha });
-      const r = await rollbackToTarget(state, ev, { kind: 'trusted-human-confirmation', proposalId: state.pendingProposal.id }, readiness.selection.target);
+      const r = await rollbackToTarget(state, ev, {
+        kind: 'trusted-human-confirmation', proposalId: state.pendingProposal.id,
+      }, readiness.selection.target);
       decisionLog({ phase: 'actuate-result', authorization: 'trusted-human-confirmation', ...r });
       return;
     }
@@ -832,6 +866,8 @@ module.exports = {
   evaluate,
   alertBlockedOnce,
   readinessBlocksBeforeAction,
+  killSwitchAllowsActuation,
+  prepareApprovalProposal,
   pendingConfirmationEvaluation,
   formatApprovalProposal,
 };

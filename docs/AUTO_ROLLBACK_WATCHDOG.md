@@ -84,7 +84,10 @@ The watchdog consumes and persists the approval before calling the actuator.
 Replays are rejected. A confirmation received during the proposal lifetime
 resumes the release-bound critical evaluation even if the rolling 90-second log
 signal has already cleared; candidate readiness and release safety are still
-checked again immediately before action. Expired proposals never resume. The
+checked again immediately before action. The current kill switch must also be
+ON for a human-approved rollback; confirmation never bypasses it. Expired
+proposals never resume, and a replacement proposal receives new credentials and
+is delivered instead of being suppressed by the previous proposal's dedupe. The
 agent/LLM may summarize evidence and recommend an outcome, but it cannot write
 the trusted receipt, change a rollout phase, access the rollback token, or invoke
 the Vercel rollback endpoint.
@@ -102,6 +105,9 @@ receive a valid confirmation.
   blockers and can never authorize an action.
 - Route metrics are aggregated by canonical path before thresholds are applied;
   query-string variants cannot inflate distinct routes or split canary evidence.
+- The policy receives the same configured heightened-window duration used by
+  the detector loop. If both canaries fail, it selects one with qualifying
+  same-route baseline evidence instead of depending on SQL row order.
 - Financial, charging, fiscal and external-dependency routes never contribute
   to the routine aggregate rollback class. Dedupe/cooldown blockers are manual
   investigation states, not approval proposals that the actuator would reject.

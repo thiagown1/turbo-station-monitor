@@ -22,7 +22,7 @@ const ACTION = Object.freeze({
   DIRECT_ROLLBACK_PERMITTED: 'direct_rollback_permitted',
 });
 
-const HEIGHTENED_WINDOW_MS = 10 * 60_000;
+const DEFAULT_HEIGHTENED_WINDOW_MS = 10 * 60_000;
 const PRE_CUTOVER_ELEVATED_RATIO = 0.3;
 const CATASTROPHIC_MIN_FAILURES = 3;
 const CATASTROPHIC_MIN_SPAN_MS = 30_000;
@@ -97,6 +97,10 @@ function deployAttributionBlockers(input, baselineSummary) {
   const blockers = [];
   const deploy = input.deploy || {};
   const nowMs = Number(input.nowMs || Date.now());
+  const configuredWindowMs = Number(input.heightenedWindowMs);
+  const heightenedWindowMs = Number.isFinite(configuredWindowMs) && configuredWindowMs > 0
+    ? configuredWindowMs
+    : DEFAULT_HEIGHTENED_WINDOW_MS;
   if (!deploy.newSha || !deploy.previousSha || deploy.newSha === deploy.previousSha) {
     blockers.push('release identity is incomplete or previous and new SHA are equal');
   }
@@ -105,8 +109,8 @@ function deployAttributionBlockers(input, baselineSummary) {
   }
   if (!Number.isFinite(deploy.cutoverMs) || deploy.cutoverMs <= 0 || nowMs < deploy.cutoverMs) {
     blockers.push('cutover timestamp is missing or invalid');
-  } else if (nowMs - deploy.cutoverMs > HEIGHTENED_WINDOW_MS) {
-    blockers.push('signal is outside the ten-minute post-cutover attribution window');
+  } else if (nowMs - deploy.cutoverMs > heightenedWindowMs) {
+    blockers.push(`signal is outside the ${Math.round(heightenedWindowMs / 1000)}-second post-cutover attribution window`);
   }
   if (baselineSummary.total < 2) {
     blockers.push('pre-cutover baseline has fewer than two observations');
@@ -162,7 +166,7 @@ function assessRollback(input = {}) {
       .map((row) => normalizeEndpoint(row.endpoint)),
   ).size;
 
-  const catastrophic = post.find((row) => {
+  const catastrophicCandidates = post.filter((row) => {
     const cls = classifyEndpoint(row.endpoint);
     const failures = Number(row.c5xx || 0);
     const successes = Number(row.success || 0);
@@ -170,6 +174,8 @@ function assessRollback(input = {}) {
     return cls.directCandidate && failures >= CATASTROPHIC_MIN_FAILURES && successes === 0 &&
       safeRatio(failures, Number(row.total || 0)) === 1 && span >= CATASTROPHIC_MIN_SPAN_MS;
   });
+  const catastrophic = catastrophicCandidates.find((row) => !sameRouteBaselineBlocker(input, row))
+    || catastrophicCandidates[0];
 
   const ambiguousCritical = post.find((row) => {
     const cls = classifyEndpoint(row.endpoint);
