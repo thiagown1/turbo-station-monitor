@@ -88,7 +88,9 @@ fires async and the message's `delivery_status` can still flip to `failed`
    tunable via `WHATSAPP_DELIVERY_POLL_MS`).
 3. Marks the alert `sent=1` only on a confirmed `sent`.
 4. Unconfirmed/failed alerts stay `sent=0`; each detection tick revisits
-   alerts younger than 30 min (max 5 per tick). Alerts without a message id
+   alerts younger than 30 min (max 5 delivery attempts per tick). Status-only
+   checks do not consume that delivery limit, so old `pending` rows cannot
+   block newer actionable alerts. Alerts without a message id
    may be POSTed again, and an explicit terminal `failed` status permits one
    replacement POST. A recorded message that is still `pending`, missing from
    the lookup, or temporarily unreadable is only checked again — it is never

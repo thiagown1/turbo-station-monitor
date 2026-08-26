@@ -65,6 +65,7 @@ function deliveryPollScheduleMs() {
 // engine never retried WhatsApp before — an alert that failed to deliver was
 // silently lost, the gap behind the 2026-07-16 cable-theft investigation).
 const UNSENT_RETRY_WINDOW_MS = 30 * 60 * 1000;
+const UNSENT_RETRY_SEND_LIMIT = 5;
 
 // Freshness guard
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send alerts older than 10 minutes
@@ -1508,8 +1509,7 @@ class AlertEngine {
                      FROM alerts
                      WHERE created_at >= ?
                        AND (sent = 0 OR sent IS NULL)
-                     ORDER BY created_at ASC
-                     LIMIT 5`
+                     ORDER BY created_at ASC`
                 )
                 .all(Date.now() - UNSENT_RETRY_WINDOW_MS);
         } catch (e) {
@@ -1518,7 +1518,8 @@ class AlertEngine {
         }
         if (!rows.length) return;
 
-        console.log(`🔁 Retrying ${rows.length} unsent alert(s)`);
+        console.log(`🔁 Checking ${rows.length} unsent alert(s) for retry`);
+        let dispatchAttempts = 0;
         for (const row of rows) {
             try {
                 // The previous POST may have been accepted and delivered after the
@@ -1546,6 +1547,8 @@ class AlertEngine {
                     }
                 }
 
+                if (dispatchAttempts >= UNSENT_RETRY_SEND_LIMIT) break;
+
                 const message = this.formatAlertMessage({
                     type: 'db_recent',
                     event_ts: row.created_at,
@@ -1558,6 +1561,7 @@ class AlertEngine {
                     vercel_log_ids: row.vercel_log_ids,
                     evidence_json: row.evidence_json,
                 });
+                dispatchAttempts += 1;
                 const { sent, waMessageId } = await this.dispatchAlert(message);
                 if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
                 if (sent) this.markAlertSent(row.id);

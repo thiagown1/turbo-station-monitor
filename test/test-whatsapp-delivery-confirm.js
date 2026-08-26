@@ -203,6 +203,38 @@ check('retry does not re-send when a stored WhatsApp message cannot be checked',
     assert.strictEqual(row.wa_message_id, 'msg_unknown_old');
 });
 
+check('pending rows do not prevent newer actionable alerts from being retried', async () => {
+    const engine = dbEngine();
+    const base = Date.now() - 10_000;
+    const pendingIds = [];
+    for (let i = 0; i < 5; i++) {
+        const messageId = `msg_pending_${i}`;
+        pendingIds.push(messageId);
+        insertAlert(engine, { createdAt: base + i, waMessageId: messageId });
+    }
+    const actionableId = insertAlert(engine, { createdAt: base + 100 });
+
+    stubFetch({
+        post: { status: 200, json: { id: 'msg_actionable_retry' } },
+        get: (calls) => ({
+            status: 200,
+            json: {
+                messages: [
+                    ...pendingIds.map((id) => ({ id, delivery_status: 'pending' })),
+                    ...(calls.some((call) => call.method === 'POST')
+                        ? [{ id: 'msg_actionable_retry', delivery_status: 'sent' }]
+                        : []),
+                ],
+            },
+        }),
+    });
+
+    await engine.retryUnsentAlerts();
+
+    assert.strictEqual(posts().length, 1, 'the newer alert without a message id must still be retried');
+    assert.strictEqual(alertRow(engine, actionableId).sent, 1);
+});
+
 check('retry re-sends when the earlier message actually failed', async () => {
     const engine = dbEngine();
     const id = insertAlert(engine, { waMessageId: 'msg_failed' });
