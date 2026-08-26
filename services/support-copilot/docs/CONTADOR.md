@@ -151,6 +151,12 @@ monthly values into the workspace.
 
 ## Implemented behavior
 
+- receipt media from an allowlisted sender is eligible for classification when
+  its group has at least one active partner link. A group with one partner is
+  bound directly; a group with multiple partners is bound only when the
+  normalized payee extracted from the receipt exactly identifies one linked
+  `partner_name`. A missing or ambiguous match omits `partnerId`, remains in
+  human review and never settles a partner payment automatically;
 - deterministic gate for PDF, accounting questions, explicit mentions and
   replies to a prior Contador message;
 - ordinary group chatter is ignored without invoking Opus;
