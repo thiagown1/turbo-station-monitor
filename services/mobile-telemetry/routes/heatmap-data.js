@@ -5,10 +5,11 @@
  * on the dashboard map. Points are deduplicated per (device, 5-minute bucket)
  * to prevent inflation from continuous heartbeats at the same spot.
  *
- * @route   GET /api/telemetry/heatmap-data?period=7d&excludeUserIds=uid1,uid2
+ * @route   GET /api/telemetry/heatmap-data?period=7d&brandId=turbo_station&excludeUserIds=uid1,uid2
  * @access  Requires X-Monitor-Secret header (applied via middleware)
  *
  * @query   {string} period — time window: '24h' | '7d' | '30d' | 'all'
+ * @query   {string} brandId — required tenant scope injected by the Next proxy
  * @query   {string} excludeUserIds — comma-separated list of user_ids whose
  *          events should be filtered out (e.g. admins/internal users whose
  *          home/office activity would skew demand suggestions). Optional.
@@ -16,9 +17,11 @@
  */
 
 const { Router } = require('express');
-const { stmts } = require('../lib/db');
-const { parseLocation } = require('../lib/utils');
 const { PERIOD_MS, LOG_TAG } = require('../lib/constants');
+const {
+    HEATMAP_QUERY_TIMEOUT_CODE,
+    heatmapQueryRunner,
+} = require('../lib/heatmap-query-runner');
 
 const router = Router();
 
@@ -27,10 +30,25 @@ const router = Router();
 // is heatmap noise reduction, not a security boundary.
 const MAX_EXCLUDE_USER_IDS = 200;
 
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
     try {
         const period = req.query.period || '7d';
-        const periodMs = PERIOD_MS[period];
+        if (period !== 'all' && !Object.hasOwn(PERIOD_MS, period)) {
+            return res.status(400).json({ error: 'period must be one of: 24h, 7d, 30d, all' });
+        }
+
+        const rawBrandId = typeof req.query.brandId === 'string'
+            ? req.query.brandId
+            : req.query.brand_id;
+        const brandId = typeof rawBrandId === 'string' ? rawBrandId.trim() : '';
+        if (!brandId) {
+            return res.status(400).json({ error: 'brandId is required' });
+        }
+        if (brandId.length > 128) {
+            return res.status(400).json({ error: 'brandId is too long' });
+        }
+
+        const periodMs = period === 'all' ? null : PERIOD_MS[period];
 
         const rawExclude = typeof req.query.excludeUserIds === 'string' ? req.query.excludeUserIds : '';
         const excludeUserIds = rawExclude
@@ -41,22 +59,17 @@ router.get('/', (req, res) => {
                   .slice(0, MAX_EXCLUDE_USER_IDS)
             : [];
 
-        const rows = stmts.heatmapFiltered({ periodMs, excludeUserIds });
+        const result = await heatmapQueryRunner.run({ periodMs, brandId, excludeUserIds });
 
-        const points = [];
-        let totalEvents = 0;
-        for (const row of rows) {
-            const { lat, lng } = parseLocation(row.data_json);
-            if (lat != null && lng != null) {
-                const w = row.weight || 1;
-                points.push({ lat, lng, weight: w });
-                totalEvents += w;
-            }
-        }
-
-        res.set('Cache-Control', 'max-age=60').json({ count: points.length, totalEvents, period, points });
+        res.set('Cache-Control', 'max-age=60').json({ period, ...result });
     } catch (err) {
         console.error(`${LOG_TAG} Error fetching heatmap data:`, err.message);
+        if (err && err.code === HEATMAP_QUERY_TIMEOUT_CODE) {
+            return res
+                .set('Retry-After', '5')
+                .status(504)
+                .json({ error: 'Heatmap query timed out' });
+        }
         res.status(500).json({ error: 'Internal server error' });
     }
 });
