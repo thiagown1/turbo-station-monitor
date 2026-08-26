@@ -230,7 +230,9 @@ function versionHealth(verRows) {
 // The policy is deterministic. An optional intelligent agent may summarize the
 // evidence, but its output is never an input to action authorization.
 function evaluate(db, nowMs, state, readiness = {}) {
-  const winFrom = nowMs - WINDOW_MS;
+  const winFrom = state.deployStartMs
+    ? Math.max(nowMs - WINDOW_MS, state.deployStartMs)
+    : nowMs - WINDOW_MS;
   const m = queryWindow(db, winFrom, nowMs);
   const pre = state.deployStartMs
     ? queryWindow(db, state.deployStartMs - PRE_CUTOVER_WINDOW_MS, state.deployStartMs)
@@ -507,14 +509,21 @@ function rollbackIsReversible(readiness) {
   return safety.noIrreversibleActivation === true && safety.noMigration === true && safety.noRuntimeFlagChange === true;
 }
 
-async function alertBlockedOnce(state, ev, detail) {
+async function alertBlockedOnce(state, ev, detail, deps = {}) {
+  const send = deps.send || sendWhatsApp;
+  const persist = deps.persist || saveState;
+  const audit = deps.audit || decisionLog;
   const key = `${state.newSha}:${ev.failureClass}:${detail}`;
   if (state.lastBlockedAlertKey === key) return;
-  await sendWhatsApp(`🚨 deploy-watch: ${ev.failureClass} em ${state.newSha}. Rollback automático NÃO apropriado. ` +
+  const delivered = await send(`🚨 deploy-watch: ${ev.failureClass} em ${state.newSha}. Rollback automático NÃO apropriado. ` +
     `${detail}. Evidência: ${reasonString(ev)}. Ação: investigar.`);
+  audit({
+    phase: 'alert-investigate', newSha: state.newSha, prevSha: state.prevSha,
+    failureClass: ev.failureClass, detail, evidence: ev.evidence, delivered,
+  });
+  if (!delivered) return;
   state.lastBlockedAlertKey = key;
-  saveState(state);
-  decisionLog({ phase: 'alert-investigate', newSha: state.newSha, prevSha: state.prevSha, failureClass: ev.failureClass, detail, evidence: ev.evidence });
+  persist(state);
 }
 
 // ─── One detector tick ───────────────────────────────────────────────
@@ -622,6 +631,7 @@ async function tick() {
     const validation = validateApprovalConfirmation(state.pendingProposal, state.pendingConfirmation, {
       allowedSenderIds: ALLOWED_APPROVER_IDS,
       personalConversationId: PERSONAL_APPROVAL_CONVERSATION_ID,
+      personalApproverJid: PERSONAL_APPROVER_JID,
     }, now);
     if (validation.ok) {
       state.pendingProposal = consumeApprovalProposal(state.pendingProposal, state.pendingConfirmation, now);
@@ -732,4 +742,11 @@ async function main() {
   await tick();
 }
 
-main().catch(e => { log('fatal', e && e.message); process.exit(1); });
+if (require.main === module) {
+  main().catch(e => { log('fatal', e && e.message); process.exit(1); });
+}
+
+module.exports = {
+  evaluate,
+  alertBlockedOnce,
+};

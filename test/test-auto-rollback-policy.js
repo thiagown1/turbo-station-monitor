@@ -20,6 +20,7 @@ const {
   validateApprovalConfirmation,
   consumeApprovalProposal,
 } = require('../services/lib/auto-rollback-policy');
+const { evaluate, alertBlockedOnce } = require('../services/auto-rollback-watchdog');
 
 const NEW_SHA = '1111111111111111111111111111111111111111';
 const PREV_SHA = '2222222222222222222222222222222222222222';
@@ -147,6 +148,39 @@ test('missing baseline evidence alerts but cannot recommend or act', () => {
   assert.match(result.blockers.join(' '), /baseline/i);
 });
 
+test('a catastrophic route requires its own clean pre-cutover baseline before any proposal', () => {
+  const result = assessRollback(fullContext({
+    rolloutPhase: ROLLOUT_PHASE.APPROVAL_REQUIRED,
+    baseline: cleanBaseline('/api/health'),
+  }));
+  assert.equal(result.recommendation, RECOMMENDATION.ALERT_INVESTIGATE);
+  assert.equal(result.action, ACTION.ALERT_INVESTIGATE);
+  assert.match(result.blockers.join(' '), /same-route baseline/i);
+});
+
+test('post-deploy evaluation excludes failures recorded before the cutover', () => {
+  const db = new Database(':memory:');
+  db.exec('CREATE TABLE vercel_logs (timestamp INTEGER, endpoint TEXT, status_code INTEGER)');
+  const insert = db.prepare('INSERT INTO vercel_logs (timestamp, endpoint, status_code) VALUES (?, ?, ?)');
+  for (let i = 0; i < 20; i++) insert.run(NOW - 250_000 + i * 5_000, '/api/health', 200);
+  insert.run(NOW - 70_000, '/api/version', 500);
+  insert.run(NOW - 40_000, '/api/version', 500);
+  insert.run(NOW - 10_000, '/api/version', 500);
+
+  try {
+    const result = evaluate(db, NOW + 10_000, {
+      newSha: NEW_SHA,
+      prevSha: PREV_SHA,
+      currentSha: NEW_SHA,
+      deployStartMs: NOW,
+    });
+    assert.equal(result.recommendation, RECOMMENDATION.OBSERVE);
+    assert.equal(result.evidence.c5xx, 0);
+  } finally {
+    db.close();
+  }
+});
+
 test('kill switch, one-per-release, cooldown, and reversible-change gates fail independently', () => {
   const cases = [
     ['kill switch', { guardrails: { killSwitchAllows: false } }],
@@ -241,6 +275,7 @@ test('approval is personal, allowlisted, release-bound, expiring and one-time', 
   const policy = {
     allowedSenderIds: ['5562999999999@s.whatsapp.net'],
     personalConversationId: 'conv_personal_owner',
+    personalApproverJid: '5562999999999@s.whatsapp.net',
   };
 
   assert.deepEqual(validateApprovalConfirmation(proposal, confirmation, policy, NOW + 60_000), { ok: true, blockers: [] });
@@ -261,6 +296,7 @@ test('approval rejects groups, wrong releases and expired confirmations', () => 
   const policy = {
     allowedSenderIds: ['5562999999999@s.whatsapp.net'],
     personalConversationId: 'conv_personal_owner',
+    personalApproverJid: '5562999999999@s.whatsapp.net',
   };
   const base = {
     source: 'trusted-whatsapp-ingress', action: 'CONFIRM_ROLLBACK', proposalId: proposal.id,
@@ -272,6 +308,49 @@ test('approval rejects groups, wrong releases and expired confirmations', () => 
   assert.equal(validateApprovalConfirmation(proposal, { ...base, remoteJid: '120363000000000000@g.us' }, policy, NOW + 30_000).ok, false);
   assert.equal(validateApprovalConfirmation(proposal, { ...base, releaseSha: '3333333333333333333333333333333333333333' }, policy, NOW + 30_000).ok, false);
   assert.equal(validateApprovalConfirmation(proposal, { ...base, receivedAtMs: NOW + 61_000 }, policy, NOW + 61_000).ok, false);
+  for (const remoteJid of [
+    'status@broadcast',
+    '120363000000000000@newsletter',
+    'not-a-whatsapp-jid',
+    '5562888888888@s.whatsapp.net',
+  ]) {
+    assert.equal(
+      validateApprovalConfirmation(proposal, { ...base, remoteJid }, policy, NOW + 30_000).ok,
+      false,
+      remoteJid,
+    );
+  }
+});
+
+test('blocked alert dedupe is persisted only after confirmed delivery', async () => {
+  const state = { newSha: NEW_SHA, prevSha: PREV_SHA, lastBlockedAlertKey: null };
+  const ev = {
+    failureClass: 'catastrophic_signal_not_attributed',
+    evidence: { c5xx: 3, total: 3, ratio: 1, windowSec: 90, topEndpoints: ['/api/version'] },
+    reasons: ['test signal'],
+  };
+  let sends = 0;
+  let persists = 0;
+  const deps = {
+    send: async () => {
+      sends += 1;
+      return sends > 1;
+    },
+    persist: () => { persists += 1; },
+    audit: () => {},
+  };
+
+  await alertBlockedOnce(state, ev, 'needs investigation', deps);
+  assert.equal(state.lastBlockedAlertKey, null);
+  assert.equal(persists, 0);
+
+  await alertBlockedOnce(state, ev, 'needs investigation', deps);
+  assert.match(state.lastBlockedAlertKey, /needs investigation/);
+  assert.equal(sends, 2);
+  assert.equal(persists, 1);
+
+  await alertBlockedOnce(state, ev, 'needs investigation', deps);
+  assert.equal(sends, 2, 'confirmed delivery is deduplicated');
 });
 
 test('offline replay exercises the real SQLite query and classifies a canary catastrophe', () => {

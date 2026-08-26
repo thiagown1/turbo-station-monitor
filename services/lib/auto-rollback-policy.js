@@ -119,14 +119,10 @@ function deployAttributionBlockers(input, baselineSummary) {
 
 function directEligibilityBlockers(input, catastrophicMetric, attributionBlockers) {
   const blockers = [...attributionBlockers];
-  const baseline = metricFor(input.baseline, normalizeEndpoint(catastrophicMetric && catastrophicMetric.endpoint));
   const candidate = input.rollbackCandidate || {};
   const safety = input.changeSafety || {};
   const guards = input.guardrails || {};
 
-  if (!baseline || Number(baseline.total || 0) < 2 || Number(baseline.c5xx || 0) !== 0) {
-    blockers.push('same-route baseline lacks at least two clean pre-cutover observations');
-  }
   if (safety.candidateConfirmed !== true) blockers.push('release candidate confirmation is missing');
   if (safety.noExternalDependency !== true) blockers.push('external dependency exclusion is not proven');
   if (safety.noFinancialAmbiguity !== true) blockers.push('financial ambiguity exclusion is not proven');
@@ -142,6 +138,14 @@ function directEligibilityBlockers(input, catastrophicMetric, attributionBlocker
   if (guards.alreadyActedForRelease === true) blockers.push('one rollback was already attempted for this release');
   if (guards.cooldownElapsed !== true) blockers.push('rollback cooldown has not elapsed');
   return [...new Set(blockers)];
+}
+
+function sameRouteBaselineBlocker(input, catastrophicMetric) {
+  const baseline = metricFor(input.baseline, normalizeEndpoint(catastrophicMetric && catastrophicMetric.endpoint));
+  if (!baseline || Number(baseline.total || 0) < 2 || Number(baseline.c5xx || 0) !== 0) {
+    return 'same-route baseline lacks at least two clean pre-cutover observations';
+  }
+  return null;
 }
 
 function assessRollback(input = {}) {
@@ -188,17 +192,20 @@ function assessRollback(input = {}) {
 
   if (catastrophic) {
     reasons.push(`${normalizeEndpoint(catastrophic.endpoint)} had at least ${CATASTROPHIC_MIN_FAILURES} consecutive 5xx-only observations spanning ${CATASTROPHIC_MIN_SPAN_MS / 1000}s`);
-    if (blockers.length > 0) {
+    const attributionBlockers = [...blockers];
+    const routeBaselineBlocker = sameRouteBaselineBlocker(input, catastrophic);
+    if (routeBaselineBlocker) attributionBlockers.push(routeBaselineBlocker);
+    if (attributionBlockers.length > 0) {
       return {
         recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
         failureClass: 'catastrophic_signal_not_attributed',
         action: ACTION.ALERT_INVESTIGATE,
         reasons,
-        blockers,
-        directEligibility: { eligible: false, blockers },
+        blockers: attributionBlockers,
+        directEligibility: { eligible: false, blockers: attributionBlockers },
       };
     }
-    const directBlockers = directEligibilityBlockers(input, catastrophic, blockers);
+    const directBlockers = directEligibilityBlockers(input, catastrophic, attributionBlockers);
     const eligible = directBlockers.length === 0;
     const action = phase === ROLLOUT_PHASE.SHADOW
       ? ACTION.SHADOW_REPORT
@@ -264,6 +271,7 @@ function createApprovalProposal({ releaseSha, targetSha, nowMs = Date.now(), ttl
 
 function validateApprovalConfirmation(proposal, confirmation, policy = {}, nowMs = Date.now()) {
   const blockers = [];
+  const personalApproverJid = String(policy.personalApproverJid || '');
   if (!proposal || proposal.status !== 'pending' || proposal.consumedAtMs) blockers.push('proposal is not pending and unused');
   if (!confirmation || confirmation.source !== 'trusted-whatsapp-ingress') blockers.push('confirmation did not come from the trusted WhatsApp ingress');
   if (!confirmation || confirmation.action !== 'CONFIRM_ROLLBACK') blockers.push('confirmation action is not explicit');
@@ -271,7 +279,12 @@ function validateApprovalConfirmation(proposal, confirmation, policy = {}, nowMs
   if (!confirmation || confirmation.releaseSha !== proposal?.releaseSha || confirmation.targetSha !== proposal?.targetSha) blockers.push('release or rollback target mismatch');
   if (!confirmation || !policy.allowedSenderIds?.includes(confirmation.senderId)) blockers.push('sender is not allowlisted');
   if (!confirmation || confirmation.conversationId !== policy.personalConversationId) blockers.push('conversation is not the allowlisted personal conversation');
-  if (!confirmation || !confirmation.remoteJid || confirmation.remoteJid.endsWith('@g.us')) blockers.push('group or unknown WhatsApp destination is forbidden');
+  if (!personalApproverJid.endsWith('@s.whatsapp.net') || !policy.allowedSenderIds?.includes(personalApproverJid)) {
+    blockers.push('configured personal approver JID is invalid or not allowlisted');
+  }
+  if (!confirmation || confirmation.remoteJid !== personalApproverJid || confirmation.senderId !== personalApproverJid) {
+    blockers.push('confirmation is not bound to the configured personal approver JID');
+  }
   const receivedAtMs = Number(confirmation && confirmation.receivedAtMs);
   if (!Number.isFinite(receivedAtMs) || receivedAtMs < Number(proposal?.createdAtMs) || receivedAtMs > Number(proposal?.expiresAtMs) || nowMs > Number(proposal?.expiresAtMs)) {
     blockers.push('confirmation is outside the proposal validity window');

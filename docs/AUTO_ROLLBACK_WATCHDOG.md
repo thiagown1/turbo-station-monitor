@@ -35,7 +35,8 @@ A signal is attributed to a release only when:
 
 1. the previous and new SHAs are known and distinct;
 2. the current production SHA exactly matches the new candidate;
-3. the signal is inside the ten-minute post-cutover window;
+3. the signal is inside the ten-minute post-cutover window, and the detector
+   clamps its query start to the cutover timestamp so older rows cannot count;
 4. the five-minute pre-cutover baseline is not already elevated;
 5. for the catastrophic canary class, the same route had at least two clean
    pre-cutover observations.
@@ -71,7 +72,9 @@ non-LLM WhatsApp ingress records all of these facts:
 - explicit `CONFIRM_ROLLBACK` action;
 - matching proposal ID, nonce, release SHA, and target SHA;
 - personal conversation ID and sender JID on the operator allowlist;
-- a personal JID (`@s.whatsapp.net`), never a group (`@g.us`);
+- sender and remote JID exactly matching the configured approver JID, with the
+  personal suffix `@s.whatsapp.net` (broadcast, newsletter, malformed, other
+  personal, and group `@g.us` destinations are rejected);
 - receipt after proposal creation and before expiration;
 - proposal still pending and unused.
 
@@ -93,7 +96,8 @@ receive a valid confirmation.
 - The attempt is durably consumed before the Vercel call; a crash or ambiguous
   response becomes `issuance-unknown` and is never retried automatically.
 - Thirty-minute cooldown between actions.
-- One shadow report/proposal per release, plus deduped blocked alerts.
+- One shadow report/proposal per release, plus deduped blocked alerts. A blocked
+  alert is deduped only after confirmed relay delivery; transport failures retry.
 - Exact previous SHA; never select an arbitrary recent deployment.
 - Strict pre-action target smoke; inaccessible is not healthy.
 - External, payment, fiscal, and charging ambiguity never enters the direct path.
