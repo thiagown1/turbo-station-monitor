@@ -10,7 +10,7 @@
  *   - only mark sent after polling the conversation and seeing delivery_status='sent'
  *   - keep unconfirmed/failed alerts at sent=0
  *   - retry recent (<30min) unsent alerts each tick, late-confirming a stored
- *     wa_message_id first so slow deliveries don't duplicate in the group
+ *     wa_message_id first and only re-posting after an explicit failure
  */
 
 process.env.SUPPORT_API_SECRET = 'test-secret';
@@ -175,6 +175,34 @@ check('retry late-confirms a stored wa_message_id without re-sending', async () 
     assert.strictEqual(posts().length, 0, 'no duplicate message posted');
 });
 
+check('retry does not re-send while a stored WhatsApp message is still pending', async () => {
+    const engine = dbEngine();
+    const id = insertAlert(engine, { waMessageId: 'msg_pending_old' });
+    stubFetch({
+        post: { status: 200, json: { id: 'msg_duplicate' } },
+        get: { status: 200, json: { messages: [{ id: 'msg_pending_old', delivery_status: 'pending' }] } },
+    });
+    await engine.retryUnsentAlerts();
+    const row = alertRow(engine, id);
+    assert.strictEqual(posts().length, 0, 'an accepted pending message must not be posted twice');
+    assert.strictEqual(row.sent, 0, 'pending delivery remains eligible for later confirmation');
+    assert.strictEqual(row.wa_message_id, 'msg_pending_old');
+});
+
+check('retry does not re-send when a stored WhatsApp message cannot be checked', async () => {
+    const engine = dbEngine();
+    const id = insertAlert(engine, { waMessageId: 'msg_unknown_old' });
+    stubFetch({
+        post: { status: 200, json: { id: 'msg_duplicate' } },
+        get: { status: 503, json: null },
+    });
+    await engine.retryUnsentAlerts();
+    const row = alertRow(engine, id);
+    assert.strictEqual(posts().length, 0, 'an unavailable status lookup must not create a duplicate');
+    assert.strictEqual(row.sent, 0);
+    assert.strictEqual(row.wa_message_id, 'msg_unknown_old');
+});
+
 check('retry re-sends when the earlier message actually failed', async () => {
     const engine = dbEngine();
     const id = insertAlert(engine, { waMessageId: 'msg_failed' });
@@ -210,7 +238,7 @@ check('retry re-sends an alert that never had a wa_message_id', async () => {
     assert.strictEqual(row.wa_message_id, 'msg_fresh');
 });
 
-check('an unconfirmed retry stays sent=0 (retried again next tick)', async () => {
+check('an unconfirmed first retry stays sent=0 for late confirmation next tick', async () => {
     const engine = dbEngine();
     const id = insertAlert(engine);
     stubFetch({

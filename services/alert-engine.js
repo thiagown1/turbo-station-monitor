@@ -1490,8 +1490,11 @@ class AlertEngine {
      * between save and send). Runs every detection tick. An alert with a
      * recorded wa_message_id is re-checked first — if the earlier send actually
      * delivered late, it's just marked sent (no duplicate message in the
-     * group). Only alerts younger than UNSENT_RETRY_WINDOW_MS are retried;
-     * anything older stays unsent by design (stale alerts are noise).
+     * group). Once a POST has a wa_message_id, only an explicit 'failed'
+     * status may trigger a replacement POST; pending/unavailable statuses are
+     * checked again without re-sending. Only alerts younger than
+     * UNSENT_RETRY_WINDOW_MS are retried; anything older stays unsent by
+     * design (stale alerts are noise).
      */
     async retryUnsentAlerts() {
         const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
@@ -1525,6 +1528,20 @@ class AlertEngine {
                     if (status === 'sent') {
                         console.log(`✅ Alert ${row.id} late-confirmed (msg=${row.wa_message_id})`);
                         this.markAlertSent(row.id);
+                        continue;
+                    }
+
+                    // The support API accepted the previous POST and gave us a
+                    // stable message id. A pending or temporarily unreadable
+                    // delivery status is not evidence that the message failed;
+                    // posting again here creates a visible duplicate every
+                    // detection tick. Only an explicit terminal failure may
+                    // create a replacement message.
+                    if (status !== 'failed') {
+                        console.log(
+                            `⏳ Alert ${row.id} delivery still unconfirmed ` +
+                            `(status=${status || 'unavailable'}, msg=${row.wa_message_id}); not re-sending`
+                        );
                         continue;
                     }
                 }
