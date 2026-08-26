@@ -126,6 +126,23 @@ test('does not reinterpret a clickable image as an ordinary text link', () => {
     }
 });
 
+test('validates reference-style internal links and their definitions', () => {
+    assert.strictEqual(
+        sanitizeInternalLinks('Fale pelo [Contato][contact].\n\n[contact]: /contato', related),
+        'Fale pelo Contato.\n',
+    );
+    keeps('Veja o [FAQ][faq].\n\n[faq]: /faq "Dúvidas"');
+    assert.strictEqual(
+        sanitizeInternalLinks('[Contato][]\n\n[Contato]: https://www.turbostation.com.br/contato', related),
+        'Contato\n',
+    );
+    assert.strictEqual(
+        sanitizeInternalLinks('Use [contact].\n\n[contact]: /contato', related),
+        'Use contact.\n',
+    );
+    keeps('[ANEEL][agencia]\n\n[agencia]: https://www.aneel.gov.br');
+});
+
 test('handles several links in one body, keeping the good and dropping the bad', () => {
     const out = sanitizeInternalLinks(
         'Veja [A](/blog/recarga-dc-vs-ac-diferencas-e-quando-usar-cada-uma), [B](/blog/inventado) e o [FAQ](/faq).',

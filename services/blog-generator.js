@@ -331,6 +331,35 @@ const VALID_STATIC_ROUTES = new Set([
 ]);
 const FIRST_PARTY_HOSTS = new Set(['turbostation.com.br', 'www.turbostation.com.br']);
 
+function inspectLinkDestination(href, validSlugs) {
+  let normalizedHref;
+  let renderedHref;
+  if (/^[a-z][a-z\d+.-]*:/i.test(href) || href.startsWith('//')) {
+    try {
+      const absolute = new URL(href.startsWith('//') ? `https:${href}` : href);
+      if (!['http:', 'https:'].includes(absolute.protocol) || !FIRST_PARTY_HOSTS.has(absolute.hostname.toLowerCase())) {
+        return { owned: false, valid: true, renderedHref: href };
+      }
+      normalizedHref = `${absolute.pathname}${absolute.search}${absolute.hash}`;
+      renderedHref = href;
+    } catch {
+      return { owned: false, valid: true, renderedHref: href };
+    }
+  } else if (href.startsWith('#') || href.startsWith('?')) {
+    return { owned: false, valid: true, renderedHref: href };
+  }
+
+  normalizedHref ||= href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}`;
+  renderedHref ||= normalizedHref;
+  if (VALID_STATIC_ROUTES.has(normalizedHref)) return { owned: true, valid: true, renderedHref };
+  const post = /^\/blog\/([^/?#]+)$/.exec(normalizedHref);
+  return { owned: true, valid: Boolean(post && validSlugs.has(post[1])), renderedHref };
+}
+
+function normalizeReferenceLabel(label) {
+  return String(label || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
 /**
  * Unwrap every internal link the site cannot actually serve.
  *
@@ -352,7 +381,7 @@ function sanitizeInternalLinks(markdown, related) {
   const validSlugs = new Set((related || []).map((p) => p.slug));
   const linkedImages = [];
   const protectedMarkdown = markdown.replace(
-    /\[!\[[^\]\n]*\]\([^)\n]*\)\]\([^)\n]*\)/g,
+    /\[!\[[^\]\n]*\]\([^)\n]*\)\](?:\([^)\n]*\)|\[[^\]\n]*\])/g,
     (match) => {
       const token = `\u0000BLOG_LINKED_IMAGE_${linkedImages.length}\u0000`;
       linkedImages.push(match);
@@ -360,36 +389,41 @@ function sanitizeInternalLinks(markdown, related) {
     },
   );
 
-  const linkPattern = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
-  const sanitized = protectedMarkdown.replace(linkPattern, (match, text, href, title = '') => {
-    // Schemed, protocol-relative and same-page destinations are not routes
-    // owned by this allowlist unless they point back to the public site.
-    let normalizedHref;
-    let renderedHref;
-    if (/^[a-z][a-z\d+.-]*:/i.test(href) || href.startsWith('//')) {
-      try {
-        const absolute = new URL(href.startsWith('//') ? `https:${href}` : href);
-        if (!['http:', 'https:'].includes(absolute.protocol) || !FIRST_PARTY_HOSTS.has(absolute.hostname.toLowerCase())) {
-          return match;
-        }
-        normalizedHref = `${absolute.pathname}${absolute.search}${absolute.hash}`;
-        renderedHref = href;
-      } catch {
-        return match;
+  const invalidReferences = new Set();
+  const definitionPattern = /^([ \t]{0,3})\[([^\]\n]+)\]:[ \t]*(?:<([^>\n]+)>|(\S+))([ \t]+(?:"[^"\n]*"|'[^'\n]*'|\([^\)\n]*\)))?[ \t]*$/gm;
+  let referencesSanitized = protectedMarkdown.replace(
+    definitionPattern,
+    (match, indent, label, angleHref, bareHref, title = '') => {
+      const href = angleHref || bareHref;
+      const destination = inspectLinkDestination(href, validSlugs);
+      if (!destination.owned) return match;
+      if (!destination.valid) {
+        invalidReferences.add(normalizeReferenceLabel(label));
+        return '\u0000BLOG_INVALID_REFERENCE_DEFINITION\u0000';
       }
-    } else if (href.startsWith('#') || href.startsWith('?')) {
-      return match;
-    }
+      const renderedHref = angleHref ? `<${destination.renderedHref}>` : destination.renderedHref;
+      return `${indent}[${label}]: ${renderedHref}${title}`;
+    },
+  );
 
-    // Markdown resolves `faq` from a blog post as `/blog/faq`. Canonicalise
-    // root-relative before validation so a model cannot bypass the allowlist
-    // merely by omitting the leading slash.
-    normalizedHref ||= href.startsWith('/') ? href : `/${href.replace(/^\.\//, '')}`;
-    renderedHref ||= normalizedHref;
-    if (VALID_STATIC_ROUTES.has(normalizedHref)) return `[${text}](${renderedHref}${title})`;
-    const post = /^\/blog\/([^/?#]+)$/.exec(normalizedHref);
-    if (post && validSlugs.has(post[1])) return `[${text}](${renderedHref}${title})`;
-    return text;
+  referencesSanitized = referencesSanitized.replace(
+    /(?<!!)\[([^\]\n]+)\]\[([^\]\n]*)\]/g,
+    (match, text, label) => invalidReferences.has(normalizeReferenceLabel(label || text)) ? text : match,
+  );
+  referencesSanitized = referencesSanitized.replace(
+    /(?<!!)(?<!\])\[([^\]\n]+)\](?![\[(])/g,
+    (match, label) => invalidReferences.has(normalizeReferenceLabel(label)) ? label : match,
+  );
+  referencesSanitized = referencesSanitized.replace(
+    /\r?\n?\u0000BLOG_INVALID_REFERENCE_DEFINITION\u0000/g,
+    '',
+  );
+
+  const linkPattern = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(\s+(?:"[^"]*"|'[^']*'|\([^)]*\)))?\s*\)/g;
+  const sanitized = referencesSanitized.replace(linkPattern, (match, text, href, title = '') => {
+    const destination = inspectLinkDestination(href, validSlugs);
+    if (!destination.owned) return match;
+    return destination.valid ? `[${text}](${destination.renderedHref}${title})` : text;
   });
   return sanitized.replace(/\u0000BLOG_LINKED_IMAGE_(\d+)\u0000/g, (_, index) => linkedImages[Number(index)]);
 }
