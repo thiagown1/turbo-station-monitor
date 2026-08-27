@@ -11,7 +11,7 @@ The worker publishes only when all of these conditions hold:
 
 1. The target is a full 40-character commit SHA.
 2. The GitHub Actions `CI` push run for that exact SHA completed successfully.
-3. `origin/main` resolves to the same SHA.
+3. `origin/main` resolves to the same SHA immediately before mutation.
 4. The production checkout has no tracked or untracked source drift.
 5. Dependency installation succeeds.
 6. Every affected PM2 restart succeeds.
@@ -20,6 +20,14 @@ The worker publishes only when all of these conditions hold:
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
 is `db/.monitor-deploy.lock`. Both are runtime state and remain outside Git.
 Logs are appended to `logs/monitor-deploy.log`.
+
+The worker waits for CI before taking the deployment lock. If GitHub cancels an
+older CI run because a newer `main` commit contains that target, the older
+request is recorded as superseded and exits without a failure notification. The
+newer worker remains responsible for publishing. A green worker that encounters
+a short deployment already applying changes waits for the lock, then fetches and
+validates `origin/main` again before making any change. Divergent history and
+cancelled CI without a verified superseding `main` commit still fail closed.
 
 ## Service selection
 
@@ -36,7 +44,7 @@ changes restart only the corresponding PM2 process.
 The worker fails closed. It does not reset, stash, discard, or overwrite local
 changes, and it does not mark a SHA as deployed before installation, restart,
 health verification, and `pm2 save` succeed. Failures are logged and sent to the
-configured Telegram target through the absolute OpenClaw CLI path.
+configured WhatsApp conversation through the authenticated support-copilot API.
 
 No automatic destructive rollback is performed. If a restart or health check
 fails, keep the deployed marker on the previous SHA and perform the documented
@@ -59,7 +67,8 @@ Do not run `git reset --hard` before classifying the drift.
 ## Required environment
 
 - `GITHUB_WEBHOOK_SECRET`
-- `OPENCLAW_CLI` (defaults to `/home/openclaw/.npm-global/bin/openclaw`)
-- `MONITOR_DEPLOY_TELEGRAM_TARGET`
+- `SUPPORT_API_SECRET` or `MONITOR_API_SECRET`
+- `MONITOR_DEPLOY_WHATSAPP_CONV` (falls back to `ALERT_WHATSAPP_CONV`)
+- `SUPPORT_API_BASE` (defaults to `http://127.0.0.1:3005`)
 - Working authenticated `gh`, `git`, `npm`, and PM2 installations at the paths
   used by the worker (overridable with `GH_BIN`, `GIT_BIN`, `NPM_BIN`, `PM2_BIN`).
