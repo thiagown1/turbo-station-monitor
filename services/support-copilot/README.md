@@ -79,11 +79,19 @@ underlying WhatsApp library.
 | `EVOLUTION_API_KEY` | Shared local gateway API key | secret |
 | `EVOLUTION_WEBHOOK_SECRET` | Verifies gateway → copilot webhooks | secret |
 | `EVOLUTION_INSTANCE_MAP` | Map instance→brand | `turbostation:turbo_station` |
+| `BRAND_AGENT_MAP` | Optional explicit brand→agent overrides | `zev:support_zev` |
+| `OPENCLAW_AGENT` | Optional shared fallback; unset means fail closed when no brand is resolved | `support_shared` |
+| `GROUP_AGENT` / `OPENCLAW_GROUP_AGENT` | Optional group override; otherwise a resolved brand uses `support_<brand>` | `support_partner_groups` |
 | `SUPPORT_COPILOT_MEDIA_DIR` | Shared inbound-media directory | repository `db/media` by default |
 | `AGENT_EVENT_BASE_URL` | Dashboard base URL that receives agent events | `https://app.example.com` |
 | `AGENT_EVENT_SECRET` | Dedicated shared secret for config/events | random secret |
 | `OPENROUTER_API_KEY` | Vision/classification provider | provider key |
 | `AGENT_VISION_MODEL` | Cheap vision-capable model | `openai/gpt-4o-mini` |
+
+Agent routing never assumes a Turbo Station tenant globally. A normal or group
+conversation must resolve a brand-specific agent, an explicit map entry, or an
+environment-configured fallback; otherwise the operation fails closed before
+an OpenClaw workspace is selected.
 
 ### Gateway webhook setup
 
