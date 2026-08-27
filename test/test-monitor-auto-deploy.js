@@ -57,6 +57,65 @@ async function expectReject(name, fn, pattern) {
   );
   console.log('  ✅ blocks deployment when main CI fails');
 
+  const supersededDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-superseded-'));
+  fs.mkdirSync(path.join(supersededDir, 'db'), { recursive: true });
+  const supersedingSha = '3'.repeat(40);
+  const supersededCalls = [];
+  const supersededResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: supersededDir,
+    run: async (command, args) => {
+      supersededCalls.push([command, ...args]);
+      if (args[0] === 'run') {
+        return {
+          stdout: JSON.stringify([{
+            status: 'completed',
+            conclusion: 'cancelled',
+            url: 'https://example.test/cancelled-run',
+          }]),
+        };
+      }
+      if (args[0] === 'fetch') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${supersedingSha}\n` };
+      if (args[0] === 'merge-base') return { stdout: '' };
+      throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+    },
+    checkHealth: async () => { throw new Error('superseded deploy must not health-check'); },
+  });
+  assert.strictEqual(supersededResult.status, 'superseded');
+  assert.strictEqual(supersededResult.targetSha, NEW_SHA);
+  assert.strictEqual(supersededResult.supersededBy, supersedingSha);
+  assert.ok(supersededCalls.some((call) => call[1] === 'merge-base' && call.includes('--is-ancestor')));
+  assert.ok(!supersededCalls.some((call) => call[1] === 'merge'));
+  assert.ok(!supersededCalls.some((call) => call[1] === 'ci'));
+  assert.ok(!fs.existsSync(path.join(supersededDir, 'db', '.monitor-deploy.lock')));
+  console.log('  ✅ treats cancelled CI as superseded only when a newer main commit contains the target');
+
+  const divergentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-divergent-'));
+  fs.mkdirSync(path.join(divergentDir, 'db'), { recursive: true });
+  await expectReject(
+    'divergent main',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: divergentDir,
+      run: async (command, args) => {
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'fetch') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${supersedingSha}\n` };
+        if (args[0] === 'merge-base') {
+          const error = new Error('not an ancestor');
+          error.code = 1;
+          throw error;
+        }
+        throw new Error(`unexpected command: ${command} ${args.join(' ')}`);
+      },
+      checkHealth: async () => { throw new Error('divergent deploy must not health-check'); },
+    }),
+    /does not contain target/
+  );
+  assert.ok(!fs.existsSync(path.join(divergentDir, 'db', '.monitor-deploy.lock')));
+  console.log('  ✅ fails closed when main diverges instead of silently treating it as superseded');
+
   const dirtyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-dirty-'));
   const dirtyCalls = [];
   const dirtyRun = async (command, args) => {
@@ -112,6 +171,36 @@ async function expectReject(name, fn, pattern) {
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
+
+  const waitingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-waiting-lock-'));
+  fs.mkdirSync(path.join(waitingDir, 'db'), { recursive: true });
+  const waitingLockPath = path.join(waitingDir, 'db', '.monitor-deploy.lock');
+  fs.writeFileSync(waitingLockPath, `${process.pid}\nactive\n`);
+  let lockSleeps = 0;
+  const waitingResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: waitingDir,
+    run: async (command, args) => {
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'fetch') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+      if (args[0] === 'diff') return { stdout: 'services/alert-engine.js\n' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => {},
+    lockSleepFn: async () => {
+      lockSleeps += 1;
+      fs.unlinkSync(waitingLockPath);
+    },
+    lockAttempts: 2,
+    lockIntervalMs: 1,
+  });
+  assert.strictEqual(waitingResult.status, 'deployed');
+  assert.strictEqual(lockSleeps, 1, 'esperou o deploy ativo liberar o lock');
+  assert.ok(!fs.existsSync(waitingLockPath));
+  console.log('  ✅ waits for an active short deploy instead of raising a false failure');
 
   // ── notifyDeploy ──────────────────────────────────────────────────────────
   // Regression for 2026-08-18: the notifier shelled out to a Telegram transport

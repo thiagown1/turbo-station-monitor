@@ -57,6 +57,13 @@ async function notify(message) {
   log(`[auto-deploy] requested ${String(targetSha || '').slice(0, 8)} by ${pusher}: ${commitMessage}`);
   try {
     const result = await deployMonitor({ sha: targetSha, repoDir, log });
+    if (result.status === 'superseded') {
+      log(
+        `[auto-deploy] request ${result.targetSha.slice(0, 8)} safely coalesced into ` +
+        `${result.supersededBy.slice(0, 8)}; the newer worker owns deployment`
+      );
+      return;
+    }
     await notify(
       `✅ Turbo Monitor ${result.targetSha.slice(0, 8)} publicado após CI verde. ` +
       `Reiniciados: ${result.services.join(', ') || 'nenhum serviço'}.`

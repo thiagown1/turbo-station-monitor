@@ -104,7 +104,12 @@ async function waitForSuccessfulCi({
     const latest = runs[0];
     if (latest?.status === 'completed') {
       if (latest.conclusion === 'success') return latest;
-      throw new Error(`CI for ${sha.slice(0, 8)} completed with ${latest.conclusion || 'unknown conclusion'}${latest.url ? `: ${latest.url}` : ''}`);
+      const conclusion = latest.conclusion || 'unknown conclusion';
+      const error = new Error(`CI for ${sha.slice(0, 8)} completed with ${conclusion}${latest.url ? `: ${latest.url}` : ''}`);
+      error.code = 'ECICONCLUSION';
+      error.ciConclusion = conclusion;
+      error.ciUrl = latest.url || null;
+      throw error;
     }
     log(`[auto-deploy] waiting for CI (${attempt}/${attempts})`);
     if (attempt < attempts) await sleepFn(intervalMs);
@@ -168,12 +173,83 @@ function acquireLock(lockPath, fsImpl = fs) {
           else throw probeError;
         }
       }
-      if (running) throw new Error(`another monitor deploy is already running (${lockPath}, pid ${pid})`);
+      if (running) {
+        const lockError = new Error(`another monitor deploy is already running (${lockPath}, pid ${pid})`);
+        lockError.code = 'EDEPLOYLOCKED';
+        lockError.lockPid = pid;
+        throw lockError;
+      }
       fsImpl.unlinkSync(lockPath);
       return acquireLock(lockPath, fsImpl);
     }
     throw error;
   }
+}
+
+async function acquireLockWithRetry(lockPath, {
+  fsImpl = fs,
+  sleepFn = sleep,
+  attempts = 120,
+  intervalMs = 5000,
+  log = () => {},
+} = {}) {
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      acquireLock(lockPath, fsImpl);
+      return;
+    } catch (error) {
+      if (error.code !== 'EDEPLOYLOCKED' || attempt === attempts) throw error;
+      log(`[auto-deploy] another deploy is applying changes; waiting for lock (${attempt}/${attempts})`);
+      await sleepFn(intervalMs);
+    }
+  }
+}
+
+async function readRemoteMain({ run, gitBin, repoDir }) {
+  await run(gitBin, ['fetch', '--prune', 'origin', 'main'], { cwd: repoDir });
+  const { stdout } = await run(gitBin, ['rev-parse', 'origin/main'], { cwd: repoDir });
+  return assertCommitSha(stdout);
+}
+
+async function isAncestorOf({ ancestorSha, descendantSha, run, gitBin, repoDir }) {
+  try {
+    await run(gitBin, ['merge-base', '--is-ancestor', ancestorSha, descendantSha], { cwd: repoDir });
+    return true;
+  } catch (error) {
+    if (error && error.code === 1) return false;
+    throw error;
+  }
+}
+
+async function supersedingMainSha({ targetSha, run, gitBin, repoDir }) {
+  const remoteSha = await readRemoteMain({ run, gitBin, repoDir });
+  if (remoteSha === targetSha) return null;
+  const isSuperseded = await isAncestorOf({
+    ancestorSha: targetSha,
+    descendantSha: remoteSha,
+    run,
+    gitBin,
+    repoDir,
+  });
+  if (!isSuperseded) {
+    throw new Error(
+      `origin/main is ${remoteSha.slice(0, 8)} and does not contain target ${targetSha.slice(0, 8)}; refusing deploy`
+    );
+  }
+  return remoteSha;
+}
+
+function supersededDeployResult(targetSha, supersededBy, log) {
+  log(`[auto-deploy] ${targetSha.slice(0, 8)} superseded by main ${supersededBy.slice(0, 8)}; skipping obsolete deploy`);
+  return {
+    status: 'superseded',
+    targetSha,
+    supersededBy,
+    changedFiles: [],
+    services: [],
+    immediateServices: [],
+    deferredServices: [],
+  };
 }
 
 /**
@@ -204,17 +280,36 @@ async function deployMonitor({
   pm2Bin = process.env.PM2_BIN || '/home/openclaw/.npm-global/bin/pm2',
   statePath = path.join(repoDir, 'db', '.monitor-deployed-sha'),
   lockPath = path.join(repoDir, 'db', '.monitor-deploy.lock'),
+  lockSleepFn = sleep,
+  lockAttempts = 120,
+  lockIntervalMs = 5000,
   log = () => {},
 }) {
   const targetSha = assertCommitSha(sha);
-  acquireLock(lockPath, fsImpl);
   try {
     await waitForCi({ sha: targetSha, run, log });
-    await run(gitBin, ['fetch', '--prune', 'origin', 'main'], { cwd: repoDir });
+  } catch (error) {
+    if (error.ciConclusion !== 'cancelled') throw error;
+    const supersededBy = await supersedingMainSha({ targetSha, run, gitBin, repoDir });
+    if (!supersededBy) throw error;
+    return supersededDeployResult(targetSha, supersededBy, log);
+  }
 
-    const { stdout: remoteOut } = await run(gitBin, ['rev-parse', 'origin/main'], { cwd: repoDir });
-    const remoteSha = assertCommitSha(remoteOut);
-    if (remoteSha !== targetSha) throw new Error(`origin/main is ${remoteSha.slice(0, 8)}, expected ${targetSha.slice(0, 8)}`);
+  const supersededBeforeLock = await supersedingMainSha({ targetSha, run, gitBin, repoDir });
+  if (supersededBeforeLock) return supersededDeployResult(targetSha, supersededBeforeLock, log);
+
+  await acquireLockWithRetry(lockPath, {
+    fsImpl,
+    sleepFn: lockSleepFn,
+    attempts: lockAttempts,
+    intervalMs: lockIntervalMs,
+    log,
+  });
+  try {
+    // Re-check after waiting for the mutation lock. A newer main push may have
+    // arrived while another green deploy was installing or restarting services.
+    const supersededAfterLock = await supersedingMainSha({ targetSha, run, gitBin, repoDir });
+    if (supersededAfterLock) return supersededDeployResult(targetSha, supersededAfterLock, log);
 
     const { stdout: dirtyOut } = await run(gitBin, ['status', '--porcelain', '--untracked-files=all'], { cwd: repoDir });
     if (dirtyOut.trim()) {
@@ -250,7 +345,15 @@ async function deployMonitor({
     if (deferredServices.length) {
       log(`[auto-deploy] deferred to last (it spawns this worker): ${deferredServices.join(', ')}`);
     }
-    return { targetSha, deployedSha, changedFiles, services: [...services], immediateServices, deferredServices };
+    return {
+      status: 'deployed',
+      targetSha,
+      deployedSha,
+      changedFiles,
+      services: [...services],
+      immediateServices,
+      deferredServices,
+    };
   } finally {
     try { fsImpl.unlinkSync(lockPath); } catch {}
   }
@@ -322,6 +425,7 @@ module.exports = {
   waitForSuccessfulCi,
   verifyHealth,
   deployMonitor,
+  acquireLockWithRetry,
   execFilePromise,
   notifyDeploy,
   restartServices,
