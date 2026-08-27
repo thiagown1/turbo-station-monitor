@@ -16,12 +16,12 @@
  * armed) roll back to the last-known-good deployment. It ships in SHADOW MODE:
  * it only sends a Telegram "WOULD roll back" alert and logs the decision.
  *
- * The actuator (rollbackToTarget) is fully written but DORMANT. It needs BOTH:
- *   (a) a kill-switch ON — prod Firestore `feature_flags/auto_rollback`
- *       {enabled:true} if a prod firebase-admin SA is on the box, ELSE a local
- *       file flag `<skill>/auto-rollback.enabled` must EXIST; AND
- *   (b) env `VERCEL_ROLLBACK_TOKEN` set (a Vercel token with rollback scope).
- * With neither present it can never call the Vercel API — it stays shadow-only.
+ * The actuator (rollbackToTarget) is DORMANT by default. A direct action needs
+ * the explicit catastrophic-auto rollout phase, ROLLBACK_DIRECT_ENABLE=1, the
+ * default-OFF kill switch, a Vercel token, deterministic policy eligibility,
+ * a strict candidate smoke, and an exact release-safety attestation. Human
+ * approval is accepted only as a release-bound, short-lived, one-time receipt
+ * from a trusted personal WhatsApp ingress. An LLM never authorizes or calls it.
  * A hard-stop file `<skill>/auto-rollback.disabled` overrides everything.
  *
  * Run:
@@ -43,7 +43,17 @@
 
 const fs = require('fs');
 const path = require('path');
-const { execFileSync } = require('child_process');
+const {
+  ROLLOUT_PHASE,
+  RECOMMENDATION,
+  ACTION,
+  normalizeEndpoint,
+  normalizeRolloutPhase,
+  assessRollback,
+  createApprovalProposal,
+  validateApprovalConfirmation,
+  consumeApprovalProposal,
+} = require('./lib/auto-rollback-policy');
 
 // ─── Paths ──────────────────────────────────────────────────────────
 const SKILL_DIR = path.join(__dirname, '..');                 // turbo-station-monitor/
@@ -60,27 +70,14 @@ catch { Database = require(path.join(SKILL_DIR, 'node_modules', 'better-sqlite3'
 
 // ─── Config / thresholds ────────────────────────────────────────────
 const BASE = (process.env.DASHBOARD_URL || 'https://www.turbostation.com.br').replace(/\/+$/, '');
-const DEPLOY_TELEGRAM_GROUP =
-  process.env.DEPLOY_TELEGRAM_GROUP || process.env.ALERT_TELEGRAM_GROUP || 'telegram:-5102620169';
 
 const POLL_INTERVAL_MS = Number(process.env.ROLLBACK_POLL_MS || 30 * 1000); // detector cadence
 const WINDOW_MS = Number(process.env.ROLLBACK_WINDOW_MS || 90 * 1000);      // rolling detection window
 const HEIGHTENED_WINDOW_MS = Number(process.env.ROLLBACK_HEIGHTENED_MS || 10 * 60 * 1000); // watch first 10 min after cutover
 const PRE_CUTOVER_WINDOW_MS = 5 * 60 * 1000;                                // baseline window before cutover
-
-// Critical detection (ALL must hold within the heightened window)
-const CRIT_RATIO = Number(process.env.ROLLBACK_CRIT_RATIO || 0.5);          // 5xx / total
-const CRIT_5XX_COUNT = Number(process.env.ROLLBACK_CRIT_5XX || 10);         // absolute 5xx floor
-const CRIT_TOTAL_FLOOR = Number(process.env.ROLLBACK_TOTAL_FLOOR || 20);    // sample-size floor
-
-// Attribution
-const PRE_CUTOVER_ELEVATED_RATIO = 0.3; // if 5xx ratio already this high BEFORE cutover -> upstream, not the deploy
-const MIN_DISTINCT_5XX_ENDPOINTS = 3;   // universal across >= 3 endpoints
-// A "dependency-free" endpoint whose failure strongly implicates the deploy itself
-const DEP_FREE_ENDPOINTS = ['/api/version'];
-// Endpoints that commonly 5xx from UPSTREAM deps (Firebase/Pagar.me/OCPP webhooks).
-// If the 5xx are CONFINED to these AND /api/version is fine -> upstream, not the deploy.
-const UPSTREAM_PRONE_PREFIXES = ['/api/webhook/', '/api/payment', '/api/pagarme', '/api/nfse'];
+const ROLLBACK_ROLLOUT_PHASE = normalizeRolloutPhase(process.env.ROLLBACK_ROLLOUT_PHASE);
+const DIRECT_ROLLBACK_ENABLED = process.env.ROLLBACK_DIRECT_ENABLE === '1';
+const RELEASE_SAFETY_PATH = process.env.ROLLBACK_RELEASE_SAFETY_PATH || '';
 
 // Guardrails (actuator only — dormant in shadow mode)
 const ANTI_FLAP_COOLDOWN_MS = 30 * 60 * 1000; // 30 min between rollback actions
@@ -109,11 +106,19 @@ function loadState() {
       seeded: false,
       actedForSha: null,       // at-most-once-per-deploy guard
       lastActionMs: 0,         // anti-flap cooldown anchor
-      lastShadowAlertSha: null // don't spam shadow alerts for the same bad deploy
+      lastActionStatus: null,
+      lastShadowAlertSha: null, // don't spam shadow alerts for the same bad deploy
+      lastBlockedAlertKey: null,
+      pendingProposal: null,
+      pendingConfirmation: null,
     };
   }
 }
-function saveState(s) { fs.writeFileSync(STATE_PATH, JSON.stringify(s, null, 2)); }
+function saveState(s) {
+  const tmp = `${STATE_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(s, null, 2), { mode: 0o600 });
+  fs.renameSync(tmp, STATE_PATH);
+}
 
 // ─── Alerts → team WhatsApp group via the support-copilot relay ──────────────
 // Telegram dropped per team decision 2026-06-22; every alert now goes to the
@@ -123,11 +128,16 @@ const SUPPORT_BASE = process.env.SUPPORT_API_BASE || 'http://127.0.0.1:3005';
 const MONITOR_API_SECRET = process.env.MONITOR_API_SECRET || process.env.SUPPORT_API_SECRET || '';
 const ALERTS_CONVERSATION_ID = process.env.DEPLOY_HOOK_ALERTS_CONV || 'conv_jiuijxjtmnet23i9';
 const ALERTS_BRAND = process.env.DEPLOY_WATCH_ALERTS_BRAND || 'turbo_station';
+const PERSONAL_APPROVAL_CONVERSATION_ID = process.env.ROLLBACK_PERSONAL_CONVERSATION_ID || '';
+const PERSONAL_APPROVER_JID = process.env.ROLLBACK_PERSONAL_APPROVER_JID || '';
+const ALLOWED_APPROVER_IDS = (process.env.ROLLBACK_ALLOWED_APPROVER_IDS || '')
+  .split(',').map(v => v.trim()).filter(Boolean);
 let DRY_TELEGRAM = false; // dry-run toggle (set by --dry-telegram): log instead of send
-async function sendWhatsApp(text) {
+async function sendWhatsAppToConversation(text, conversationId) {
   if (DRY_TELEGRAM) { log('[dry-send] WOULD WhatsApp:\n' + text); return true; }
   if (!MONITOR_API_SECRET) { log('whatsapp relay skipped: MONITOR_API_SECRET unset'); return false; }
-  const url = new URL(`/api/support/conversations/${encodeURIComponent(ALERTS_CONVERSATION_ID)}/messages`, SUPPORT_BASE);
+  if (!conversationId) { log('whatsapp relay skipped: conversation id unset'); return false; }
+  const url = new URL(`/api/support/conversations/${encodeURIComponent(conversationId)}/messages`, SUPPORT_BASE);
   url.searchParams.set('brandId', ALERTS_BRAND);
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 30000);
@@ -138,10 +148,100 @@ async function sendWhatsApp(text) {
       body: JSON.stringify({ body: text, source: 'auto-rollback-watchdog' }),
       signal: controller.signal,
     });
-    if (!res.ok) { log(`whatsapp relay POST ${res.status} conv=${ALERTS_CONVERSATION_ID}`); return false; }
+    if (!res.ok) { log(`whatsapp relay POST ${res.status} conv=${conversationId}`); return false; }
     log('whatsapp relay accepted'); return true;
   } catch (e) { log('whatsapp relay unreachable:', e.message); return false; }
   finally { clearTimeout(t); }
+}
+
+async function sendWhatsApp(text) {
+  return sendWhatsAppToConversation(text, ALERTS_CONVERSATION_ID);
+}
+
+function personalApprovalDestinationValid() {
+  return Boolean(
+    PERSONAL_APPROVAL_CONVERSATION_ID &&
+    PERSONAL_APPROVAL_CONVERSATION_ID !== ALERTS_CONVERSATION_ID &&
+    PERSONAL_APPROVER_JID.endsWith('@s.whatsapp.net') &&
+    !PERSONAL_APPROVER_JID.endsWith('@g.us') &&
+    ALLOWED_APPROVER_IDS.includes(PERSONAL_APPROVER_JID)
+  );
+}
+
+function approvalDeliveryAction(existingMessageId, status) {
+  if (!existingMessageId || status === 'failed') return 'post';
+  if (status === 'sent') return 'confirmed';
+  return 'wait';
+}
+
+function approvalDeliveryPollScheduleMs() {
+  const raw = process.env.ROLLBACK_APPROVAL_DELIVERY_POLL_MS || process.env.WHATSAPP_DELIVERY_POLL_MS;
+  if (raw) {
+    const parsed = raw.split(',').map(v => Number(v.trim())).filter(v => Number.isFinite(v) && v >= 0);
+    if (parsed.length) return parsed;
+  }
+  return [500, 1000, 2000, 3000];
+}
+
+async function fetchApprovalDeliveryStatus(messageId) {
+  try {
+    const url = new URL(`/api/support/conversations/${encodeURIComponent(PERSONAL_APPROVAL_CONVERSATION_ID)}/messages`, SUPPORT_BASE);
+    url.searchParams.set('limit', '50');
+    const res = await fetch(url.toString(), { headers: { 'x-api-secret': MONITOR_API_SECRET } });
+    if (!res.ok) return null;
+    const json = await res.json().catch(() => null);
+    const message = (json?.messages || []).find(item => item?.id === messageId);
+    return message ? (message.delivery_status || 'pending') : null;
+  } catch {
+    return null;
+  }
+}
+
+async function confirmApprovalDelivery(messageId) {
+  for (const waitMs of approvalDeliveryPollScheduleMs()) {
+    await new Promise(resolve => setTimeout(resolve, waitMs));
+    const status = await fetchApprovalDeliveryStatus(messageId);
+    if (status === 'sent' || status === 'failed') return status;
+  }
+  return 'unconfirmed';
+}
+
+async function sendApprovalProposal(text, existingMessageId = null) {
+  if (!personalApprovalDestinationValid()) {
+    log('approval proposal blocked: personal WhatsApp allowlist is incomplete or points to the alerts conversation');
+    return { delivered: false, messageId: null, status: 'invalid-destination' };
+  }
+  if (DRY_TELEGRAM) {
+    log('[dry-send] WOULD approval WhatsApp:\n' + text);
+    return { delivered: true, messageId: existingMessageId || 'dry-run', status: 'sent' };
+  }
+
+  if (existingMessageId) {
+    const status = await fetchApprovalDeliveryStatus(existingMessageId);
+    const action = approvalDeliveryAction(existingMessageId, status);
+    if (action === 'confirmed') return { delivered: true, messageId: existingMessageId, status };
+    if (action === 'wait') return { delivered: false, messageId: existingMessageId, status: status || 'unconfirmed' };
+  }
+
+  if (!MONITOR_API_SECRET) return { delivered: false, messageId: null, status: 'missing-secret' };
+  const url = new URL(`/api/support/conversations/${encodeURIComponent(PERSONAL_APPROVAL_CONVERSATION_ID)}/messages`, SUPPORT_BASE);
+  url.searchParams.set('brandId', ALERTS_BRAND);
+  try {
+    const res = await fetch(url.toString(), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json', 'x-brand-id': ALERTS_BRAND, 'x-api-secret': MONITOR_API_SECRET },
+      body: JSON.stringify({ body: text, source: 'auto-rollback-watchdog' }),
+    });
+    if (!res.ok) return { delivered: false, messageId: null, status: `post-${res.status}` };
+    const json = await res.json().catch(() => null);
+    const messageId = typeof json?.id === 'string' ? json.id : null;
+    if (!messageId) return { delivered: false, messageId: null, status: 'missing-message-id' };
+    const status = await confirmApprovalDelivery(messageId);
+    return { delivered: status === 'sent', messageId, status };
+  } catch (e) {
+    log('approval proposal relay unreachable:', e.message);
+    return { delivered: false, messageId: null, status: 'unreachable' };
+  }
 }
 
 // ─── Deploy detection (poll /api/version, like nextjs-deploy-trigger.js) ──────
@@ -157,7 +257,51 @@ async function currentSha() {
   return null;
 }
 
+function currentProductionShaBlocker(state, liveSha) {
+  if (!liveSha) return 'current production SHA could not be confirmed on this tick';
+  if (liveSha !== state.newSha) return `current production SHA ${liveSha} does not match watched release ${state.newSha}`;
+  return null;
+}
+
 // ─── Metrics from vercel.db (read-only) ──────────────────────────────
+function normalizeRouteRows(rows) {
+  const byRoute = new Map();
+  for (const row of rows || []) {
+    const endpoint = normalizeEndpoint(row.endpoint);
+    if (!endpoint) continue;
+    const merged = byRoute.get(endpoint) || {
+      endpoint, total: 0, c5xx: 0, success: 0, first5xxMs: null, last5xxMs: null,
+    };
+    merged.total += Number(row.total || 0);
+    merged.c5xx += Number(row.c5xx || 0);
+    merged.success += Number(row.success || 0);
+    if (row.first5xxMs != null) {
+      merged.first5xxMs = merged.first5xxMs == null
+        ? Number(row.first5xxMs)
+        : Math.min(merged.first5xxMs, Number(row.first5xxMs));
+    }
+    if (row.last5xxMs != null) {
+      merged.last5xxMs = merged.last5xxMs == null
+        ? Number(row.last5xxMs)
+        : Math.max(merged.last5xxMs, Number(row.last5xxMs));
+    }
+    byRoute.set(endpoint, merged);
+  }
+  return [...byRoute.values()];
+}
+
+function normalizeEndpointCounts(rows) {
+  const byRoute = new Map();
+  for (const row of rows || []) {
+    const endpoint = normalizeEndpoint(row.endpoint);
+    if (!endpoint) continue;
+    byRoute.set(endpoint, (byRoute.get(endpoint) || 0) + Number(row.c || 0));
+  }
+  return [...byRoute.entries()]
+    .map(([endpoint, c]) => ({ endpoint, c }))
+    .sort((a, b) => b.c - a.c);
+}
+
 function queryWindow(db, fromMs, toMs) {
   const total = db.prepare(
     'SELECT COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code IS NOT NULL'
@@ -165,7 +309,7 @@ function queryWindow(db, fromMs, toMs) {
   const c5xx = db.prepare(
     'SELECT COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code>=500'
   ).get(fromMs, toMs).c;
-  const endpoints = db.prepare(
+  const rawEndpoints = db.prepare(
     'SELECT endpoint, COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code>=500 ' +
     'AND endpoint IS NOT NULL GROUP BY endpoint ORDER BY c DESC'
   ).all(fromMs, toMs);
@@ -174,7 +318,18 @@ function queryWindow(db, fromMs, toMs) {
     "SELECT status_code, COUNT(*) c FROM vercel_logs WHERE timestamp>=? AND timestamp<? " +
     "AND endpoint LIKE '%/api/version%' GROUP BY status_code"
   ).all(fromMs, toMs);
-  return { total, c5xx, ratio: total ? c5xx / total : 0, endpoints, verRows };
+  const rawRouteRows = db.prepare(
+    'SELECT endpoint, COUNT(*) total, ' +
+    'SUM(CASE WHEN status_code>=500 THEN 1 ELSE 0 END) c5xx, ' +
+    'SUM(CASE WHEN status_code>=200 AND status_code<400 THEN 1 ELSE 0 END) success, ' +
+    'MIN(CASE WHEN status_code>=500 THEN timestamp ELSE NULL END) first5xxMs, ' +
+    'MAX(CASE WHEN status_code>=500 THEN timestamp ELSE NULL END) last5xxMs ' +
+    'FROM vercel_logs WHERE timestamp>=? AND timestamp<? AND status_code IS NOT NULL ' +
+    'AND endpoint IS NOT NULL GROUP BY endpoint'
+  ).all(fromMs, toMs);
+  const endpoints = normalizeEndpointCounts(rawEndpoints);
+  const routeRows = normalizeRouteRows(rawRouteRows);
+  return { total, c5xx, ratio: total ? c5xx / total : 0, endpoints, verRows, routeRows };
 }
 
 function versionHealth(verRows) {
@@ -187,78 +342,55 @@ function versionHealth(verRows) {
 }
 
 // ─── The core detector + attribution test ────────────────────────────
-// Returns { critical, attributed, reasons[], evidence{} }
-function evaluate(db, nowMs, deployStartMs) {
-  const winFrom = nowMs - WINDOW_MS;
+// The policy is deterministic. An optional intelligent agent may summarize the
+// evidence, but its output is never an input to action authorization.
+function evaluate(db, nowMs, state, readiness = {}) {
+  const winFrom = state.deployStartMs
+    ? Math.max(nowMs - WINDOW_MS, state.deployStartMs)
+    : nowMs - WINDOW_MS;
   const m = queryWindow(db, winFrom, nowMs);
+  const pre = state.deployStartMs
+    ? queryWindow(db, state.deployStartMs - PRE_CUTOVER_WINDOW_MS, state.deployStartMs)
+    : { total: 0, c5xx: 0, ratio: 0, routeRows: [] };
+  const vh = versionHealth(m.verRows);
+  const policy = assessRollback({
+    nowMs,
+    heightenedWindowMs: HEIGHTENED_WINDOW_MS,
+    rolloutPhase: ROLLBACK_ROLLOUT_PHASE,
+    deploy: {
+      newSha: state.newSha,
+      previousSha: state.prevSha,
+      currentSha: state.currentSha,
+      cutoverMs: state.deployStartMs,
+    },
+    baseline: pre.routeRows || [],
+    post: m.routeRows || [],
+    aggregate: { total: m.total, c5xx: m.c5xx, distinct5xxEndpoints: m.endpoints.length },
+    rollbackCandidate: readiness.rollbackCandidate || {},
+    changeSafety: readiness.changeSafety || {},
+    guardrails: readiness.guardrails || {},
+  });
 
-  const result = {
-    critical: false, attributed: false, reasons: [], blockers: [],
+  return {
+    ...policy,
+    critical: policy.recommendation !== RECOMMENDATION.OBSERVE,
+    attributed: policy.recommendation === RECOMMENDATION.ROLLBACK_RECOMMENDED,
     evidence: {
       windowSec: Math.round(WINDOW_MS / 1000),
-      total: m.total, c5xx: m.c5xx, ratio: Number(m.ratio.toFixed(3)),
+      total: m.total,
+      c5xx: m.c5xx,
+      ratio: Number(m.ratio.toFixed(3)),
       distinctEndpoints: m.endpoints.length,
       topEndpoints: m.endpoints.slice(0, 8).map(e => `${e.endpoint} (${e.c})`),
-    }
+      preCutoverRatio: Number(pre.ratio.toFixed(3)),
+      preCutover5xx: pre.c5xx,
+      versionHealth: vh,
+      routeClasses: (m.routeRows || [])
+        .filter(row => Number(row.c5xx || 0) > 0)
+        .slice(0, 12)
+        .map(row => ({ endpoint: row.endpoint, c5xx: row.c5xx, total: row.total })),
+    },
   };
-
-  // 1) CRITICAL gate
-  result.critical = m.ratio >= CRIT_RATIO && m.c5xx >= CRIT_5XX_COUNT && m.total >= CRIT_TOTAL_FLOOR;
-  if (!result.critical) {
-    result.reasons.push(`not critical: ratio=${m.ratio.toFixed(2)} 5xx=${m.c5xx} total=${m.total} ` +
-      `(need ratio>=${CRIT_RATIO}, 5xx>=${CRIT_5XX_COUNT}, total>=${CRIT_TOTAL_FLOOR})`);
-    return result;
-  }
-  result.reasons.push(`CRITICAL: ${m.c5xx}/${m.total} 5xx (${(m.ratio * 100).toFixed(0)}%) over ${result.evidence.windowSec}s`);
-
-  // 2) Heightened-window gate (only attribute to the deploy in the first ~10 min)
-  if (deployStartMs && nowMs - deployStartMs > HEIGHTENED_WINDOW_MS) {
-    result.blockers.push(`outside heightened window (deploy +${Math.round((nowMs - deployStartMs) / 60000)}min > ` +
-      `${Math.round(HEIGHTENED_WINDOW_MS / 60000)}min) — late surge, not attributing to this deploy`);
-  }
-
-  // 3) Attribution (a): surge starts at/after cutover (pre-cutover must be quiet)
-  if (deployStartMs) {
-    const pre = queryWindow(db, deployStartMs - PRE_CUTOVER_WINDOW_MS, deployStartMs);
-    result.evidence.preCutoverRatio = Number(pre.ratio.toFixed(3));
-    result.evidence.preCutover5xx = pre.c5xx;
-    if (pre.ratio >= PRE_CUTOVER_ELEVATED_RATIO) {
-      result.blockers.push(`pre-cutover 5xx already elevated (ratio=${pre.ratio.toFixed(2)}) — upstream, not the deploy`);
-    } else {
-      result.reasons.push(`pre-cutover clean (ratio=${pre.ratio.toFixed(2)}) — surge began at cutover`);
-    }
-  } else {
-    result.reasons.push('no cutover recorded — treating as standalone critical (cannot attribute to a specific deploy)');
-  }
-
-  // 4) Attribution (b)+(c): universal across >=3 endpoints; not confined to upstream-prone routes;
-  //    /api/version status is the strongest deploy-broken signal.
-  const distinct = m.endpoints.length;
-  if (distinct < MIN_DISTINCT_5XX_ENDPOINTS) {
-    result.blockers.push(`5xx confined to ${distinct} endpoint(s) (<${MIN_DISTINCT_5XX_ENDPOINTS}) — not universal`);
-  } else {
-    result.reasons.push(`universal across ${distinct} endpoints`);
-  }
-
-  const nonUpstream = m.endpoints.filter(e =>
-    !UPSTREAM_PRONE_PREFIXES.some(p => (e.endpoint || '').startsWith(p)));
-  const vh = versionHealth(m.verRows);
-  const depFreeFailing = m.endpoints.some(e => DEP_FREE_ENDPOINTS.includes(e.endpoint)) || vh.broken;
-
-  result.evidence.versionHealth = vh;
-  result.evidence.nonUpstreamFailing = nonUpstream.slice(0, 5).map(e => `${e.endpoint} (${e.c})`);
-
-  if (nonUpstream.length === 0 && !vh.broken) {
-    result.blockers.push('5xx CONFINED to webhook/payment routes and /api/version is fine — upstream dep (Firebase/Pagar.me), not the deploy');
-  } else if (vh.broken) {
-    result.reasons.push(`/api/version itself failing/flipping (ok=${vh.ok} bad=${vh.bad}) — strong deploy-broken signal`);
-  } else {
-    result.reasons.push(`${nonUpstream.length} non-upstream endpoints failing (incl. dependency-free routes)`);
-  }
-  if (depFreeFailing) result.reasons.push('dependency-free endpoint among the failures');
-
-  result.attributed = result.critical && result.blockers.length === 0;
-  return result;
 }
 
 // ─── Kill-switch resolution (default OFF; shadow mode wins on any ambiguity) ──
@@ -326,29 +458,108 @@ async function selectRollbackTarget(prevSha) {
   });
   let target = matches.find(d => d.isRollbackCandidate === true) || matches[0];
   if (!target) return { target: null, reason: `no READY production deployment matches known-good sha ${prevSha}` };
-  // Smoke the candidate's own URL before trusting it. Deployment URLs sit behind Vercel
-  // Deployment Protection, so send the automation bypass header. A 401/403 means "protected"
-  // (cannot verify via the direct URL) — NOT a real failure: proceed on the sha match and let
-  // the post-rollback re-smoke of the PUBLIC prod alias be the final check. Only a real 5xx
-  // from the deployment aborts (refuse to roll onto a broken target).
+  // Smoke the candidate's own URL before trusting it. Any inaccessible, non-200,
+  // malformed, or SHA-mismatched response is inconclusive and therefore blocks
+  // rollback. A post-action smoke must never be the first proof of target health.
   const smokeUrl = target.url ? (target.url.startsWith('http') ? target.url : `https://${target.url}`) : null;
-  if (smokeUrl) {
-    const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
-    const headers = bypass ? { 'x-vercel-protection-bypass': bypass } : {};
-    try {
-      const r = await fetch(`${smokeUrl}/api/version`, { method: 'GET', redirect: 'manual', headers });
-      if (r.status === 401 || r.status === 403) {
-        log(`target ${target.uid} smoke ${r.status} (deployment-protection wall; ${bypass ? 'bypass rejected' : 'no bypass secret set'}) — proceeding on sha match, post-rollback re-smoke verifies`);
-      } else if (r.status >= 500) {
-        return { target: null, reason: `target ${target.uid} smoke FAILED (${r.status}) — refusing to roll onto a broken deployment` };
-      }
-    } catch (e) { log(`target ${target.uid} smoke error: ${e.message} — proceeding on sha match`); }
+  if (!smokeUrl) return { target: null, reason: `target ${target.uid} has no smokeable deployment URL` };
+  const bypass = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
+  const headers = bypass ? { 'x-vercel-protection-bypass': bypass } : {};
+  try {
+    const r = await fetch(`${smokeUrl}/api/version`, { method: 'GET', redirect: 'manual', headers });
+    if (r.status !== 200) {
+      return { target: null, reason: `target ${target.uid} smoke is inconclusive (${r.status}); exact HTTP 200 is required` };
+    }
+    const body = await r.json().catch(() => null);
+    const smokeSha = body && String(body.sha || body.commit || body.gitCommitSha || '');
+    if (!smokeSha || !(smokeSha.startsWith(prevSha) || prevSha.startsWith(smokeSha))) {
+      return { target: null, reason: `target ${target.uid} smoke SHA does not match captured previous SHA` };
+    }
+    return { target, reason: 'ok', smokeStatus: r.status, smokeSha };
+  } catch (e) {
+    return { target: null, reason: `target ${target.uid} smoke failed closed: ${e.message}` };
   }
-  return { target, reason: 'ok' };
+}
+
+function loadReleaseSafetyAttestation(state, nowMs = Date.now()) {
+  const blocked = {
+    candidateConfirmed: false,
+    noExternalDependency: false,
+    noFinancialAmbiguity: false,
+    noIrreversibleActivation: false,
+    noMigration: false,
+    noRuntimeFlagChange: false,
+  };
+  if (!RELEASE_SAFETY_PATH) return blocked;
+  try {
+    const data = JSON.parse(fs.readFileSync(RELEASE_SAFETY_PATH, 'utf8'));
+    const createdAtMs = Date.parse(data.createdAt || '');
+    const exactRelease = data.releaseSha === state.newSha && data.previousSha === state.prevSha;
+    const fresh = Number.isFinite(createdAtMs) && createdAtMs <= nowMs && nowMs - createdAtMs <= HEIGHTENED_WINDOW_MS;
+    if (!exactRelease || !fresh) return blocked;
+    return {
+      candidateConfirmed: data.candidateConfirmed === true,
+      noExternalDependency: data.noExternalDependency === true,
+      noFinancialAmbiguity: data.noFinancialAmbiguity === true,
+      noIrreversibleActivation: data.noIrreversibleActivation === true,
+      noMigration: data.noMigration === true,
+      noRuntimeFlagChange: data.noRuntimeFlagChange === true,
+    };
+  } catch (e) {
+    log('release safety attestation failed closed:', e.message);
+    return blocked;
+  }
+}
+
+async function resolveKillSwitch() {
+  const ks = killSwitchOn();
+  if (ks.on === 'firestore-deferred') return resolveFirestoreFlag(ks.admin);
+  return ks;
+}
+
+async function buildReadiness(state, nowMs = Date.now(), options = {}) {
+  const ks = await resolveKillSwitch();
+  let selection = { target: null, reason: 'VERCEL_ROLLBACK_TOKEN unset; previous candidate cannot be verified' };
+  if (process.env.VERCEL_ROLLBACK_TOKEN && state.prevSha) {
+    try { selection = await selectRollbackTarget(state.prevSha); }
+    catch (e) { selection = { target: null, reason: `rollback candidate lookup failed closed: ${e.message}` }; }
+  }
+  return {
+    selection,
+    ks,
+    rollbackCandidate: {
+      ready: Boolean(selection.target),
+      shaMatches: Boolean(selection.target),
+      smokeVerified: Boolean(selection.target && selection.smokeStatus === 200 && selection.smokeSha),
+      smokeStatus: selection.smokeStatus || null,
+      smokeSha: selection.smokeSha || null,
+    },
+    // For an unexpired proposal, keep the attestation freshness decision bound
+    // to proposal creation while still re-reading its current exact-release flags.
+    changeSafety: loadReleaseSafetyAttestation(state, options.attestationAsOfMs || nowMs),
+    guardrails: {
+      killSwitchAllows: ks.on === true && DIRECT_ROLLBACK_ENABLED,
+      dedupeAvailable: true,
+      alreadyActedForRelease: state.actedForSha === state.newSha,
+      cooldownElapsed: nowMs - (state.lastActionMs || 0) >= ANTI_FLAP_COOLDOWN_MS,
+    },
+  };
 }
 
 // DORMANT actuator. Returns a result object; PAGES on every branch.
-async function rollbackToTarget(state, evalResult) {
+async function rollbackToTarget(state, evalResult, authorization, selectedTarget) {
+  if (!authorization || !['deterministic-policy', 'trusted-human-confirmation'].includes(authorization.kind)) {
+    return { acted: false, reason: 'missing trusted rollback authorization' };
+  }
+  const currentKillSwitch = await resolveKillSwitch();
+  if (currentKillSwitch.on !== true) {
+    return { acted: false, reason: 'kill switch is not currently enabled' };
+  }
+  if (authorization.kind === 'deterministic-policy' &&
+      (ROLLBACK_ROLLOUT_PHASE !== ROLLOUT_PHASE.CATASTROPHIC_AUTO || !DIRECT_ROLLBACK_ENABLED ||
+       evalResult.action !== ACTION.DIRECT_ROLLBACK_PERMITTED)) {
+    return { acted: false, reason: 'direct rollback phase or deterministic eligibility is not active' };
+  }
   // ── Guardrail: hard stop ──
   if (fs.existsSync(DISABLE_FLAG)) { await sendWhatsApp('🛑 auto-rollback ABORTED: hard-stop file present'); return { acted: false, reason: 'hard-stop' }; }
   // ── Guardrail: token must be present ──
@@ -362,15 +573,30 @@ async function rollbackToTarget(state, evalResult) {
   // ── Need a known-good target ──
   if (!state.prevSha) { await sendWhatsApp('🚨 auto-rollback: no known-good prevSha captured — manual rollback required'); return { acted: false, reason: 'no prevSha' }; }
 
-  const sel = await selectRollbackTarget(state.prevSha);
+  const sel = selectedTarget ? { target: selectedTarget, reason: 'pre-verified' } : await selectRollbackTarget(state.prevSha);
   if (!sel.target) {
     await sendWhatsApp(`🚨 auto-rollback ABORTED: ${sel.reason} — MANUAL ROLLBACK REQUIRED for bad deploy ${state.newSha}`);
     return { acted: false, reason: sel.reason };
   }
 
+  // Consume the per-release action before the external side effect. A crash or
+  // ambiguous network response must require investigation, never a blind retry.
+  state.actedForSha = state.newSha;
+  state.lastActionMs = Date.now();
+  state.lastActionStatus = 'issuing';
+  saveState(state);
+
   // ── Execute the rollback (the only place the Vercel rollback API is called) ──
   await sendWhatsApp(`🔴 AUTO-ROLLBACK EXECUTING: prod ${state.newSha} -> ${state.prevSha} (deployment ${sel.target.uid})`);
-  await vercelFetch(`/v1/projects/${VERCEL_PROJECT_ID}/rollback/${sel.target.uid}`, { method: 'POST' });
+  try {
+    await vercelFetch(`/v1/projects/${VERCEL_PROJECT_ID}/rollback/${sel.target.uid}`, { method: 'POST' });
+  } catch (e) {
+    state.lastActionStatus = 'issuance-unknown';
+    saveState(state);
+    await sendWhatsApp(`⚠️ AUTO-ROLLBACK não pôde ser confirmado após a chamada à Vercel para ${state.newSha}. ` +
+      'A tentativa foi consumida e não será repetida automaticamente. INVESTIGAR.');
+    return { acted: false, ambiguous: true, reason: e.message };
+  }
 
   // ── Poll for completion (current sha should flip back to prevSha) ──
   let flipped = false;
@@ -385,14 +611,103 @@ async function rollbackToTarget(state, evalResult) {
   let prodOk = false;
   try { const r = await fetch(`${BASE}/api/version`, { redirect: 'manual' }); prodOk = r.ok; } catch { /* */ }
 
-  state.actedForSha = state.newSha;
-  state.lastActionMs = Date.now();
+  state.lastActionStatus = prodOk && flipped ? 'confirmed' : 'issued-unverified';
   saveState(state);
 
   await sendWhatsApp(prodOk && flipped
     ? `✅ AUTO-ROLLBACK COMPLETE: prod restored to ${state.prevSha} and /api/version is 200`
     : `⚠️ AUTO-ROLLBACK issued but prod NOT confirmed healthy (flipped=${flipped} smoke=${prodOk}) — INVESTIGATE`);
   return { acted: true, target: sel.target.uid, prodOk, flipped };
+}
+
+function reasonString(ev) {
+  const e = ev.evidence || {};
+  return `class=${ev.failureClass}; 5xx ${e.c5xx || 0}/${e.total || 0} (${Math.round((e.ratio || 0) * 100)}%) over ${e.windowSec || 0}s; ` +
+    `top=${(e.topEndpoints || []).slice(0, 4).join(', ') || 'none'}; reasons=${(ev.reasons || []).join('; ')}`;
+}
+
+function rollbackIsReversible(readiness) {
+  const safety = readiness.changeSafety || {};
+  return safety.noIrreversibleActivation === true && safety.noMigration === true && safety.noRuntimeFlagChange === true;
+}
+
+function readinessBlocksBeforeAction(rolloutPhase, readiness = {}) {
+  if (normalizeRolloutPhase(rolloutPhase) === ROLLOUT_PHASE.SHADOW) return false;
+  return !readiness.selection?.target || !rollbackIsReversible(readiness);
+}
+
+function killSwitchAllowsActuation(readiness = {}) {
+  return readiness.ks?.on === true;
+}
+
+function prepareApprovalProposal(state, evaluation, nowMs = Date.now()) {
+  const current = state.pendingProposal;
+  if (
+    current?.status === 'pending'
+    && current.releaseSha === state.newSha
+    && current.targetSha === state.prevSha
+    && Number(current.expiresAtMs) > nowMs
+  ) return false;
+
+  state.pendingProposal = createApprovalProposal({
+    releaseSha: state.newSha,
+    targetSha: state.prevSha,
+    nowMs,
+  });
+  state.pendingProposal.evaluation = JSON.parse(JSON.stringify(evaluation));
+  state.pendingConfirmation = null;
+  state.lastShadowAlertSha = null;
+  return true;
+}
+
+function pendingProposalEvaluation(state = {}, nowMs = Date.now()) {
+  const proposal = state.pendingProposal;
+  if (!proposal) return null;
+  if (
+    proposal.status !== 'pending'
+    || proposal.releaseSha !== state.newSha
+    || proposal.targetSha !== state.prevSha
+  ) return null;
+  if (!Number.isFinite(Number(proposal.expiresAtMs)) || nowMs > Number(proposal.expiresAtMs)) return null;
+  const evaluation = proposal.evaluation;
+  return evaluation?.critical === true ? evaluation : null;
+}
+
+function pendingConfirmationEvaluation(state = {}, nowMs = Date.now()) {
+  return state.pendingConfirmation ? pendingProposalEvaluation(state, nowMs) : null;
+}
+
+function pendingProposalNeedsAttention(state = {}, nowMs = Date.now()) {
+  if (!pendingProposalEvaluation(state, nowMs)) return false;
+  return Boolean(state.pendingConfirmation) || state.pendingProposal.deliveryStatus !== 'sent';
+}
+
+function formatApprovalProposal(proposal, reasonStr) {
+  const expiresAt = new Date(proposal.expiresAtMs).toISOString();
+  return `🔶 PROPOSTA DE ROLLBACK ${proposal.id}\n` +
+    `Release atual: ${proposal.releaseSha}\nCandidato anterior verificado: ${proposal.targetSha}\n` +
+    `Evidência: ${reasonStr}\nExpira: ${expiresAt}\n` +
+    'Para autorizar, responda na conversa pessoal com todos os campos abaixo:\n' +
+    `Ação: CONFIRM_ROLLBACK\nID: ${proposal.id}\nNonce: ${proposal.nonce}\n` +
+    `Release: ${proposal.releaseSha}\nDestino: ${proposal.targetSha}\n` +
+    'Uso único; grupos não são aceitos.';
+}
+
+async function alertBlockedOnce(state, ev, detail, deps = {}) {
+  const send = deps.send || sendWhatsApp;
+  const persist = deps.persist || saveState;
+  const audit = deps.audit || decisionLog;
+  const key = `${state.newSha}:${ev.failureClass}:${detail}`;
+  if (state.lastBlockedAlertKey === key) return;
+  const delivered = await send(`🚨 deploy-watch: ${ev.failureClass} em ${state.newSha}. Rollback automático NÃO apropriado. ` +
+    `${detail}. Evidência: ${reasonString(ev)}. Ação: investigar.`);
+  audit({
+    phase: 'alert-investigate', newSha: state.newSha, prevSha: state.prevSha,
+    failureClass: ev.failureClass, detail, evidence: ev.evidence, delivered,
+  });
+  if (!delivered) return;
+  state.lastBlockedAlertKey = key;
+  persist(state);
 }
 
 // ─── One detector tick ───────────────────────────────────────────────
@@ -415,58 +730,165 @@ async function tick() {
       state.deployStartMs = now;
       state.actedForSha = null;
       state.lastShadowAlertSha = null;
+      state.lastBlockedAlertKey = null;
+      state.pendingProposal = null;
+      state.pendingConfirmation = null;
       saveState(state);
-      log(`ARMED: new deploy ${state.prevSha} -> ${state.newSha} at ${new Date(now).toISOString()}`);
-      await sendWhatsApp(`🟢 auto-rollback-watchdog ARMED for new prod deploy ${state.newSha} (good target: ${state.prevSha}). Watching 5xx for ${Math.round(HEIGHTENED_WINDOW_MS / 60000)} min.`);
+      log(`WATCH ACTIVE: new deploy ${state.prevSha} -> ${state.newSha} phase=${ROLLBACK_ROLLOUT_PHASE}`);
+      await sendWhatsApp(`🟢 auto-rollback-watchdog observando o novo deploy ${state.newSha} por ${Math.round(HEIGHTENED_WINDOW_MS / 60000)} min. ` +
+        `Fase=${ROLLBACK_ROLLOUT_PHASE}; rollback direto=${DIRECT_ROLLBACK_ENABLED ? 'configurado, ainda sujeito a todos os gates' : 'DESATIVADO'}. ` +
+        `Esta mensagem confirma monitoramento, não execução automática.`);
     }
   }
 
-  // 2) Evaluate within the heightened window only.
+  // 2) Detect only inside the heightened window. A release-bound proposal may
+  // still finish delivery or consume a confirmation until its own shorter TTL.
   const inWindow = state.deployStartMs && now - state.deployStartMs <= HEIGHTENED_WINDOW_MS;
-  if (!inWindow) { db.close(); return; }
+  const proposalNeedsAttention = pendingProposalNeedsAttention(state, now);
+  if (!inWindow && !proposalNeedsAttention) { db.close(); return; }
 
-  const ev = evaluate(db, now, state.deployStartMs);
-  db.close();
-
-  if (!ev.critical) { log(`ok — ${ev.reasons[0]}`); return; }
-
-  // CRITICAL: log every critical evaluation.
-  decisionLog({ phase: 'critical-eval', newSha: state.newSha, prevSha: state.prevSha, attributed: ev.attributed, reasons: ev.reasons, blockers: ev.blockers, evidence: ev.evidence });
-
-  if (!ev.attributed) {
-    log(`CRITICAL but NOT deploy-attributed — blockers: ${ev.blockers.join('; ')}`);
-    return; // do not alert/act — likely upstream
+  let ev = inWindow ? evaluate(db, now, state) : null;
+  const resumedEvaluation = !inWindow
+    ? pendingProposalEvaluation(state, now)
+    : (!ev.critical && proposalNeedsAttention ? pendingProposalEvaluation(state, now) : null);
+  if (resumedEvaluation) {
+    ev = resumedEvaluation;
+    decisionLog({
+      phase: 'pending-confirmation-resumed', proposalId: state.pendingProposal.id,
+      newSha: state.newSha, prevSha: state.prevSha,
+    });
   }
 
-  // CRITICAL + attributed → SHADOW alert (once per bad deploy), and (if armed) act.
-  const ks = killSwitchOn();
-  let armed = false, ksSource = ks.source;
-  if (ks.on === true) armed = true;
-  else if (ks.on === 'firestore-deferred') { const f = await resolveFirestoreFlag(ks.admin); armed = f.on; ksSource = f.source; }
+  if (!ev?.critical) { db.close(); log(`ok — ${ev?.reasons?.[0] || 'no active proposal or critical signal'}`); return; }
 
-  const ev5 = ev.evidence;
-  const reasonStr = `5xx ${ev5.c5xx}/${ev5.total} (${(ev5.ratio * 100).toFixed(0)}%) over ${ev5.windowSec}s, universal across ${ev5.distinctEndpoints} endpoints` +
-    (ev5.versionHealth && ev5.versionHealth.broken ? `, /api/version broken (ok=${ev5.versionHealth.ok} bad=${ev5.versionHealth.bad})` : '') +
-    `; top: ${(ev5.topEndpoints || []).slice(0, 4).join(', ')}`;
+  // CRITICAL: log every critical evaluation.
+  decisionLog({ phase: 'critical-eval', rolloutPhase: ROLLBACK_ROLLOUT_PHASE, newSha: state.newSha, prevSha: state.prevSha, recommendation: ev.recommendation, failureClass: ev.failureClass, reasons: ev.reasons, blockers: ev.blockers, evidence: ev.evidence });
 
-  if (armed && process.env.VERCEL_ROLLBACK_TOKEN) {
-    // ARMED — real action path (NOT reachable in shadow mode: requires enable flag + token).
-    log(`ARMED + token present (kill-switch: ${ksSource}) — invoking actuator`);
-    decisionLog({ phase: 'actuate', newSha: state.newSha, prevSha: state.prevSha, ksSource, reason: reasonStr });
-    const r = await rollbackToTarget(state, ev);
+  if (ev.recommendation === RECOMMENDATION.ALERT_INVESTIGATE) {
+    db.close();
+    const detail = (ev.blockers || []).join('; ') || 'critical route is externally or financially ambiguous';
+    log(`CRITICAL but rollback blocked — ${detail}`);
+    await alertBlockedOnce(state, ev, detail);
+    return;
+  }
+
+  const productionShaBlocker = currentProductionShaBlocker(state, live);
+  if (productionShaBlocker) {
+    db.close();
+    const blockedEv = {
+      ...ev,
+      recommendation: RECOMMENDATION.ALERT_INVESTIGATE,
+      failureClass: 'production_sha_unconfirmed',
+      action: ACTION.ALERT_INVESTIGATE,
+      blockers: [...new Set([...(ev.blockers || []), productionShaBlocker])],
+      directEligibility: { eligible: false, blockers: [productionShaBlocker] },
+    };
+    await alertBlockedOnce(state, blockedEv, productionShaBlocker);
+    return;
+  }
+
+  // A rollback recommendation is not enough: verify the previous deployment,
+  // smoke its own URL, load the exact release safety attestation, and re-run the
+  // deterministic policy with guardrail evidence.
+  const readiness = await buildReadiness(state, now, {
+    attestationAsOfMs: resumedEvaluation ? state.pendingProposal.createdAtMs : now,
+  });
+  if (!resumedEvaluation) ev = evaluate(db, now, state, readiness);
+  db.close();
+  const reasonStr = reasonString(ev);
+  decisionLog({
+    phase: 'readiness-eval', rolloutPhase: ROLLBACK_ROLLOUT_PHASE,
+    newSha: state.newSha, prevSha: state.prevSha, recommendation: ev.recommendation,
+    failureClass: ev.failureClass, action: ev.action, directEligibility: ev.directEligibility,
+    candidateReason: readiness.selection.reason, killSwitchSource: readiness.ks.source,
+  });
+
+  if (ev.recommendation === RECOMMENDATION.ALERT_INVESTIGATE) {
+    const detail = (ev.blockers || []).join('; ') || 'rollback guardrail requires manual investigation';
+    await alertBlockedOnce(state, ev, detail);
+    return;
+  }
+
+  if (readinessBlocksBeforeAction(ROLLBACK_ROLLOUT_PHASE, readiness)) {
+    const detail = !readiness.selection.target
+      ? `candidato anterior não verificável: ${readiness.selection.reason}`
+      : 'release sem atestado verificável de ausência de migração, flag ou ativação irreversível';
+    await alertBlockedOnce(state, ev, detail);
+    return;
+  }
+
+  if (ev.action === ACTION.DIRECT_ROLLBACK_PERMITTED) {
+    log(`deterministic catastrophic policy permits direct rollback (kill-switch: ${readiness.ks.source})`);
+    decisionLog({ phase: 'actuate', authorization: 'deterministic-policy', newSha: state.newSha, prevSha: state.prevSha, reason: reasonStr });
+    const r = await rollbackToTarget(state, ev, { kind: 'deterministic-policy' }, readiness.selection.target);
     decisionLog({ phase: 'actuate-result', ...r });
     return;
   }
 
-  // SHADOW MODE — alert "WOULD roll back", never call the API.
-  if (state.lastShadowAlertSha === state.newSha) { log('shadow alert already sent for this deploy — skipping'); return; }
-  const msg = `🟠 WOULD auto-rollback prod from ${state.newSha} to ${state.prevSha} — reason: ${reasonStr}\n` +
-    `(SHADOW MODE — no action taken. kill-switch: ${ksSource}; token: ${process.env.VERCEL_ROLLBACK_TOKEN ? 'set' : 'unset'})`;
-  await sendWhatsApp(msg);
+  if (ROLLBACK_ROLLOUT_PHASE === ROLLOUT_PHASE.SHADOW) {
+    if (state.lastShadowAlertSha === state.newSha) { log('shadow report already sent for this deploy — skipping'); return; }
+    const msg = `🟠 SHADOW: rollback recomendado para ${state.newSha} -> ${state.prevSha}, mas nenhuma ação foi autorizada. ` +
+      `Evidência: ${reasonStr}. Elegibilidade direta=${ev.directEligibility.eligible}; ` +
+      `bloqueios=${(ev.directEligibility.blockers || []).join('; ') || 'nenhum'}.`;
+    await sendWhatsApp(msg);
+    state.lastShadowAlertSha = state.newSha;
+    saveState(state);
+    decisionLog({ phase: 'shadow-report', newSha: state.newSha, prevSha: state.prevSha, reason: reasonStr, directEligibility: ev.directEligibility });
+    return;
+  }
+
+  // Approval-required is also the fallback for every non-minimal class in the
+  // future catastrophic-auto phase. Only a trusted WhatsApp ingress may attach
+  // pendingConfirmation; the agent/LLM never writes or consumes authorization.
+  if (prepareApprovalProposal(state, ev, now)) saveState(state);
+
+  if (state.pendingConfirmation) {
+    const validation = validateApprovalConfirmation(state.pendingProposal, state.pendingConfirmation, {
+      allowedSenderIds: ALLOWED_APPROVER_IDS,
+      personalConversationId: PERSONAL_APPROVAL_CONVERSATION_ID,
+      personalApproverJid: PERSONAL_APPROVER_JID,
+    }, now);
+    if (validation.ok) {
+      if (!killSwitchAllowsActuation(readiness)) {
+        decisionLog({
+          phase: 'human-approval-blocked', proposalId: state.pendingProposal.id,
+          newSha: state.newSha, prevSha: state.prevSha, blocker: 'kill switch is OFF',
+        });
+        await alertBlockedOnce(state, ev, 'confirmação recebida, mas o kill switch está OFF');
+        return;
+      }
+      state.pendingProposal = consumeApprovalProposal(state.pendingProposal, state.pendingConfirmation, now);
+      state.pendingConfirmation = null;
+      saveState(state); // consume before the external side effect (one-time)
+      decisionLog({ phase: 'human-approval-consumed', proposalId: state.pendingProposal.id, newSha: state.newSha, prevSha: state.prevSha });
+      const r = await rollbackToTarget(state, ev, {
+        kind: 'trusted-human-confirmation', proposalId: state.pendingProposal.id,
+      }, readiness.selection.target);
+      decisionLog({ phase: 'actuate-result', authorization: 'trusted-human-confirmation', ...r });
+      return;
+    }
+    decisionLog({ phase: 'human-approval-rejected', proposalId: state.pendingProposal.id, blockers: validation.blockers });
+  }
+
+  if (state.lastShadowAlertSha === state.newSha) { log('approval proposal already sent for this deploy — skipping'); return; }
+  const expiresAt = new Date(state.pendingProposal.expiresAtMs).toISOString();
+  const proposalText = formatApprovalProposal(state.pendingProposal, reasonStr);
+  const delivery = await sendApprovalProposal(proposalText, state.pendingProposal.deliveryMessageId);
+  state.pendingProposal.deliveryMessageId = delivery.messageId || null;
+  state.pendingProposal.deliveryStatus = delivery.status;
+  saveState(state);
+  if (!delivery.delivered) {
+    decisionLog({
+      phase: 'approval-proposal-delivery-unconfirmed', proposalId: state.pendingProposal.id,
+      newSha: state.newSha, prevSha: state.prevSha, messageId: delivery.messageId, status: delivery.status,
+    });
+    if (delivery.messageId) return; // accepted/pending: late-confirm without duplicate POST
+    await alertBlockedOnce(state, ev, 'proposta não enviada: destino pessoal allowlisted ou transporte confirmado indisponível');
+    return;
+  }
   state.lastShadowAlertSha = state.newSha;
   saveState(state);
-  decisionLog({ phase: 'shadow-alert', newSha: state.newSha, prevSha: state.prevSha, reason: reasonStr, ksSource, tokenSet: !!process.env.VERCEL_ROLLBACK_TOKEN });
-  log('SHADOW alert sent: WOULD roll back ' + state.newSha + ' -> ' + state.prevSha);
+  decisionLog({ phase: 'approval-proposal-sent', proposalId: state.pendingProposal.id, newSha: state.newSha, prevSha: state.prevSha, expiresAt });
 }
 
 // ─── Offline replay (verification) ───────────────────────────────────
@@ -480,9 +902,13 @@ function replay(startISO, endISO, cutoverISO, dbPathOverride) {
   log(`REPLAY window ${new Date(start).toISOString()} .. ${new Date(end).toISOString()} | cutover ${new Date(cutover).toISOString()}`);
   let firstFire = null;
   const fires = [];
+  const replayState = {
+    newSha: 'replay-new-sha', prevSha: 'replay-previous-sha', currentSha: 'replay-new-sha',
+    deployStartMs: cutover,
+  };
   for (let t = cutover; t <= end; t += POLL_INTERVAL_MS) {
     if (t - cutover > HEIGHTENED_WINDOW_MS) break;
-    const ev = evaluate(db, t, cutover);
+    const ev = evaluate(db, t, replayState);
     if (ev.critical) {
       const tag = ev.attributed ? 'CRITICAL+ATTRIBUTED (WOULD ROLL BACK)' : `CRITICAL but blocked: ${ev.blockers.join('; ')}`;
       log(`  ${new Date(t).toISOString()} ${tag} | ${ev.reasons.join(' | ')}`);
@@ -512,7 +938,10 @@ async function main() {
       deployStartTime: s.deployStartMs ? new Date(s.deployStartMs).toISOString() : null,
       killSwitch: killSwitchOn().source,
       tokenSet: !!process.env.VERCEL_ROLLBACK_TOKEN,
-      mode: (fs.existsSync(ENABLE_FLAG) || fs.existsSync(FIREBASE_SA)) && process.env.VERCEL_ROLLBACK_TOKEN ? 'ARMED-CAPABLE' : 'SHADOW',
+      rolloutPhase: ROLLBACK_ROLLOUT_PHASE,
+      directEnable: DIRECT_ROLLBACK_ENABLED,
+      personalApprovalDestinationValid: personalApprovalDestinationValid(),
+      mode: ROLLBACK_ROLLOUT_PHASE === ROLLOUT_PHASE.SHADOW ? 'SHADOW' : 'FAIL-CLOSED-PENDING-GATES',
     }, null, 2));
     return;
   }
@@ -529,9 +958,9 @@ async function main() {
   }
 
   if (args.includes('--loop')) {
-    log(`watchdog starting in ${process.env.VERCEL_ROLLBACK_TOKEN ? 'TOKEN-PRESENT' : 'SHADOW'} mode; ` +
-      `poll=${POLL_INTERVAL_MS / 1000}s window=${WINDOW_MS / 1000}s heightened=${HEIGHTENED_WINDOW_MS / 60000}min ` +
-      `crit ratio>=${CRIT_RATIO} 5xx>=${CRIT_5XX_COUNT} total>=${CRIT_TOTAL_FLOOR}`);
+    log(`watchdog starting phase=${ROLLBACK_ROLLOUT_PHASE} directEnable=${DIRECT_ROLLBACK_ENABLED}; ` +
+      `poll=${POLL_INTERVAL_MS / 1000}s window=${WINDOW_MS / 1000}s heightened=${HEIGHTENED_WINDOW_MS / 60000}min; ` +
+      'thresholds are defined by the deterministic route policy');
     // eslint-disable-next-line no-constant-condition
     while (true) {
       try { await tick(); } catch (e) { log('tick error:', e.message); }
@@ -543,4 +972,19 @@ async function main() {
   await tick();
 }
 
-main().catch(e => { log('fatal', e && e.message); process.exit(1); });
+if (require.main === module) {
+  main().catch(e => { log('fatal', e && e.message); process.exit(1); });
+}
+
+module.exports = {
+  evaluate,
+  alertBlockedOnce,
+  readinessBlocksBeforeAction,
+  killSwitchAllowsActuation,
+  prepareApprovalProposal,
+  pendingProposalNeedsAttention,
+  approvalDeliveryAction,
+  currentProductionShaBlocker,
+  pendingConfirmationEvaluation,
+  formatApprovalProposal,
+};
