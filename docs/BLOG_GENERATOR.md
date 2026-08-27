@@ -50,6 +50,51 @@ Only a genuinely empty discovery result records
 on consecutive days means discovery itself is broken (model erroring, or every
 proposal already covered) and is worth investigating.
 
+## Internal links: code decides, the editor does not
+
+Whether `/blog/<slug>` exists is a **fact**, not a judgement call, so
+`sanitizeInternalLinks` decides it deterministically and runs **before** the
+editor. Every internal link that reaches the editor is therefore valid by
+construction, and the editor prompt explicitly says so.
+
+The operator-triggered `--revise` path loads the published-slug set and applies
+the same sanitiser before both editor review and storage. If that lookup fails,
+blog links fail closed and are unwrapped instead of being trusted.
+
+It used to police this too, and it was worse at it: the writer prompt tells the
+model to link 1-2 published posts, the editor prompt rejected "rotas
+inexistentes (as únicas válidas são /, /blog e /#contato)", and the two
+contradicted each other. Once dynamic topic discovery started producing posts
+again, that held **two consecutive days** (2026-08-21 and 2026-08-22) over links
+to posts that exist.
+
+Rules:
+
+- **`VALID_STATIC_ROUTES` is the allowlist of non-blog routes**, and it is
+  verified against production: `/`, `/blog`, `/faq`, `/#contato`,
+  `/parceiro/ganhe-com-estacoes`. `/contato`, `/sobre` and `/estacoes` are 404.
+  Add a route only after confirming it serves 200.
+- The sanitiser covers **all** internal links, not just `/blog/`. It used to only
+  look at `/blog/`, so an invented `/contato` sailed through it.
+- Relative internal destinations are canonicalised to root-relative paths
+  before validation (`faq` becomes `/faq`); invalid relatives are unwrapped.
+  Schemed and protocol-relative external links are preserved unchanged.
+- Standard Markdown link titles are parsed without bypassing validation; the
+  title is preserved when the destination itself is valid.
+- Absolute links back to `turbostation.com.br` use the same route allowlist as
+  relative links; genuinely external hosts remain untouched. Clickable-image
+  Markdown is preserved as a complete construct instead of being reinterpreted
+  as an ordinary text link.
+- Reference-style Markdown definitions use the same validation. Invalid
+  first-party definitions and their references are unwrapped, while valid
+  internal and external definitions remain usable. Definitions referenced by
+  images are preserved as media sources rather than treated as page routes.
+- Only the bare canonical post path counts. A trailing slash, a query or an
+  extra segment gets unwrapped, on purpose: only the exact path is provably real.
+- External links and images are untouched.
+- **Never reintroduce a route check into the editor prompt.** There is a test
+  asserting the old string does not come back.
+
 ## Content bar enforced in the prompts
 
 The writer prompt and the editor prompt must stay in sync — the editor rejects
