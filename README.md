@@ -67,6 +67,22 @@ All data is stored in SQLite (WAL mode) under `db/`:
 | `db/mobile.db` | ~3.4 MB | Mobile app telemetry (`mobile_raw`, `mobile_events`) |
 | `db/logs.db` | ~30 MB | Legacy shared log table (deprecated) |
 
+## Payment-credit release signal
+
+`GET /api/telemetry/funnel-counts` accepts `start_ms`, `end_ms`, and the
+optional `payment_credit_grace_ms` (two minutes by default). In addition to the
+existing request totals, `payments` exposes four aggregate counters used by the
+Turbo Station release watch:
+
+- `providerPaidAfterGrace`: unique provider-paid references older than grace;
+- `creditsSucceeded`: unique correlated wallet-credit completions;
+- `paidWithoutCreditAfterGrace`: old paid references without settlement evidence;
+- `creditClaimRegistryUnavailable`: CreditClaim registry failures, de-duplicated per request.
+
+The monitor correlates identifiers internally across checkout, Pagar.me webhook,
+PIX polling, and Auto Add logs, but returns counts only. It never exposes a user
+or payment identifier and keeps the Vercel database connection read-only.
+
 ## PM2 Commands
 
 ```bash

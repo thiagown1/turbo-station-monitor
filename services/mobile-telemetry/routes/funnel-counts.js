@@ -12,12 +12,17 @@
  *
  * @query   start_ms  epoch ms, inclusive lower bound (required)
  * @query   end_ms    epoch ms, exclusive upper bound (required, must be > start_ms)
+ * @query   payment_credit_grace_ms non-negative grace window (default 2 minutes)
  *
  * @returns {{
  *   ok: true,
  *   startMs: number, endMs: number,
  *   drainLastTs: number|null,   // max(last_ts) across the drain — freshness probe
- *   payments:  { processOk, processFailed, webhookOk },
+ *   payments:  {
+ *     processOk, processFailed, webhookOk,
+ *     providerPaidAfterGrace, creditsSucceeded,
+ *     paidWithoutCreditAfterGrace, creditClaimRegistryUnavailable
+ *   },
  *   recharges: { started, failed }
  * }}
  *
@@ -26,6 +31,10 @@
  *     customer / buying credits). 2xx = money moved, 4xx/5xx = failed attempt.
  *   - payments.webhookOk        → POST /api/webhooks/pagarme 2xx (Pagar.me
  *     liveness; not 1:1 with payments, kept as a secondary signal).
+ *   - payment-credit counters   → correlated, de-duplicated domain markers in
+ *     `vercel_logs`. Provider-paid events are held for the requested grace;
+ *     successful credit evidence clears overdue state for the same reference.
+ *     CreditClaim registry failures are de-duplicated per request.
  *   - recharges.started/failed  → POST /api/stations/{id}/connectors/{c}/transaction.
  *     2xx (200/201/202) = a recharge session start was accepted; 5xx = server
  *     failure. 4xx (e.g. 403 busy/forbidden) is a user-side reject, NOT a failure.
@@ -38,6 +47,10 @@ const { Router } = require('express');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { LOG_TAG } = require('../lib/constants');
+const {
+    aggregatePaymentCreditFunnel,
+    parsePaymentCreditGraceMs,
+} = require('../lib/payment-credit-funnel');
 
 const router = Router();
 
@@ -56,6 +69,53 @@ const PAYMENT_PROCESS = '/api/payments/process';
 const PAGARME_WEBHOOK = '/api/webhooks/pagarme';
 const TX_START_LIKE = '/api/stations/%/connectors/%/transaction';
 
+function readFunnelCounts(db, { startMs, endMs, paymentCreditGraceMs }) {
+    const pay = db
+        .prepare(
+            `SELECT
+               SUM(CASE WHEN endpoint = @proc AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS processOk,
+               SUM(CASE WHEN endpoint = @proc AND status_code >= 400 THEN 1 ELSE 0 END) AS processFailed,
+               SUM(CASE WHEN endpoint = @hook AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS webhookOk
+             FROM vercel_requests
+             WHERE last_ts >= @start AND last_ts < @end
+               AND endpoint IN (@proc, @hook)`,
+        )
+        .get({ start: startMs, end: endMs, proc: PAYMENT_PROCESS, hook: PAGARME_WEBHOOK });
+
+    const rec = db
+        .prepare(
+            `SELECT
+               SUM(CASE WHEN status_code IN (200, 201, 202) THEN 1 ELSE 0 END) AS started,
+               SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) AS failed
+             FROM vercel_requests
+             WHERE last_ts >= @start AND last_ts < @end
+               AND method = 'POST'
+               AND endpoint LIKE @like`,
+        )
+        .get({ start: startMs, end: endMs, like: TX_START_LIKE });
+
+    const lastTsRow = db.prepare('SELECT MAX(last_ts) AS t FROM vercel_requests').get();
+    const paymentCredit = aggregatePaymentCreditFunnel(db, {
+        startMs,
+        endMs,
+        graceMs: paymentCreditGraceMs,
+    });
+
+    return {
+        drainLastTs: lastTsRow && lastTsRow.t != null ? Number(lastTsRow.t) : null,
+        payments: {
+            processOk: (pay && pay.processOk) || 0,
+            processFailed: (pay && pay.processFailed) || 0,
+            webhookOk: (pay && pay.webhookOk) || 0,
+            ...paymentCredit,
+        },
+        recharges: {
+            started: (rec && rec.started) || 0,
+            failed: (rec && rec.failed) || 0,
+        },
+    };
+}
+
 router.get('/', (req, res) => {
     try {
         const startMs = Number(req.query.start_ms);
@@ -65,49 +125,25 @@ router.get('/', (req, res) => {
                 .status(400)
                 .json({ error: 'start_ms and end_ms are required (end_ms > start_ms)' });
         }
+        let paymentCreditGraceMs;
+        try {
+            paymentCreditGraceMs = parsePaymentCreditGraceMs(req.query.payment_credit_grace_ms);
+        } catch (err) {
+            return res.status(400).json({ error: err.message });
+        }
 
         const db = getVercelDb();
-
-        const pay = db
-            .prepare(
-                `SELECT
-                   SUM(CASE WHEN endpoint = @proc AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS processOk,
-                   SUM(CASE WHEN endpoint = @proc AND status_code >= 400 THEN 1 ELSE 0 END) AS processFailed,
-                   SUM(CASE WHEN endpoint = @hook AND status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) AS webhookOk
-                 FROM vercel_requests
-                 WHERE last_ts >= @start AND last_ts < @end
-                   AND endpoint IN (@proc, @hook)`,
-            )
-            .get({ start: startMs, end: endMs, proc: PAYMENT_PROCESS, hook: PAGARME_WEBHOOK });
-
-        const rec = db
-            .prepare(
-                `SELECT
-                   SUM(CASE WHEN status_code IN (200, 201, 202) THEN 1 ELSE 0 END) AS started,
-                   SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END) AS failed
-                 FROM vercel_requests
-                 WHERE last_ts >= @start AND last_ts < @end
-                   AND method = 'POST'
-                   AND endpoint LIKE @like`,
-            )
-            .get({ start: startMs, end: endMs, like: TX_START_LIKE });
-
-        const lastTsRow = db.prepare('SELECT MAX(last_ts) AS t FROM vercel_requests').get();
+        const counts = readFunnelCounts(db, {
+            startMs,
+            endMs,
+            paymentCreditGraceMs,
+        });
 
         res.set('Cache-Control', 'no-store').json({
             ok: true,
             startMs,
             endMs,
-            drainLastTs: lastTsRow && lastTsRow.t != null ? Number(lastTsRow.t) : null,
-            payments: {
-                processOk: (pay && pay.processOk) || 0,
-                processFailed: (pay && pay.processFailed) || 0,
-                webhookOk: (pay && pay.webhookOk) || 0,
-            },
-            recharges: {
-                started: (rec && rec.started) || 0,
-                failed: (rec && rec.failed) || 0,
-            },
+            ...counts,
         });
     } catch (err) {
         console.error(`${LOG_TAG} funnel-counts error:`, err.message);
@@ -116,3 +152,4 @@ router.get('/', (req, res) => {
 });
 
 module.exports = router;
+module.exports.readFunnelCounts = readFunnelCounts;
