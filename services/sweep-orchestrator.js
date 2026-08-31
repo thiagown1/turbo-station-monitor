@@ -182,16 +182,51 @@ function createFreshState() {
 
 // ─── Phase: SWEEP ──────────────────────────────────────────────────
 
-function buildSweepPrompt() {
+function prepareScoutSnapshot() {
+  const gitOptions = {
+    encoding: 'utf8',
+    timeout: 120000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  };
+  const dirty = execFileSync(
+    'git',
+    ['-C', SCOUT_DIR, 'status', '--porcelain'],
+    gitOptions
+  ).trim();
+  if (dirty) throw new Error('Scout checkout is dirty; refusing to replace its snapshot');
+
+  execFileSync(
+    'git',
+    [
+      '-C', SCOUT_DIR, 'fetch', '--prune', 'origin',
+      `+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}`,
+    ],
+    gitOptions
+  );
+  execFileSync(
+    'git',
+    ['-C', SCOUT_DIR, 'checkout', '--detach', `origin/${TARGET_BRANCH}`],
+    gitOptions
+  );
+  const sha = execFileSync('git', ['-C', SCOUT_DIR, 'rev-parse', 'HEAD'], gitOptions).trim();
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('Scout snapshot SHA is unavailable');
+  return sha;
+}
+
+function buildSweepPrompt(snapshotSha) {
   return `🌙 White-Label Night Sweep — Ciclo autônomo de validação.
 
 Tu é o Scout do time. Tua missão é varrer o branch final/white-label e encontrar TODOS os problemas white-label restantes.
 
 WORKSPACE: ${SCOUT_DIR}
 BRANCH: ${TARGET_BRANCH}
+SNAPSHOT SHA: ${snapshotSha}
 
-═══ PASSO 1: ATUALIZAR CÓDIGO ═══
-cd ${SCOUT_DIR} && git fetch origin && git checkout ${TARGET_BRANCH} && git pull origin ${TARGET_BRANCH}
+═══ PASSO 1: CONFIRMAR SNAPSHOT READ-ONLY ═══
+O monitor já preparou o snapshot exato acima. Confirme com:
+git -C ${SCOUT_DIR} rev-parse HEAD
+Não execute fetch, checkout, pull, commit, push nem qualquer escrita no repositório ou no GitHub.
 
 ═══ PASSO 2: LER A MATRIX ═══
 cat ${SCOUT_DIR}/docs/WHITE_LABEL_MATRIX.md
@@ -273,8 +308,16 @@ async function runSweep(state) {
     log('Cleared stale scout session locks');
   } catch {}
 
-  // Dispatch scout agent with unique session
-  const prompt = buildSweepPrompt();
+  // The monitor performs the only checkout mutation before the agent starts.
+  // Operational isolation mounts this exact snapshot read-only to Scout and
+  // exposes only the dedicated findings path as writable.
+  let snapshotSha;
+  try {
+    snapshotSha = prepareScoutSnapshot();
+  } catch (err) {
+    throw new Error(`Scout snapshot preparation blocked: ${err.message?.substring(0, 160)}`);
+  }
+  const prompt = buildSweepPrompt(snapshotSha);
   const sessionId = `sweep-${state.cycle}-${Date.now()}`;
 
   log(`Dispatching scout agent (session: ${sessionId})...`);

@@ -13,6 +13,7 @@ const {
   formatWriterTupleGuard,
 } = require('../services/lib/openclaw-writer-guard');
 const { sanitizeLegacyTaskState } = require('../services/task-planner');
+const { auditLegacyCoderCron, CODER_JOB_ID } = require('../services/boost');
 
 const CURRENT = {
   number: 72,
@@ -169,6 +170,33 @@ test('current CI is read-only and future writer isolation is documented', () => 
   assert.match(docs, /`openclaw-writer-v1` is reserved as a dedicated/);
   assert.match(docs, /No host may receive that\s+label before/);
   assert.match(docs, /does not create or configure that variable/);
+});
+
+test('legacy Coder boost is retired and cron state fails closed', () => {
+  assert.equal(auditLegacyCoderCron({ jobs: [] }).safe, true);
+  assert.equal(auditLegacyCoderCron({ jobs: [{ id: CODER_JOB_ID, enabled: false }] }).safe, true);
+  assert.equal(auditLegacyCoderCron({ jobs: [{ id: CODER_JOB_ID, enabled: true }] }).safe, false);
+  assert.equal(auditLegacyCoderCron({ jobs: [{ id: CODER_JOB_ID }] }).safe, false);
+  assert.equal(auditLegacyCoderCron({}).safe, false);
+
+  const root = path.join(__dirname, '..');
+  const boost = fs.readFileSync(path.join(root, 'services', 'boost.js'), 'utf8');
+  const reconcile = fs.readFileSync(path.join(root, 'services', 'reconcile.js'), 'utf8');
+  assert.doesNotMatch(boost, /writeFileSync|nextRunAtMs|schedule\.everyMs\s*=/);
+  assert.doesNotMatch(reconcile, /boost\.js/);
+});
+
+test('Scout receives a monitor-prepared immutable snapshot contract', () => {
+  const sweep = fs.readFileSync(
+    path.join(__dirname, '..', 'services', 'sweep-orchestrator.js'),
+    'utf8'
+  );
+  assert.match(sweep, /function prepareScoutSnapshot\(\)/);
+  assert.match(sweep, /`\+refs\/heads\/\$\{TARGET_BRANCH\}:refs\/remotes\/origin\/\$\{TARGET_BRANCH\}`/);
+  assert.match(sweep, /buildSweepPrompt\(snapshotSha\)/);
+  assert.match(sweep, /SNAPSHOT SHA: \$\{snapshotSha\}/);
+  assert.match(sweep, /Não execute fetch, checkout, pull, commit, push/);
+  assert.doesNotMatch(sweep, /cd \$\{SCOUT_DIR\} && git fetch/);
 });
 
 test('PR comments and reviews cannot auto-dispatch the Coder', () => {

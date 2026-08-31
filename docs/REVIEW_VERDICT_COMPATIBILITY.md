@@ -136,8 +136,10 @@ the following must be proven:
 
 - the writer runs in an isolated, disposable environment, separate from the
   deterministic CI runners and from persistent production workspaces;
-- the analysis-only Scout has a separately verified read-only filesystem and
-  GitHub credential; a negative test proves that pushes, issue writes, PR
+- the analysis-only Scout receives an exact checkout prepared by a trusted
+  monitor sync step, then sees that repository filesystem read-only; only its
+  dedicated findings output path is writable. Its separately scoped GitHub
+  credential is read-only, negative tests prove that pushes, issue writes, PR
   writes, and merges are denied, and it never receives the writer runner label;
 - the write-capable workflow/job selects only a runner carrying the dedicated
   `openclaw-writer-v1` label; no general-purpose monitor runner is eligible;
@@ -153,6 +155,8 @@ the following must be proven:
   deploy, restart services, or act on a different revision.
 
 At cutover, operators must also inventory and stop any legacy Coder session or
-cron, run the state sanitizer, and verify both executable arrays are empty. This
-is a separate operational action; this pull request does not stop processes,
-restart services, deploy, assign runner labels, or set repository variables.
+cron, run the state sanitizer, and verify both executable arrays are empty. The
+old `boost.js` command is now a read-only, fail-closed audit and cannot enable or
+reschedule the legacy Coder cron. This is a separate operational action; this
+pull request does not stop processes, restart services, deploy, assign runner
+labels, or set repository variables.

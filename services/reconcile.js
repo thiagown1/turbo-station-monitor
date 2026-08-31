@@ -644,13 +644,6 @@ try {
     console.log(`  ✅ task-state.json sanitized (queue=${result.taskState.queue.length}, active=${result.taskState.activeTasks.length})`);
     console.log(`  ✅ Monitor evidence recorded (${result.evidence.tasks.length} blocked)`);
 
-    // Auto-adjust heartbeat frequency based on workload
-    try {
-      const boostScript = path.join(__dirname, 'boost.js');
-      if (fs.existsSync(boostScript)) {
-        exec(`node ${boostScript}`, { allowFail: true, timeout: 10000 });
-      }
-    } catch { /* ignore boost errors */ }
   } else {
     printPlan(plan);
     console.log('  (Dry run — use --apply to clean up + write state)');
