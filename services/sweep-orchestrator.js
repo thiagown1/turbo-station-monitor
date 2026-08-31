@@ -22,7 +22,11 @@ const {
 } = require('./lib/review-verdicts');
 const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
 const { buildWriterConcurrencyKey, canonicalizePrNumber } = require('./lib/openclaw-writer-guard');
-const { writeJsonAtomic, writeWriterEvidence } = require('./lib/writer-evidence-store');
+const {
+  sanitizeCoderTaskState,
+  writeJsonAtomic,
+  writeWriterEvidence,
+} = require('./lib/writer-evidence-store');
 
 // ─── Config ────────────────────────────────────────────────────────
 const STATE_PATH = path.join(__dirname, '..', 'state', 'sweep-loop.json');
@@ -530,21 +534,23 @@ async function createIssuesForBatch(state, batchFindings, batchIndex, totalBatch
     reason: `Sweep batch ${batchIndex}: ${f.description.substring(0, 80)}`,
     blockedReason: 'manual implementation required; monitor has no write-capable repair job',
   }));
-  const taskState = {
-    schema: 'v3',
-    ciFixAttempts: {},
-    blockedPRs: [],
-    lastHeartbeat: new Date().toISOString(),
-    queue: [],
-    activeTasks: [],
-  };
   const taskStatePath = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
-  writeJsonAtomic(taskStatePath, taskState);
+  let currentTaskState = {};
+  try {
+    currentTaskState = JSON.parse(fs.readFileSync(taskStatePath, 'utf8'));
+  } catch {}
+  const generatedAt = new Date().toISOString();
+  const sanitized = sanitizeCoderTaskState({
+    currentState: currentTaskState,
+    currentTasks: blockedTasks,
+    generatedAt,
+  });
+  writeJsonAtomic(taskStatePath, sanitized.taskState);
   const evidence = writeWriterEvidence({
     filePath: WRITER_EVIDENCE_PATH,
     source: 'sweep',
-    tasks: blockedTasks,
-    generatedAt: taskState.lastHeartbeat,
+    tasks: sanitized.evidenceTasks,
+    generatedAt,
   });
   log(`Recorded ${evidence.tasks.length} sweep tasks as monitor-owned, non-executable evidence`);
 

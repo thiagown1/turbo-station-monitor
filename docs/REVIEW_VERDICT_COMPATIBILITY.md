@@ -96,9 +96,10 @@ of this monitor is a separate operational action from merging this code.
 
 CI and review failures remain visible and blocking. The monitor has no direct
 OpenClaw repair writer. Webhook comments and the persistent
-`reconcile`/legacy-planner flows keep the Coder-owned `task-state.json` as a
-tombstone with empty `queue` and `activeTasks`. Blocked task details are written
-separately under the monitor-owned `state/writer-repair-evidence-*.json` files,
+`reconcile`/legacy-planner/sweep flows keep the Coder-owned `task-state.json` as
+a fixed four-field tombstone (`schema`, `lastHeartbeat`, empty `queue`, and empty
+`activeTasks`). Blocked task details are written separately under the
+monitor-owned `state/writer-repair-evidence-*.json` files,
 outside the Coder workspace. They never auto-dispatch PR repair. Sweep issues
 use the neutral `auto:none` label and no `agent:*` label. The sweep records
 evidence issues and, when it finds a merge conflict, the exact PR tuple for

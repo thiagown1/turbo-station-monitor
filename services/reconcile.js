@@ -7,7 +7,8 @@
  * GitHub + git on every run to build a prioritized work plan.
  *
  * Core principle: GitHub + `git worktree list` are the source of truth.
- * task-state.json only stores what can't be derived (ciFixAttempts, blockedPRs).
+ * task-state.json is kept only as an inert fixed-schema tombstone. Any legacy
+ * task details are migrated to monitor-owned, non-executable evidence files.
  *
  * Usage:
  *   node reconcile.js                # Show current state (dry run)
@@ -30,7 +31,11 @@ const {
   canonicalizePrNumber,
   evaluateWriterAuthorization,
 } = require('./lib/openclaw-writer-guard');
-const { writeJsonAtomic, writeWriterEvidence } = require('./lib/writer-evidence-store');
+const {
+  sanitizeCoderTaskState,
+  writeJsonAtomic,
+  writeWriterEvidence,
+} = require('./lib/writer-evidence-store');
 
 // ─── Config ────────────────────────────────────────────────────────
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
@@ -524,25 +529,21 @@ function applyPlan(plan) {
   }
   exec(`cd ${TURBO_STATION_DIR} && git worktree prune`, { allowFail: true });
 
-  // 2. First sanitize the legacy Coder-owned state. It contains no task details
-  // that a model could reinterpret as executable work.
-  const newState = {
-    schema: 'v3',
-    ciFixAttempts: plan.ciFixAttempts,
-    blockedPRs: plan.blockedPRs,
-    lastHeartbeat: plan.timestamp,
-    queue: [],
-    activeTasks: [],
-  };
-
-  writeJsonAtomic(TASK_STATE_PATH, newState);
+  // 2. First migrate legacy task details out of the Coder workspace and leave
+  // only a fixed-schema tombstone that cannot carry disguised instructions.
+  const sanitized = sanitizeCoderTaskState({
+    currentState: readTaskState(),
+    currentTasks: plan.blockedWriterTasks.slice(0, 20),
+    generatedAt: plan.timestamp,
+  });
+  writeJsonAtomic(TASK_STATE_PATH, sanitized.taskState);
   const evidence = writeWriterEvidence({
     filePath: WRITER_EVIDENCE_PATH,
     source: 'reconcile',
-    tasks: plan.blockedWriterTasks.slice(0, 20),
+    tasks: sanitized.evidenceTasks,
     generatedAt: plan.timestamp,
   });
-  return { taskState: newState, evidence };
+  return { taskState: sanitized.taskState, evidence };
 }
 
 // ─── Output ────────────────────────────────────────────────────────

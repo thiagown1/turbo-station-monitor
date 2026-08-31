@@ -3,6 +3,52 @@
 const fs = require('fs');
 const path = require('path');
 
+function blockedTaskIdentity(task) {
+  return [
+    task.repo || '',
+    task.action || '',
+    task.prNumber || task.issueNumber || task.number || '',
+    task.branch || '',
+    task.concurrencyKey || '',
+  ].join('|');
+}
+
+function sanitizeCoderTaskState({
+  currentState,
+  currentTasks,
+  generatedAt = new Date().toISOString(),
+}) {
+  const state = currentState && typeof currentState === 'object' ? currentState : {};
+  const quarantined = [];
+  for (const field of ['queue', 'activeTasks', 'blockedWriterQueue']) {
+    if (!Array.isArray(state[field])) continue;
+    for (const task of state[field]) {
+      if (!task || typeof task !== 'object') continue;
+      quarantined.push({
+        ...task,
+        quarantinedFrom: field,
+        blockedReason: task.blockedReason || 'legacy task quarantined; manual repair required',
+      });
+    }
+  }
+
+  const byIdentity = new Map();
+  for (const task of [...quarantined, ...(Array.isArray(currentTasks) ? currentTasks : [])]) {
+    if (!task || typeof task !== 'object') continue;
+    byIdentity.set(blockedTaskIdentity(task), task);
+  }
+
+  return {
+    taskState: {
+      schema: 'v3',
+      lastHeartbeat: generatedAt,
+      queue: [],
+      activeTasks: [],
+    },
+    evidenceTasks: [...byIdentity.values()],
+  };
+}
+
 function buildWriterEvidence({ source, tasks, generatedAt = new Date().toISOString() }) {
   return {
     schema: 'writer-repair-evidence/v1',
@@ -34,7 +80,9 @@ function writeWriterEvidence({ filePath, source, tasks, generatedAt }) {
 }
 
 module.exports = {
+  blockedTaskIdentity,
   buildWriterEvidence,
+  sanitizeCoderTaskState,
   writeJsonAtomic,
   writeWriterEvidence,
 };

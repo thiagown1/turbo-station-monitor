@@ -21,7 +21,12 @@ const {
   OPENCLAW_WRITER_ATTESTATION_VARIABLE,
   canonicalizePrNumber,
 } = require('./lib/openclaw-writer-guard');
-const { writeJsonAtomic, writeWriterEvidence } = require('./lib/writer-evidence-store');
+const {
+  blockedTaskIdentity,
+  sanitizeCoderTaskState,
+  writeJsonAtomic,
+  writeWriterEvidence,
+} = require('./lib/writer-evidence-store');
 
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
 const WRITER_EVIDENCE_PATH = path.join(__dirname, '..', 'state', 'writer-repair-evidence-planner.json');
@@ -254,32 +259,7 @@ function buildPlan() {
   };
 }
 
-function blockedTaskIdentity(task) {
-  return [
-    task.repo || REPO,
-    task.action || '',
-    task.prNumber || task.issueNumber || task.number || '',
-    task.branch || '',
-    task.concurrencyKey || '',
-  ].join('|');
-}
-
 function sanitizeLegacyTaskState(currentState, plan, attested, now = new Date().toISOString()) {
-  const taskState = currentState && typeof currentState === 'object' ? currentState : {};
-  const quarantined = [
-    ...(Array.isArray(taskState.activeTasks) ? taskState.activeTasks : []).map(task => ({
-      ...task,
-      repo: task.repo || REPO,
-      quarantinedFrom: 'activeTasks',
-      blockedReason: 'legacy executable task quarantined; manual repair required',
-    })),
-    ...(Array.isArray(taskState.queue) ? taskState.queue : []).map(task => ({
-      ...task,
-      repo: task.repo || REPO,
-      quarantinedFrom: 'queue',
-      blockedReason: 'legacy executable task quarantined; manual repair required',
-    })),
-  ];
   const selected = (Array.isArray(plan.selected) ? plan.selected : []).map(issue => ({
     repo: REPO,
     issueNumber: issue.number,
@@ -289,41 +269,11 @@ function sanitizeLegacyTaskState(currentState, plan, attested, now = new Date().
       ? 'manual writer dispatch required; legacy task-state queue is evidence-only'
       : `${OPENCLAW_WRITER_ATTESTATION_VARIABLE} is not exactly true`,
   }));
-  const blockedByIdentity = new Map();
-  for (const task of [
-    ...(Array.isArray(taskState.blockedWriterQueue) ? taskState.blockedWriterQueue : []),
-    ...quarantined,
-    ...selected,
-  ]) {
-    blockedByIdentity.set(blockedTaskIdentity(task), task);
-  }
-
-  // Allowlist metadata so legacy/custom task-bearing fields cannot survive the
-  // sanitizer under a different name.
-  const nonExecutableState = {
-    ciFixAttempts: taskState.ciFixAttempts && typeof taskState.ciFixAttempts === 'object'
-      ? taskState.ciFixAttempts
-      : {},
-    blockedPRs: Array.isArray(taskState.blockedPRs) ? taskState.blockedPRs : [],
-    lastHeartbeat: taskState.lastHeartbeat || null,
-  };
-
-  return {
-    taskState: {
-      ...nonExecutableState,
-      schema: 'v3',
-      queue: [],
-      activeTasks: [],
-      lastUpdated: now,
-      lastPlan: {
-        timestamp: now,
-        slotsAvailable: plan.slots.total,
-        slotsUsed: selected.length,
-        budgetStatus: plan.budget?.status || 'unknown',
-      },
-    },
-    evidenceTasks: [...blockedByIdentity.values()],
-  };
+  return sanitizeCoderTaskState({
+    currentState,
+    currentTasks: selected,
+    generatedAt: now,
+  });
 }
 
 /**
@@ -341,7 +291,7 @@ function applyPlan(plan) {
     filePath: WRITER_EVIDENCE_PATH,
     source: 'legacy-planner',
     tasks: sanitized.evidenceTasks,
-    generatedAt: sanitized.taskState.lastUpdated,
+    generatedAt: sanitized.taskState.lastHeartbeat,
   });
 
   return { taskState: sanitized.taskState, evidence };

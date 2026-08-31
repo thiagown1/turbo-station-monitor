@@ -91,7 +91,7 @@ test('monitor repair paths are manual and leave executable writer queues empty',
 
   assert.match(reconcile, /writerAttestationValues\[task\.repo\]/);
   assert.match(reconcile, /manual exact-tuple repair required/);
-  assert.match(reconcile, /queue: \[\]/);
+  assert.match(reconcile, /sanitizeCoderTaskState/);
   assert.doesNotMatch(reconcile, /queue: plan\.todo\.slice\(0, 5\)/);
   assert.match(reconcile, /writeWriterEvidence/);
 
@@ -102,12 +102,11 @@ test('monitor repair paths are manual and leave executable writer queues empty',
   assert.doesNotMatch(sweep, /--label "auto:implement"/);
   assert.doesNotMatch(sweep, /--add-label "needs:(?:test|sec)-review"/);
   assert.match(sweep, /auto:none,white-label/);
-  assert.match(sweep, /queue: \[\]/);
+  assert.match(sweep, /sanitizeCoderTaskState/);
   assert.match(sweep, /manual_rebase_required/);
   assert.match(sweep, /concurrencyKey: `openclaw-writer-v1:/);
   assert.match(planner, /fetchWriterAttestationValue\(\) === 'true'/);
-  assert.match(planner, /queue: \[\]/);
-  assert.match(planner, /activeTasks: \[\]/);
+  assert.match(planner, /sanitizeCoderTaskState/);
   assert.doesNotMatch(planner, /taskState\.queue = plan\.selected\.map/);
 });
 
@@ -118,6 +117,10 @@ test('legacy executable planner state is quarantined even with no new selection'
     activeTasks: [{ action: 'implement', issueNumber: 11 }],
     blockedWriterQueue: [{ action: 'rebase', prNumber: 12 }],
     completedToday: [{ action: 'fix_review', prNumber: 9 }],
+    ciFixAttempts: { evil: { queue: [{ action: 'fix_ci', prNumber: 13 }] } },
+    blockedPRs: [{ action: 'fix_review', prNumber: 14 }],
+    lastHeartbeat: { queue: [{ action: 'implement', issueNumber: 15 }] },
+    unknownTaskField: { nested: { action: 'fix_ci', prNumber: 16 } },
   }, {
     selected: [],
     slots: { total: 0 },
@@ -128,10 +131,18 @@ test('legacy executable planner state is quarantined even with no new selection'
   assert.deepEqual(sanitized.taskState.activeTasks, []);
   assert.equal(Object.hasOwn(sanitized.taskState, 'blockedWriterQueue'), false);
   assert.equal(Object.hasOwn(sanitized.taskState, 'completedToday'), false);
+  assert.equal(Object.hasOwn(sanitized.taskState, 'ciFixAttempts'), false);
+  assert.equal(Object.hasOwn(sanitized.taskState, 'blockedPRs'), false);
+  assert.equal(Object.hasOwn(sanitized.taskState, 'unknownTaskField'), false);
+  assert.equal(sanitized.taskState.lastHeartbeat, '2026-08-31T00:00:00.000Z');
+  assert.deepEqual(
+    Object.keys(sanitized.taskState).sort(),
+    ['activeTasks', 'lastHeartbeat', 'queue', 'schema']
+  );
   assert.equal(sanitized.evidenceTasks.length, 3);
   assert.deepEqual(
     new Set(sanitized.evidenceTasks.map(task => task.quarantinedFrom).filter(Boolean)),
-    new Set(['queue', 'activeTasks'])
+    new Set(['queue', 'activeTasks', 'blockedWriterQueue'])
   );
 });
 
@@ -140,11 +151,12 @@ test('blocked writer details are stored outside the Coder workspace', () => {
   for (const file of ['reconcile.js', 'task-planner.js', 'sweep-orchestrator.js']) {
     const source = fs.readFileSync(path.join(root, 'services', file), 'utf8');
     assert.match(source, /writer-repair-evidence-/);
-    assert.match(source, /queue: \[\]/);
-    assert.match(source, /activeTasks: \[\]/);
+    assert.match(source, /sanitizeCoderTaskState/);
   }
   const store = fs.readFileSync(path.join(root, 'services', 'lib', 'writer-evidence-store.js'), 'utf8');
   assert.match(store, /executable: false/);
+  assert.match(store, /queue: \[\]/);
+  assert.match(store, /activeTasks: \[\]/);
 });
 
 test('current CI is read-only and future writer isolation is documented', () => {
