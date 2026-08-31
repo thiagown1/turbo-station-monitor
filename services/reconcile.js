@@ -300,14 +300,12 @@ function reconcile() {
       categories.conflicting.push(pr);
     } else if (hasLabel(pr, 'needs:coder-fix')) {
       categories.needsCoderFix.push(pr);
-    } else if (pr.reviewReadiness.mergeGate.status !== 'missing') {
-      // Once present, Merge Gate is the authoritative verdict for this exact
-      // head/base revision. Any result other than success remains waiting.
-      if (pr.reviewReadiness.approved) {
-        categories.readyToMerge.push(pr);
-      } else {
-        categories.ciPending.push(pr);
-      }
+    } else if (pr.reviewReadiness.mergeGate.status !== 'missing' &&
+               !pr.reviewReadiness.mergeGate.approved) {
+      // A non-green Merge Gate is a conservative blocker. Its success is only
+      // redundant evidence: deterministic CI and both attested reviews still
+      // decide whether the PR is ready.
+      categories.ciPending.push(pr);
     } else if (pr.checks.status === 'failing') {
       categories.ciFailing.push(pr);
     } else if (pr.checks.status === 'pending') {

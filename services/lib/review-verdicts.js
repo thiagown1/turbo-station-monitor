@@ -53,6 +53,35 @@ const CHECK_KIND_BY_NAME = Object.freeze({
 
 const TRUSTED_CHECK_APPS = new Set(['github-actions']);
 
+const VERDICT_WORKFLOW_POLICIES = Object.freeze({
+  'thiagown1/turbo_station': Object.freeze({
+    defaultBranch: 'master',
+    test: Object.freeze({
+      path: '.github/workflows/agent-test-review.yml',
+      title: ({ prNumber, headSha, baseSha }) =>
+        `Test review verdict PR #${prNumber} head ${headSha} base ${baseSha}`,
+    }),
+    security: Object.freeze({
+      path: '.github/workflows/agent-sec-review.yml',
+      title: ({ prNumber, headSha, baseSha }) =>
+        `Security review verdict PR #${prNumber} head ${headSha} base ${baseSha}`,
+    }),
+  }),
+  'thiagown1/ocpp_server': Object.freeze({
+    defaultBranch: 'main',
+    test: Object.freeze({
+      path: '.github/workflows/agent-test-review.yml',
+      title: ({ prNumber, headSha, baseSha }) =>
+        `Test review PR #${prNumber} head ${headSha} base ${baseSha}`,
+    }),
+    security: Object.freeze({
+      path: '.github/workflows/agent-sec-review.yml',
+      title: ({ prNumber, headSha, baseSha }) =>
+        `Security review PR #${prNumber} head ${headSha} base ${baseSha}`,
+    }),
+  }),
+});
+
 function getCheckName(check = {}) {
   return check.name || check.context || 'unknown';
 }
@@ -105,17 +134,55 @@ function expectedExternalId(name, revision = {}) {
   return `review-verdict:v1:${revision.repo}:pr:${revision.prNumber}:${kind}:head:${revision.headSha}:base:${revision.baseSha}`;
 }
 
+function parseWorkflowRunId(detailsUrl, repo) {
+  try {
+    const url = new URL(detailsUrl);
+    const match = url.pathname.match(/^\/([^/]+)\/([^/]+)\/actions\/runs\/(\d+)(?:\/attempts\/\d+)?\/?$/);
+    if (url.protocol !== 'https:' || url.hostname !== 'github.com' || !match) return null;
+    if (`${match[1]}/${match[2]}`.toLowerCase() !== String(repo).toLowerCase()) return null;
+    return Number(match[3]);
+  } catch {
+    return null;
+  }
+}
+
+function workflowRunTimestamp(check = {}) {
+  const run = check.workflowRun;
+  if (!run) return Number.NEGATIVE_INFINITY;
+  return Date.parse(run.run_started_at || run.created_at || '') || Number.NEGATIVE_INFINITY;
+}
+
+function hasAttestedWorkflowRun(check, name, revision = {}) {
+  const kind = CHECK_KIND_BY_NAME[name];
+  if (kind !== 'test' && kind !== 'security') return true;
+  const repoPolicy = VERDICT_WORKFLOW_POLICIES[revision.repo];
+  const kindPolicy = repoPolicy?.[kind];
+  const run = check.workflowRun;
+  const runId = parseWorkflowRunId(check.details_url || check.detailsUrl, revision.repo);
+  if (!kindPolicy || !run || !runId || Number(run.id) !== runId) return false;
+  if (run.event !== 'workflow_dispatch' || run.head_branch !== repoPolicy.defaultBranch) return false;
+  if (run.path !== kindPolicy.path || run.display_title !== kindPolicy.title(revision)) return false;
+  const checkState = normalizeState(check);
+  if (checkState === 'SUCCESS') return run.status === 'completed' && run.conclusion === 'success';
+  if (['FAILURE', 'ACTION_REQUIRED'].includes(checkState)) {
+    return run.status === 'completed' && run.conclusion === 'failure';
+  }
+  return run.status !== 'completed' && !run.conclusion;
+}
+
 function matchesRevision(check, name, revision = {}) {
   const checkHeadSha = check.headSha || check.head_sha || check.checkSuite?.headSha || check.check_suite?.head_sha;
   if (revision.headSha && checkHeadSha && checkHeadSha !== revision.headSha) return false;
 
   const externalId = check.externalId || check.external_id;
   const expected = expectedExternalId(name, revision);
+  const kind = CHECK_KIND_BY_NAME[name];
   const hasIdentityMetadata = checkHeadSha || Object.hasOwn(check, 'externalId') || Object.hasOwn(check, 'external_id');
-  if (CHECK_KIND_BY_NAME[name] && hasIdentityMetadata) {
+  if (kind && (hasIdentityMetadata || ((kind === 'test' || kind === 'security') && VERDICT_WORKFLOW_POLICIES[revision.repo]))) {
     if (!expected) return false;
     const appSlug = check.app?.slug || check.appSlug || check.app_slug;
-    return externalId === expected && TRUSTED_CHECK_APPS.has(appSlug);
+    return externalId === expected && TRUSTED_CHECK_APPS.has(appSlug) &&
+      hasAttestedWorkflowRun(check, name, revision);
   }
 
   // statusCheckRollup is already scoped to the PR's current head. It does not
@@ -130,10 +197,15 @@ function latestChecksByName(checks = [], revision = {}) {
     const name = getCheckName(check);
     if (!matchesRevision(check, name, revision)) return;
 
-    const candidate = { check, timestamp: checkTimestamp(check), index };
+    const kind = CHECK_KIND_BY_NAME[name];
+    const timestamp = kind === 'test' || kind === 'security'
+      ? workflowRunTimestamp(check)
+      : checkTimestamp(check);
+    const candidate = { check, timestamp, runId: Number(check.workflowRun?.id || 0), index };
     const current = latest.get(name);
     if (!current || candidate.timestamp > current.timestamp ||
-        (candidate.timestamp === current.timestamp && candidate.index > current.index)) {
+        (candidate.timestamp === current.timestamp && candidate.runId > current.runId) ||
+        (candidate.timestamp === current.timestamp && candidate.runId === current.runId && candidate.index > current.index)) {
       latest.set(name, candidate);
     }
   });
@@ -199,7 +271,7 @@ function evaluateReviewReadiness({ checks = [], labels = [], reviews = [], ...re
   const mergeGate = evaluateNamedCheck(latestChecks, CHECK_NAMES.merge, seenNames);
   const testCheck = evaluateNamedCheck(latestChecks, CHECK_NAMES.test, seenNames);
   const securityCheck = evaluateNamedCheck(latestChecks, CHECK_NAMES.security, seenNames);
-  const hasCanonicalChecks = Object.values(CHECK_NAMES).some(name => seenNames.has(name));
+  const hasCanonicalChecks = [CHECK_NAMES.test, CHECK_NAMES.security].some(name => seenNames.has(name));
   // The legacy path is all-or-nothing. Once any canonical check exists, a
   // missing sibling cannot be supplied by a label from the old state machine.
   const test = hasCanonicalChecks ? testCheck : withLegacyFallback(
@@ -229,9 +301,9 @@ function evaluateReviewReadiness({ checks = [], labels = [], reviews = [], ...re
     };
   }
 
-  if (mergeGate.status !== 'missing') {
+  if (mergeGate.status !== 'missing' && !mergeGate.approved) {
     return {
-      approved: mergeGate.approved,
+      approved: false,
       status: mergeGate.status,
       source: 'merge-gate',
       needsCoderFix,
@@ -323,10 +395,12 @@ module.exports = {
   LEGACY_REVIEW_EVIDENCE,
   REVIEW_CONTROL_CHECK_NAMES,
   TRUSTED_CHECK_APPS,
+  VERDICT_WORKFLOW_POLICIES,
   evaluateReviewReadiness,
   getMarkedReviewKind,
   hasCanonicalReviewChecks,
   latestChecksByName,
+  parseWorkflowRunId,
   replaceCanonicalChecksWithMetadata,
   summarizeCiChecks,
 };
