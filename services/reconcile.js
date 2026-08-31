@@ -7,7 +7,8 @@
  * GitHub + git on every run to build a prioritized work plan.
  *
  * Core principle: GitHub + `git worktree list` are the source of truth.
- * task-state.json only stores what can't be derived (ciFixAttempts, blockedPRs).
+ * task-state.json is kept only as an inert fixed-schema tombstone. Any legacy
+ * task details are migrated to monitor-owned, non-executable evidence files.
  *
  * Usage:
  *   node reconcile.js                # Show current state (dry run)
@@ -19,9 +20,26 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  evaluateReviewReadiness,
+  summarizeCiChecks,
+} = require('./lib/review-verdicts');
+const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
+const {
+  OPENCLAW_WRITER_ATTESTATION_VARIABLE,
+  buildWriterConcurrencyKey,
+  canonicalizePrNumber,
+  evaluateWriterAuthorization,
+} = require('./lib/openclaw-writer-guard');
+const {
+  sanitizeCoderTaskState,
+  writeJsonAtomic,
+  writeWriterEvidence,
+} = require('./lib/writer-evidence-store');
 
 // ─── Config ────────────────────────────────────────────────────────
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
+const WRITER_EVIDENCE_PATH = path.join(__dirname, '..', 'state', 'writer-repair-evidence-reconcile.json');
 const TURBO_STATION_DIR = '/home/openclaw/.openclaw/workspace-coder/turbo_station';
 const WORKTREES_DIR = '/home/openclaw/.openclaw/workspace-coder/worktrees';
 const BUDGET_STATE_PATH = '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/data/budget-state.json';
@@ -79,6 +97,20 @@ function hasLabel(pr, name) {
   return (pr.labels || []).some(l => (l.name || l) === name);
 }
 
+function fetchWriterAttestationValue(repo) {
+  const raw = exec(
+    `gh api "repos/${repo}/actions/variables/${OPENCLAW_WRITER_ATTESTATION_VARIABLE}"`,
+    { allowFail: true, timeout: 15000 }
+  );
+  if (!raw) return null;
+  try {
+    const payload = JSON.parse(raw);
+    return typeof payload.value === 'string' ? payload.value : null;
+  } catch {
+    return null;
+  }
+}
+
 function detectPriority(labelNames = []) {
   for (const [tier, variants] of Object.entries(PRIORITY_VARIANTS)) {
     if (variants.some(label => labelNames.includes(label))) return tier;
@@ -91,89 +123,63 @@ function extractIssueNumber(branchName) {
   return match ? parseInt(match[1]) : null;
 }
 
-function getChecksSummary(pr) {
-  const checks = pr.statusCheckRollup || [];
-  if (checks.length === 0) return { status: 'no_checks', failing: [], pending: [] };
+function decoratePullRequest(pr, repo) {
+  hydrateCanonicalCheckMetadata(pr, {
+    repo,
+    run: exec,
+    onUnavailable: () => {
+      console.error(`  ⚠️  Canonical check metadata unavailable for ${repo}#${pr.number}; keeping gate blocked`);
+    },
+  });
+  pr.repo = repo;
+  pr.labelNames = (pr.labels || []).map(label => label.name || label);
+  pr.issueNumber = extractIssueNumber(pr.headRefName);
 
-  // Keep only the latest run per check name so old failed attempts do not block
-  // the current status when a newer run passed.
-  const latestPerName = new Map();
-  for (const check of checks) {
-    const name = check.name || check.context || 'unknown';
-    const ts = new Date(check.completedAt || check.updatedAt || check.updated_at || '1970-01-01T00:00:00Z').getTime();
-    const current = latestPerName.get(name);
-    const currentTs = current
-      ? new Date(current.completedAt || current.updatedAt || current.updated_at || '1970-01-01T00:00:00Z').getTime()
-      : -1;
-
-    if (!current || ts >= currentTs) {
-      latestPerName.set(name, check);
-    }
-  }
-
-  const latestChecks = Array.from(latestPerName.values());
-  const failing = [];
-  const pending = [];
-  const passing = [];
-
-  for (const check of latestChecks) {
-    const name = check.name || check.context || 'unknown';
-    if (check.status === 'COMPLETED' || check.state) {
-      const conclusion = check.conclusion || check.state;
-      if (conclusion === 'SUCCESS' || conclusion === 'NEUTRAL' || conclusion === 'SKIPPED') {
-        passing.push(name);
-      } else if (conclusion === 'FAILURE' || conclusion === 'ERROR' || conclusion === 'TIMED_OUT') {
-        failing.push(name);
-      } else if (conclusion === 'CANCELLED') {
-        // Ignore cancelled checks
-      } else {
-        passing.push(name); // e.g. Vercel SUCCESS state
-      }
-    } else {
-      pending.push(name);
-    }
-  }
-
-  if (pending.length > 0) return { status: 'pending', failing, pending, passing };
-  if (failing.length > 0) return { status: 'failing', failing, pending, passing };
-  return { status: 'green', failing, pending, passing };
+  const revision = {
+    repo,
+    prNumber: pr.number,
+    headSha: pr.headRefOid,
+    baseSha: pr.baseRefOid,
+    baseAncestryCurrent: pr.baseAncestryCurrent,
+  };
+  pr.checks = summarizeCiChecks(pr.statusCheckRollup || [], revision);
+  pr.reviewReadiness = evaluateReviewReadiness({
+    checks: pr.statusCheckRollup || [],
+    labels: pr.labels || [],
+    reviews: pr.reviews || [],
+    ...revision,
+  });
+  return pr;
 }
 
 // ─── Data Collection ───────────────────────────────────────────────
 
 function fetchOpenPRs() {
   const allPRs = [];
-  const seenNumbers = new Set();
+  const seenPullRequests = new Set();
 
   for (const repo of REPOS) {
     try {
       // 1. Fetch bot's own PRs
       const botPRs = gh(
-        `pr list --author ${BOT_AUTHOR} --state open --json number,title,headRefName,mergeable,labels,statusCheckRollup,updatedAt`,
+        `pr list --author ${BOT_AUTHOR} --state open --json number,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup,updatedAt`,
         repo
       );
       for (const pr of botPRs) {
-        pr.repo = repo;
-        pr.labelNames = (pr.labels || []).map(l => l.name || l);
-        pr.issueNumber = extractIssueNumber(pr.headRefName);
-        pr.checks = getChecksSummary(pr);
-        allPRs.push(pr);
-        seenNumbers.add(pr.number);
+        allPRs.push(decoratePullRequest(pr, repo));
+        seenPullRequests.add(`${repo}#${pr.number}`);
       }
 
       // 2. Also fetch PRs from ANY author with needs:coder-fix (e.g. human PRs)
       const coderFixPRs = gh(
-        `pr list --label "needs:coder-fix" --state open --json number,title,headRefName,mergeable,labels,statusCheckRollup,updatedAt`,
+        `pr list --label "needs:coder-fix" --state open --json number,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup,updatedAt`,
         repo
       );
       for (const pr of coderFixPRs) {
-        if (seenNumbers.has(pr.number)) continue; // skip duplicates
-        pr.repo = repo;
-        pr.labelNames = (pr.labels || []).map(l => l.name || l);
-        pr.issueNumber = extractIssueNumber(pr.headRefName);
-        pr.checks = getChecksSummary(pr);
-        allPRs.push(pr);
-        seenNumbers.add(pr.number);
+        const identity = `${repo}#${pr.number}`;
+        if (seenPullRequests.has(identity)) continue; // skip duplicates in this repository
+        allPRs.push(decoratePullRequest(pr, repo));
+        seenPullRequests.add(identity);
       }
     } catch (err) {
       console.error(`  ⚠️  Failed to fetch PRs for ${repo}: ${err.message}`);
@@ -289,6 +295,9 @@ function reconcile() {
   // 1. Fetch live data from GitHub
   const openPRs = fetchOpenPRs();
   const worktrees = getWorktrees();
+  const writerAttestationValues = Object.fromEntries(
+    REPOS.map(repo => [repo, fetchWriterAttestationValue(repo)])
+  );
 
   // 2. Categorize PRs
   const categories = {
@@ -301,16 +310,17 @@ function reconcile() {
   };
 
   for (const pr of openPRs) {
-    const prKey = String(pr.number);
+    const prKey = `${pr.repo}#${pr.number}`;
+    const legacyPrKey = String(pr.number);
 
     // Skip explicitly blocked PRs
-    if (blockedPRs.has(pr.number) || hasLabel(pr, 'status:blocked')) {
+    if (blockedPRs.has(prKey) || blockedPRs.has(pr.number) || blockedPRs.has(legacyPrKey) || hasLabel(pr, 'status:blocked')) {
       categories.blocked.push(pr);
       continue;
     }
 
     // Check CI fix attempts
-    const attempts = ciFixAttempts[prKey] || 0;
+    const attempts = ciFixAttempts[prKey] ?? ciFixAttempts[legacyPrKey] ?? 0;
     if (attempts >= MAX_CI_FIX_ATTEMPTS) {
       categories.blocked.push(pr);
       continue;
@@ -321,15 +331,20 @@ function reconcile() {
       categories.conflicting.push(pr);
     } else if (hasLabel(pr, 'needs:coder-fix')) {
       categories.needsCoderFix.push(pr);
+    } else if (pr.reviewReadiness.mergeGate.status !== 'missing' &&
+               !pr.reviewReadiness.mergeGate.approved) {
+      // A non-green Merge Gate is a conservative blocker. Its success is only
+      // redundant evidence: deterministic CI and both attested reviews still
+      // decide whether the PR is ready.
+      categories.ciPending.push(pr);
     } else if (pr.checks.status === 'failing') {
       categories.ciFailing.push(pr);
     } else if (pr.checks.status === 'pending') {
       categories.ciPending.push(pr);
     } else if (pr.checks.status === 'green') {
-      // All checks pass — is it reviewed?
-      const hasTestReview = hasLabel(pr, 'reviewed:tests');
-      const hasSecReview = hasLabel(pr, 'reviewed:security');
-      if (hasTestReview && hasSecReview) {
+      // During migration, any canonical verdict check disables the complete
+      // legacy path. Labels are consulted only when all canonical names are absent.
+      if (pr.reviewReadiness.approved) {
         categories.readyToMerge.push(pr);
       } else {
         // CI green but missing reviews — nothing for coder to do
@@ -359,8 +374,12 @@ function reconcile() {
     todo.push({
       action: 'fix_review',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       reason: 'Reviewer requested changes (needs:coder-fix)',
       priority: 100,
@@ -369,12 +388,16 @@ function reconcile() {
 
   // Priority 2: CI failures (only if no checks pending)
   for (const pr of categories.ciFailing) {
-    const attempts = ciFixAttempts[String(pr.number)] || 0;
+    const attempts = ciFixAttempts[`${pr.repo}#${pr.number}`] ?? ciFixAttempts[String(pr.number)] ?? 0;
     todo.push({
       action: 'fix_ci',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       failingChecks: pr.checks.failing,
       attempts,
@@ -388,8 +411,12 @@ function reconcile() {
     todo.push({
       action: 'rebase',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       reason: 'PR has merge conflicts — must rebase before anything else',
       priority: 110,
@@ -402,6 +429,7 @@ function reconcile() {
       action: 'implement',
       issue: issue.number,
       repo: issue.repo,
+      concurrencyKey: `openclaw-writer-v1:${issue.repo}:issue:${canonicalizePrNumber(issue.number)}`,
       title: issue.title,
       score: issue.score,
       priority: issue.score,
@@ -411,6 +439,45 @@ function reconcile() {
 
   // Sort by priority
   todo.sort((a, b) => b.priority - a.priority);
+
+  // Keep every detected problem as evidence. PR/issue repair is manual-only:
+  // task-state.json is not an authorization or CAS boundary, so its executable
+  // queue stays empty even when the infrastructure attestation is present.
+  const writerQueue = [];
+  const blockedWriterTasks = [];
+  for (const task of todo) {
+    const variableValue = writerAttestationValues[task.repo];
+    if (!task.pr) {
+      blockedWriterTasks.push({
+        ...task,
+        blockedReason: variableValue === 'true'
+          ? 'manual writer dispatch required; task-state queue is evidence-only'
+          : `${OPENCLAW_WRITER_ATTESTATION_VARIABLE} is not exactly true`,
+      });
+      continue;
+    }
+
+    const authorization = evaluateWriterAuthorization({
+      repo: task.repo,
+      prNumber: task.prNumber,
+      expectedHeadSha: task.headSha,
+      expectedBaseSha: task.baseSha,
+      variableValue,
+      currentPr: {
+        number: task.prNumber,
+        state: 'OPEN',
+        headRefOid: task.headSha,
+        baseRefOid: task.baseSha,
+      },
+    });
+    blockedWriterTasks.push({
+      ...task,
+      ...(authorization.tuple || {}),
+      blockedReason: authorization.authorized
+        ? 'manual exact-tuple repair required; task-state queue is evidence-only'
+        : authorization.reason,
+    });
+  }
 
   // 6. Budget check
   const budgetStatus = getBudgetStatus();
@@ -437,6 +504,8 @@ function reconcile() {
     canTakeNewWork,
     newIssuesAvailable: newIssues.length,
     todo,
+    writerQueue,
+    blockedWriterTasks,
     categories: {
       readyToMerge: categories.readyToMerge.map(pr => ({ number: pr.number, title: pr.title?.substring(0, 50), repo: pr.repo })),
       blocked: categories.blocked.map(pr => ({ number: pr.number, title: pr.title?.substring(0, 50), repo: pr.repo })),
@@ -460,25 +529,21 @@ function applyPlan(plan) {
   }
   exec(`cd ${TURBO_STATION_DIR} && git worktree prune`, { allowFail: true });
 
-  // 2. Write minimal task-state.json (v3)
-  const newState = {
-    schema: 'v3',
-    ciFixAttempts: plan.ciFixAttempts,
-    blockedPRs: plan.blockedPRs,
-    lastHeartbeat: plan.timestamp,
-    // Queue the top items for the coder to pick up (batch fix)
-    queue: plan.todo.slice(0, 5).map(t => ({
-      action: t.action,
-      number: t.pr || t.issue,
-      repo: t.repo,
-      branch: t.branch,
-      title: t.title,
-      reason: t.reason,
-    })),
-  };
-
-  fs.writeFileSync(TASK_STATE_PATH, JSON.stringify(newState, null, 2) + '\n');
-  return newState;
+  // 2. First migrate legacy task details out of the Coder workspace and leave
+  // only a fixed-schema tombstone that cannot carry disguised instructions.
+  const sanitized = sanitizeCoderTaskState({
+    currentState: readTaskState(),
+    currentTasks: plan.blockedWriterTasks.slice(0, 20),
+    generatedAt: plan.timestamp,
+  });
+  writeJsonAtomic(TASK_STATE_PATH, sanitized.taskState);
+  const evidence = writeWriterEvidence({
+    filePath: WRITER_EVIDENCE_PATH,
+    source: 'reconcile',
+    tasks: sanitized.evidenceTasks,
+    generatedAt: plan.timestamp,
+  });
+  return { taskState: sanitized.taskState, evidence };
 }
 
 // ─── Output ────────────────────────────────────────────────────────
@@ -521,6 +586,10 @@ function printPlan(plan) {
     console.log(`     ${icon} [${t.priority}] ${t.action} ${ref}: ${t.reason}`);
   }
   if (plan.todo.length > 5) console.log(`     ... and ${plan.todo.length - 5} more`);
+  if (plan.blockedWriterTasks.length > 0) {
+    console.log(`\n  🔒 Writer blocked: ${plan.blockedWriterTasks.length} task(s) retained as evidence`);
+    console.log(`     Set ${OPENCLAW_WRITER_ATTESTATION_VARIABLE}=true only after the documented writer controls are operational.`);
+  }
 
   // Ready to merge (for human awareness)
   if (plan.categories.readyToMerge.length > 0) {
@@ -549,7 +618,8 @@ function printStatus(plan) {
     `ci:${plan.openPRs.ciFailing}`,
     `conflict:${plan.openPRs.conflicting}`,
     `wt:${plan.worktrees.total}(${plan.worktrees.stale}stale)`,
-    `todo:${plan.todo.length}`,
+    `todo:${plan.writerQueue.length}`,
+    `writer-blocked:${plan.blockedWriterTasks.length}`,
     `new:${plan.newIssuesAvailable}`,
   ];
   console.log(parts.join(' | '));
@@ -571,15 +641,9 @@ try {
     console.log('\n  Applying...');
     const result = applyPlan(plan);
     console.log(`  ✅ Cleaned ${plan.worktrees.stale} stale worktrees`);
-    console.log(`  ✅ task-state.json updated (v3, ${plan.todo.length} queued items)`);
+    console.log(`  ✅ task-state.json sanitized (queue=${result.taskState.queue.length}, active=${result.taskState.activeTasks.length})`);
+    console.log(`  ✅ Monitor evidence recorded (${result.evidence.tasks.length} blocked)`);
 
-    // Auto-adjust heartbeat frequency based on workload
-    try {
-      const boostScript = path.join(__dirname, 'boost.js');
-      if (fs.existsSync(boostScript)) {
-        exec(`node ${boostScript}`, { allowFail: true, timeout: 10000 });
-      }
-    } catch { /* ignore boost errors */ }
   } else {
     printPlan(plan);
     console.log('  (Dry run — use --apply to clean up + write state)');

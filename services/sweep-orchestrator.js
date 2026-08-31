@@ -12,13 +12,26 @@
  *   node sweep-orchestrator.js --status     # Show current status
  */
 
-const { execSync } = require('child_process');
+const { execFileSync, execSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const {
+  evaluateReviewReadiness,
+  summarizeCiChecks,
+} = require('./lib/review-verdicts');
+const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
+const { buildWriterConcurrencyKey, canonicalizePrNumber } = require('./lib/openclaw-writer-guard');
+const {
+  sanitizeCoderTaskState,
+  writeJsonAtomic,
+  writeWriterEvidence,
+} = require('./lib/writer-evidence-store');
 
 // ─── Config ────────────────────────────────────────────────────────
 const STATE_PATH = path.join(__dirname, '..', 'state', 'sweep-loop.json');
 const FINDINGS_PATH = path.join(__dirname, '..', 'state', 'sweep-findings.json');
+const WRITER_EVIDENCE_PATH = path.join(__dirname, '..', 'state', 'writer-repair-evidence-sweep.json');
 const REPO = 'thiagown1/turbo_station';
 const TARGET_BRANCH = 'final/white-label';
 const TURBO_DIR = '/home/openclaw/.openclaw/workspace-coder/turbo_station';
@@ -57,11 +70,48 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function pullRequestRevision(pr) {
+  return {
+    repo: REPO,
+    prNumber: pr.number,
+    headSha: pr.headRefOid,
+    baseSha: pr.baseRefOid,
+    baseAncestryCurrent: pr.baseAncestryCurrent,
+  };
+}
+
+function getPullRequestReviewReadiness(pr) {
+  return evaluateReviewReadiness({
+    checks: pr.statusCheckRollup || [],
+    labels: pr.labels || [],
+    reviews: pr.reviews || [],
+    ...pullRequestRevision(pr),
+  });
+}
+
+function fetchPullRequestSnapshot(prNumber) {
+  const raw = exec(
+    `gh pr view ${prNumber} --repo ${REPO} --json number,state,title,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup 2>/dev/null || echo ""`,
+    { allowFail: true, timeout: 30000 }
+  );
+  if (!raw) return null;
+  try {
+    const pr = JSON.parse(raw);
+    return hydrateCanonicalCheckMetadata(pr, {
+      repo: REPO,
+      run: exec,
+      onUnavailable: () => log(`PR #${prNumber} canonical check metadata unavailable — keeping gate blocked`),
+    });
+  } catch {
+    return null;
+  }
+}
+
 function sendTelegram(text) {
   try {
-    const escaped = text.replace(/"/g, '\\"').replace(/\$/g, '\\$');
-    execSync(
-      `openclaw message send --channel telegram --target "${TELEGRAM_TARGET}" --message "${escaped}"`,
+    execFileSync(
+      'openclaw',
+      ['message', 'send', '--channel', 'telegram', '--target', TELEGRAM_TARGET, '--message', String(text)],
       { timeout: 30000, stdio: 'pipe' }
     );
     log(`Telegram sent: ${text.substring(0, 60)}...`);
@@ -94,10 +144,8 @@ function enableCron(name) {
 
 // Clean up: re-enable heartbeats on process exit
 const SCOUT_CRON = 'f60e2e2d-3413-41c2-bc56-1d033af59f0e';  // scout-heartbeat-10m
-const CODER_CRON = 'c0d3r-hb-30m-a1b2c3d4e5f6';              // coder-heartbeat-10m
 function cleanupCrons() {
   enableCron(SCOUT_CRON);
-  enableCron(CODER_CRON);
 }
 process.on('exit', cleanupCrons);
 process.on('SIGINT', () => { cleanupCrons(); process.exit(130); });
@@ -134,16 +182,51 @@ function createFreshState() {
 
 // ─── Phase: SWEEP ──────────────────────────────────────────────────
 
-function buildSweepPrompt() {
+function prepareScoutSnapshot() {
+  const gitOptions = {
+    encoding: 'utf8',
+    timeout: 120000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+  };
+  const dirty = execFileSync(
+    'git',
+    ['-C', SCOUT_DIR, 'status', '--porcelain'],
+    gitOptions
+  ).trim();
+  if (dirty) throw new Error('Scout checkout is dirty; refusing to replace its snapshot');
+
+  execFileSync(
+    'git',
+    [
+      '-C', SCOUT_DIR, 'fetch', '--prune', 'origin',
+      `+refs/heads/${TARGET_BRANCH}:refs/remotes/origin/${TARGET_BRANCH}`,
+    ],
+    gitOptions
+  );
+  execFileSync(
+    'git',
+    ['-C', SCOUT_DIR, 'checkout', '--detach', `origin/${TARGET_BRANCH}`],
+    gitOptions
+  );
+  const sha = execFileSync('git', ['-C', SCOUT_DIR, 'rev-parse', 'HEAD'], gitOptions).trim();
+  if (!/^[0-9a-f]{40}$/i.test(sha)) throw new Error('Scout snapshot SHA is unavailable');
+  return sha;
+}
+
+function buildSweepPrompt(snapshotSha) {
   return `🌙 White-Label Night Sweep — Ciclo autônomo de validação.
 
 Tu é o Scout do time. Tua missão é varrer o branch final/white-label e encontrar TODOS os problemas white-label restantes.
 
 WORKSPACE: ${SCOUT_DIR}
 BRANCH: ${TARGET_BRANCH}
+SNAPSHOT SHA: ${snapshotSha}
 
-═══ PASSO 1: ATUALIZAR CÓDIGO ═══
-cd ${SCOUT_DIR} && git fetch origin && git checkout ${TARGET_BRANCH} && git pull origin ${TARGET_BRANCH}
+═══ PASSO 1: CONFIRMAR SNAPSHOT READ-ONLY ═══
+O monitor já preparou o snapshot exato acima. Confirme com:
+git -C ${SCOUT_DIR} rev-parse HEAD
+Não execute fetch, checkout, pull, commit, push nem qualquer escrita no repositório ou no GitHub.
 
 ═══ PASSO 2: LER A MATRIX ═══
 cat ${SCOUT_DIR}/docs/WHITE_LABEL_MATRIX.md
@@ -225,17 +308,24 @@ async function runSweep(state) {
     log('Cleared stale scout session locks');
   } catch {}
 
-  // Dispatch scout agent with unique session
-  const prompt = buildSweepPrompt();
-  const promptFile = '/tmp/sweep-prompt.txt';
-  fs.writeFileSync(promptFile, prompt);
+  // The monitor performs the only checkout mutation before the agent starts.
+  // Operational isolation mounts this exact snapshot read-only to Scout and
+  // exposes only the dedicated findings path as writable.
+  let snapshotSha;
+  try {
+    snapshotSha = prepareScoutSnapshot();
+  } catch (err) {
+    throw new Error(`Scout snapshot preparation blocked: ${err.message?.substring(0, 160)}`);
+  }
+  const prompt = buildSweepPrompt(snapshotSha);
   const sessionId = `sweep-${state.cycle}-${Date.now()}`;
 
   log(`Dispatching scout agent (session: ${sessionId})...`);
   try {
-    exec(
-      `openclaw agent --agent scout --thinking high --timeout 1200 --session-id "${sessionId}" --message "$(cat ${promptFile})"`,
-      { timeout: SCOUT_TIMEOUT_MS + 30000, allowFail: true }
+    execFileSync(
+      'openclaw',
+      ['agent', '--agent', 'scout', '--thinking', 'high', '--timeout', '1200', '--session-id', sessionId, '--message', prompt],
+      { timeout: SCOUT_TIMEOUT_MS + 30000, stdio: 'pipe' }
     );
   } catch (err) {
     log(`Scout dispatch returned: ${err.message?.substring(0, 100)}`);
@@ -333,9 +423,9 @@ function dedupFindings(findings) {
     }
   }
 
-  // Also check open issues with auto:implement label
+  // Neutral evidence issues are durable records, not implementation triggers.
   const openIssuesRaw = exec(
-    `gh issue list --repo ${REPO} --state open --label "auto:implement" --json number,title --jq '[.[].title]' 2>/dev/null || echo "[]"`,
+    `gh issue list --repo ${REPO} --state open --label "auto:none" --json number,title --jq '[.[].title]' 2>/dev/null || echo "[]"`,
     { allowFail: true, timeout: 15000 }
   );
   let openIssueTitles = [];
@@ -372,22 +462,38 @@ function dedupFindings(findings) {
 // ─── Phase: IMPLEMENT (batch) ──────────────────────────────────────
 
 async function createIssuesForBatch(state, batchFindings, batchIndex, totalBatches) {
-  log(`═══ IMPLEMENT — Batch ${batchIndex}/${totalBatches} (${batchFindings.length} issues) ═══`);
-  sendTelegram(`🔧 Ciclo ${state.cycle} Batch ${batchIndex}/${totalBatches}: ${batchFindings.length} issues. Criando e ativando Coder...`);
+  log(`═══ RECORD — Batch ${batchIndex}/${totalBatches} (${batchFindings.length} issues) ═══`);
+  sendTelegram(`📋 Ciclo ${state.cycle} Batch ${batchIndex}/${totalBatches}: ${batchFindings.length} achados. Registrando evidências para correção manual...`);
 
   const batchData = [];
 
   for (const finding of batchFindings) {
     // Check for existing open issue with similar title
-    const searchTitle = finding.description.substring(0, 50).replace(/"/g, '\\"');
-    const existing = exec(
-      `gh issue list --repo ${REPO} --state open --search "${searchTitle}" --json number --jq '.[0].number' 2>/dev/null || echo ""`,
-      { allowFail: true }
-    );
+    const searchTitle = String(finding.description || '').substring(0, 50);
+    const title = `fix(white-label): ${String(finding.description || '').substring(0, 72)}`;
 
     let issueNumber;
-    if (existing && existing !== 'null' && existing !== '') {
-      issueNumber = parseInt(existing);
+    try {
+      const candidates = JSON.parse(execFileSync(
+        'gh',
+        ['issue', 'list', '--repo', REPO, '--state', 'open', '--search', searchTitle, '--json', 'number,title,labels', '--limit', '10'],
+        { encoding: 'utf8', timeout: 15000 }
+      ));
+      const exact = candidates.find(candidate => {
+        const labels = (candidate.labels || []).map(label => label.name || label);
+        return candidate.title === title &&
+          labels.includes('auto:none') && labels.includes('white-label') &&
+          !labels.some(label => label.startsWith('agent:')) &&
+          !labels.includes('auto:implement') &&
+          !labels.includes('status:done') && !labels.includes('status:blocked');
+      });
+      issueNumber = canonicalizePrNumber(exact?.number);
+    } catch (error) {
+      log(`Issue lookup failed closed for ${finding.id}: ${error.message}`);
+      continue;
+    }
+
+    if (issueNumber) {
       log(`Issue already exists: #${issueNumber} (skipping creation)`);
     } else {
       // Create issue
@@ -410,23 +516,26 @@ async function createIssuesForBatch(state, batchFindings, batchIndex, totalBatch
         `Branch alvo: \`${TARGET_BRANCH}\``,
       ].join('\n');
 
-      const bodyFile = `/tmp/sweep-issue-${finding.id}.md`;
-      fs.writeFileSync(bodyFile, body);
+      const labels = 'auto:none,white-label,Priority: P1-important';
 
-      const title = `fix(white-label): ${finding.description.substring(0, 72)}`;
-      const labels = 'agent:coder,auto:implement,white-label,Priority: P1-important';
-
-    try {
-        const result = exec(
-          `gh issue create --repo ${REPO} --title "${title.replace(/"/g, '\\"')}" --body-file "${bodyFile}" --label "${labels}"`,
-          { timeout: 15000 }
-        );
+      const tempDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'sweep-issue-'));
+      const bodyFile = path.join(tempDirectory, 'body.md');
+      try {
+        fs.writeFileSync(bodyFile, body, { encoding: 'utf8', mode: 0o600 });
+        const result = execFileSync(
+          'gh',
+          ['issue', 'create', '--repo', REPO, '--title', title, '--body-file', bodyFile, '--label', labels],
+          { encoding: 'utf8', timeout: 15000 }
+        ).trim();
         const urlMatch = result.match(/\/issues\/(\d+)/);
-        issueNumber = urlMatch ? parseInt(urlMatch[1]) : null;
+        issueNumber = canonicalizePrNumber(urlMatch?.[1]);
+        if (!issueNumber) throw new Error('GitHub did not return a canonical issue number');
         log(`Created issue #${issueNumber}: ${finding.id}`);
       } catch (err) {
         log(`Failed to create issue for ${finding.id}: ${err.message}`);
         continue;
+      } finally {
+        fs.rmSync(tempDirectory, { recursive: true, force: true });
       }
     }
 
@@ -440,6 +549,11 @@ async function createIssuesForBatch(state, batchFindings, batchIndex, totalBatch
     });
   }
 
+  if (batchData.length === 0) {
+    log(`Batch ${batchIndex}: no exact actionable issues remain; no repair dispatched`);
+    return [];
+  }
+
   // Set current batch as the active cycle data
   state.currentCycle = {
     sweepFindings: batchData,
@@ -451,97 +565,41 @@ async function createIssuesForBatch(state, batchFindings, batchIndex, totalBatch
   state.status = 'IMPLEMENT';
   saveState(state);
 
-  // === Phase: Wake Coder for Sweep Batch ===
-  // CRITICAL: The coder has a heartbeat cron that runs reconcile.js which overwrites
-  // task-state.json with rebase tasks. We must:
-  // 1. Disable the coder cron BEFORE writing task-state
-  // 2. Kill existing sessions AFTER cron is disabled
-  // 3. Write a sweep-lock file to signal reconcile to skip
-  // 4. Keep coder cron disabled until the batch is done
-
-  disableCron(CODER_CRON);
-  log('Coder cron disabled for sweep batch');
-  await sleep(20000); // Wait for any running heartbeat to finish
-
-  // Kill ALL existing coder sessions — must kill PROCESS, not just lock file
-  try {
-    // Read PIDs from lock files and kill them
-    exec(`for f in /home/openclaw/.openclaw/agents/coder/sessions/*.lock; do [ -f "$f" ] && PID=$(python3 -c "import json; print(json.load(open('$f')).get('pid',''))" 2>/dev/null) && [ -n "$PID" ] && kill $PID 2>/dev/null; done; sleep 2; find /home/openclaw/.openclaw/agents/coder/sessions/ -name "*.lock" -delete 2>/dev/null || true`, { allowFail: true });
-    log('Killed all coder session processes and cleared locks');
-  } catch {}
-  await sleep(5000);
-
-  // Write sweep-lock file to prevent reconcile from overwriting task-state
-  const sweepLockPath = '/home/openclaw/.openclaw/workspace-coder/sweep-lock.json';
-  fs.writeFileSync(sweepLockPath, JSON.stringify({
-    active: true,
-    batchIndex,
-    totalBatches,
-    issues: batchData.map(f => f.issueNumber),
-    startedAt: new Date().toISOString(),
-  }, null, 2) + '\n');
-  log('Wrote sweep-lock.json');
-
-  // Write task-state.json directly with ONLY sweep issues (skip reconcile entirely)
-  const taskState = {
-    schema: 'v3',
-    ciFixAttempts: {},
-    blockedPRs: [],
-    lastHeartbeat: new Date().toISOString(),
-    queue: batchData.map(f => ({
-      action: 'implement',
-      number: f.issueNumber,
-      repo: REPO,
-      branch: `fix/issue-${f.issueNumber}-sweep`,
-      title: `fix(white-label): ${f.description.substring(0, 60)}`,
-      reason: `Sweep batch ${batchIndex}: ${f.description.substring(0, 80)}`,
-    })),
-  };
+  // Persist evidence only. Never kill other sessions or expose a durable
+  // heartbeat queue that could outlive attestation revocation.
+  const blockedTasks = batchData.map(f => ({
+    action: 'implement',
+    number: f.issueNumber,
+    repo: REPO,
+    concurrencyKey: `openclaw-writer-v1:${REPO}:issue:${canonicalizePrNumber(f.issueNumber)}`,
+    branch: `fix/issue-${f.issueNumber}-sweep`,
+    title: `fix(white-label): ${f.description.substring(0, 60)}`,
+    reason: `Sweep batch ${batchIndex}: ${f.description.substring(0, 80)}`,
+    blockedReason: 'manual implementation required; monitor has no write-capable repair job',
+  }));
   const taskStatePath = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
-  fs.writeFileSync(taskStatePath, JSON.stringify(taskState, null, 2) + '\n');
-  log(`Wrote ${taskState.queue.length} implement tasks to task-state.json`);
+  let currentTaskState = {};
+  try {
+    currentTaskState = JSON.parse(fs.readFileSync(taskStatePath, 'utf8'));
+  } catch {}
+  const generatedAt = new Date().toISOString();
+  const sanitized = sanitizeCoderTaskState({
+    currentState: currentTaskState,
+    currentTasks: blockedTasks,
+    generatedAt,
+  });
+  writeJsonAtomic(taskStatePath, sanitized.taskState);
+  const evidence = writeWriterEvidence({
+    filePath: WRITER_EVIDENCE_PATH,
+    source: 'sweep',
+    tasks: sanitized.evidenceTasks,
+    generatedAt,
+  });
+  log(`Recorded ${evidence.tasks.length} sweep tasks as monitor-owned, non-executable evidence`);
 
   const issueNums = batchData.map(f => `#${f.issueNumber}`).join(', ');
-  const coderSessionId = `sweep-coder-${state.cycle}-b${batchIndex}-${Date.now()}`;
-
-  // Build explicit per-issue instructions
-  const issueInstructions = batchData.map((f, i) => {
-    return `${i + 1}. Issue #${f.issueNumber}: ${f.description.substring(0, 80)}\n   Arquivo: ${f.file}${f.line ? `:${f.line}` : ''}\n   Fix: ${(f.suggestedFix || '').substring(0, 80)}`;
-  }).join('\n');
-
-  const coderMessage = `🚨 SWEEP BATCH — PRIORIDADE MÁXIMA
-
-⚠️ NÃO rode reconcile.js --apply. O sweep-lock.json está ativo.
-⚠️ NÃO rode o HEARTBEAT.md fast path. Leia estas instruções DIRETAMENTE.
-
-O task-state.json já foi escrito com as ${batchData.length} issues deste batch.
-
-Implemente CADA issue sequencialmente:
-
-${issueInstructions}
-
-Para CADA issue:
-1. cd /home/openclaw/.openclaw/workspace-coder/turbo_station && git fetch origin
-2. git worktree add ../worktrees/issue-N origin/${TARGET_BRANCH} -b fix/issue-N-desc
-3. Leia a issue: gh issue view N --repo ${REPO}
-4. Faça o fix (use getBrandConfig() ou brand context pra resolver branding dinâmico)
-5. cd ../worktrees/issue-N/next && npm run type-check
-6. git add -A && git commit -m 'fix(white-label): descrição'
-7. git push origin fix/issue-N-desc
-8. gh pr create --repo ${REPO} --base ${TARGET_BRANCH} --title 'fix(white-label): ...' --body 'Closes #N' --label 'needs:test-review,needs:sec-review,backend'
-9. cd /home/openclaw/.openclaw/workspace-coder/turbo_station && git worktree remove --force ../worktrees/issue-N
-
-Branch base: ${TARGET_BRANCH}. NUNCA faça merge de PRs.`;
-
-  try {
-    exec(
-      `openclaw agent --agent coder --deliver --thinking high --timeout 900 --session-id "${coderSessionId}" --message "${coderMessage.replace(/"/g, '\\"').replace(/\$/g, '\\$')}"`,
-      { timeout: 30000, allowFail: true }
-    );
-    log('Coder agent woken with direct sweep instructions');
-  } catch (err) {
-    log(`Coder wake: ${err.message?.substring(0, 80)}`);
-  }
+  log(`Sweep evidence ready (${issueNums}); manual repair dispatch required`);
+  sendTelegram(`🛑 Sweep ${state.cycle} batch ${batchIndex}: ${issueNums} aguardam correção manual. Nenhum Coder foi acionado.`);
 
   return batchData;
 }
@@ -604,12 +662,20 @@ async function mergeExistingReadyPRs(state) {
   log('═══ PRE-SWEEP — Checking for existing reviewed PRs to merge ═══');
 
   const readyPRsRaw = exec(
-    `gh pr list --repo ${REPO} --state open --base ${TARGET_BRANCH} --label "reviewed:tests" --label "reviewed:security" --json number,title,mergeable --jq '[.[] | select(.mergeable == "MERGEABLE") | {number, title}]' 2>/dev/null || echo "[]"`,
+    `gh pr list --repo ${REPO} --state open --base ${TARGET_BRANCH} --limit 100 --json number,title,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup 2>/dev/null || echo "[]"`,
     { allowFail: true, timeout: 30000 }
   );
 
   let readyPRs = [];
-  try { readyPRs = JSON.parse(readyPRsRaw || '[]'); } catch {}
+  try {
+    readyPRs = JSON.parse(readyPRsRaw || '[]')
+      .map(pr => hydrateCanonicalCheckMetadata(pr, {
+        repo: REPO,
+        run: exec,
+        onUnavailable: () => log(`PR #${pr.number} canonical check metadata unavailable — keeping gate blocked`),
+      }))
+      .filter(pr => pr.mergeable === 'MERGEABLE' && getPullRequestReviewReadiness(pr).approved);
+  } catch {}
 
   if (readyPRs.length === 0) {
     log('No existing reviewed PRs ready to merge.');
@@ -621,11 +687,17 @@ async function mergeExistingReadyPRs(state) {
 
   let merged = 0;
   for (const pr of readyPRs) {
+    // Re-read the current head/base immediately before the write. A verdict
+    // that disappeared or became pending must never inherit stale readiness.
+    const current = fetchPullRequestSnapshot(pr.number);
+    const readiness = current ? getPullRequestReviewReadiness(current) : null;
+    if (!current || !readiness?.approved || current.mergeable !== 'MERGEABLE') {
+      log(`PR #${pr.number} readiness changed — skipping pre-sweep merge`);
+      continue;
+    }
+
     // Safety: only merge PRs targeting our branch, not master/main
-    const baseBranch = exec(
-      `gh pr view ${pr.number} --repo ${REPO} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "unknown"`,
-      { allowFail: true }
-    );
+    const baseBranch = current.baseRefName || 'unknown';
     if (baseBranch === 'master' || baseBranch === 'main') {
       log(`⚠️ PR #${pr.number} targets ${baseBranch} — SKIPPING`);
       continue;
@@ -664,36 +736,26 @@ async function waitForCI(state) {
     for (const finding of state.currentCycle.sweepFindings) {
       if (!finding.prNumber || finding.prStatus === 'ci_green') continue;
 
-      const checksJson = exec(
-        `gh pr checks ${finding.prNumber} --repo ${REPO} --json name,state,conclusion 2>/dev/null || echo "[]"`,
-        { allowFail: true }
-      );
+      const pr = fetchPullRequestSnapshot(finding.prNumber);
 
       try {
-        const checks = JSON.parse(checksJson || '[]');
-        if (checks.length === 0) {
+        if (!pr) {
+          finding.prStatus = 'ci_pending';
           allGreen = false;
           continue;
         }
 
-        const failing = checks.filter(c =>
-          c.conclusion === 'FAILURE' || c.conclusion === 'ERROR' || c.conclusion === 'TIMED_OUT'
-        );
-        const pending = checks.filter(c => !c.conclusion || c.state === 'IN_PROGRESS' || c.state === 'QUEUED');
-        const passing = checks.filter(c =>
-          c.conclusion === 'SUCCESS' || c.conclusion === 'NEUTRAL' || c.conclusion === 'SKIPPED'
-        );
-
-        if (pending.length > 0) {
+        const checks = summarizeCiChecks(pr.statusCheckRollup || [], pullRequestRevision(pr));
+        if (checks.status === 'pending' || checks.status === 'no_checks') {
           finding.prStatus = 'ci_pending';
           allGreen = false;
-        } else if (failing.length > 0) {
+        } else if (checks.status === 'failing') {
           finding.prStatus = 'ci_failed';
           allGreen = false;
 
           if (finding.ciFixAttempts < CI_FIX_MAX_ATTEMPTS) {
             finding.ciFixAttempts++;
-            log(`PR #${finding.prNumber} CI failed (attempt ${finding.ciFixAttempts}). Existing webhook pipeline will auto-fix.`);
+            log(`PR #${finding.prNumber} CI failed (observation ${finding.ciFixAttempts}); manual repair required.`);
           } else {
             log(`PR #${finding.prNumber} CI failed ${CI_FIX_MAX_ATTEMPTS} times — marking blocked`);
             finding.prStatus = 'blocked';
@@ -746,37 +808,29 @@ async function waitForReviews(state) {
       if (!finding.prNumber || finding.prStatus === 'blocked') continue;
       if (finding.prStatus === 'reviewed') continue;
 
-      const labelsJson = exec(
-        `gh pr view ${finding.prNumber} --repo ${REPO} --json labels --jq '[.labels[].name]' 2>/dev/null || echo "[]"`,
-        { allowFail: true }
-      );
-
       try {
-        const labels = JSON.parse(labelsJson || '[]');
-        const hasTestReview = labels.includes('reviewed:tests');
-        const hasSecReview = labels.includes('reviewed:security');
-        const needsCoderFix = labels.includes('needs:coder-fix');
+        const pr = fetchPullRequestSnapshot(finding.prNumber);
+        if (!pr) {
+          allReviewed = false;
+          continue;
+        }
+        const readiness = getPullRequestReviewReadiness(pr);
 
-        if (needsCoderFix) {
+        if (readiness.needsCoderFix) {
           finding.prStatus = 'changes_requested';
           allReviewed = false;
-          // The existing webhook pipeline will wake coder automatically
-          log(`PR #${finding.prNumber} needs coder fix — existing pipeline handles this`);
-        } else if (hasTestReview && hasSecReview) {
+          log(`PR #${finding.prNumber} needs a manual exact-tuple repair`);
+        } else if (readiness.approved) {
           finding.prStatus = 'reviewed';
-          log(`PR #${finding.prNumber} fully reviewed ✅`);
+          log(`PR #${finding.prNumber} fully reviewed via ${readiness.source} ✅`);
         } else if (finding.prStatus !== 'ci_green') {
           // Still waiting
           allReviewed = false;
         } else {
           allReviewed = false;
-          // Ensure review labels are set
-          if (!labels.includes('needs:test-review') && !hasTestReview) {
-            exec(`gh pr edit ${finding.prNumber} --repo ${REPO} --add-label "needs:test-review"`, { allowFail: true });
-          }
-          if (!labels.includes('needs:sec-review') && !hasSecReview) {
-            exec(`gh pr edit ${finding.prNumber} --repo ${REPO} --add-label "needs:sec-review"`, { allowFail: true });
-          }
+          // Reviewer labels can transitively wake a writer in the target
+          // repository, so the evidence-only sweep never writes them.
+          log(`PR #${finding.prNumber} is waiting for a review verdict; no trigger label changed`);
         }
       } catch {
         allReviewed = false;
@@ -817,9 +871,10 @@ async function mergePRs(state) {
   state.status = 'MERGE';
   saveState(state);
 
-  // Only merge PRs that are reviewed (or at least CI green if reviews timed out)
+  // Only merge PRs that reached an explicit review verdict. CI green without
+  // a verdict is intentionally insufficient.
   const toMerge = state.currentCycle.sweepFindings.filter(f =>
-    f.prNumber && !f.merged && (f.prStatus === 'reviewed' || f.prStatus === 'ci_green') && f.prStatus !== 'blocked'
+    f.prNumber && !f.merged && f.prStatus === 'reviewed'
   );
 
   sendTelegram(`🔀 Ciclo ${state.cycle}: Mergeando ${toMerge.length} PRs...`);
@@ -827,11 +882,17 @@ async function mergePRs(state) {
   for (const finding of toMerge) {
     log(`Merging PR #${finding.prNumber}...`);
 
+    // Reconcile the exact current revision immediately before merging.
+    const current = fetchPullRequestSnapshot(finding.prNumber);
+    const readiness = current ? getPullRequestReviewReadiness(current) : null;
+    if (!current || !readiness?.approved) {
+      log(`PR #${finding.prNumber} no longer has an approved current verdict — skipping`);
+      finding.prStatus = 'review_pending';
+      continue;
+    }
+
     // Check base branch — only merge if target is NOT master/main
-    const baseBranch = exec(
-      `gh pr view ${finding.prNumber} --repo ${REPO} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "unknown"`,
-      { allowFail: true }
-    );
+    const baseBranch = current.baseRefName || 'unknown';
 
     if (baseBranch === 'master' || baseBranch === 'main') {
       log(`⚠️ PR #${finding.prNumber} targets ${baseBranch} — SKIPPING (safety)`);
@@ -840,39 +901,21 @@ async function mergePRs(state) {
     }
 
     // Check mergeable status
-    const mergeable = exec(
-      `gh pr view ${finding.prNumber} --repo ${REPO} --json mergeable --jq '.mergeable' 2>/dev/null || echo "UNKNOWN"`,
-      { allowFail: true }
-    );
+    const mergeable = current.mergeable || 'UNKNOWN';
 
     if (mergeable === 'CONFLICTING') {
-      log(`PR #${finding.prNumber} has conflicts — waking coder to rebase`);
-      try {
-        exec(
-          `openclaw agent --agent coder --deliver --timeout 600 --message "PR #${finding.prNumber} tem conflito de merge. Rebasa a branch no ${TARGET_BRANCH} e faz push --force-with-lease."`,
-          { timeout: 30000, allowFail: true }
-        );
-      } catch {}
-
-      // Wait for rebase (up to 10 min)
-      const rebaseDeadline = Date.now() + 10 * 60 * 1000;
-      let rebased = false;
-      while (Date.now() < rebaseDeadline) {
-        await sleep(60000);
-        const status = exec(
-          `gh pr view ${finding.prNumber} --repo ${REPO} --json mergeable --jq '.mergeable' 2>/dev/null || echo "UNKNOWN"`,
-          { allowFail: true }
-        );
-        if (status === 'MERGEABLE') {
-          rebased = true;
-          break;
-        }
-      }
-      if (!rebased) {
-        log(`PR #${finding.prNumber} still conflicting after rebase attempt — skipping`);
-        finding.prStatus = 'conflict_stuck';
-        continue;
-      }
+      const prNumber = canonicalizePrNumber(finding.prNumber);
+      finding.prStatus = 'manual_rebase_required';
+      finding.writerTuple = {
+        repo: REPO,
+        prNumber,
+        headSha: current.headRefOid,
+        baseSha: current.baseRefOid,
+        concurrencyKey: buildWriterConcurrencyKey({ repo: REPO, prNumber }),
+      };
+      log(`PR #${prNumber} has conflicts — exact-tuple manual rebase required`);
+      saveState(state);
+      continue;
     }
 
     // Attempt merge
@@ -1001,8 +1044,15 @@ async function main() {
 
           log(`\n┌─── Batch ${batchNum}/${batches.length} (${batch.length} issues) ───┐`);
 
-          // 1. Create issues and wake coder for THIS batch only
-          await createIssuesForBatch(state, batch, batchNum, batches.length);
+          // 1. Record evidence for THIS batch. The monitor never dispatches a writer.
+          const batchData = await createIssuesForBatch(state, batch, batchNum, batches.length);
+          if (batchData.length === 0) {
+            log(`Batch ${batchNum}: No exact actionable issues remain — skipping to next batch`);
+            stalledBatches++;
+            state.currentCycle = null;
+            saveState(state);
+            continue;
+          }
 
           // 2. Wait for PRs to be created
           const hasPRs = await waitForPRs(state);

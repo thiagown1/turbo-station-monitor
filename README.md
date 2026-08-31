@@ -35,10 +35,18 @@ Runs on a VPS as a set of PM2-managed Node.js services that collect, store, and 
 | `ocpp-collector` | — | `smart-collector.js` | WebSocket + REST poller for OCPP charger logs → `db/ocpp.db` |
 | `ocpp-alerts` | — | `alert-processor.js` | Monitors OCPP events, triggers alerts for faults/recovery |
 | `vercel-drain` | 3001 | `vercel-drain.js` | Vercel log drain webhook → `db/vercel.db` |
-| `github-webhook` | 3002 | `github-webhook.js` | GitHub CI webhook, auto-fixes failing builds |
+| `github-webhook` | 3002 | `github-webhook.js` | GitHub CI/review webhook and evidence capture |
 | `mobile-telemetry` | 3003 | `mobile-telemetry.js` | Mobile app telemetry ingress → `db/mobile.db` |
 | `pagarme-status-webhook` | 3004 | `pagarme-status-webhook.js` | Payment status updates → Telegram notifications |
 | `alert-engine` | — | `alert-engine.js` | Advanced alerting with rate limiting, grouping, Telegram |
+
+GitHub review automation follows the fail-closed dual-read contract documented
+in [`docs/REVIEW_VERDICT_COMPATIBILITY.md`](docs/REVIEW_VERDICT_COMPATIBILITY.md).
+Canonical checks are authoritative; legacy approval labels are accepted only
+with a marked native review on the exact current PR head.
+The monitor does not auto-dispatch write-capable OpenClaw repair. See the same
+document for the fail-closed attestation, dedicated-runner, immutable PR tuple,
+and separate activation requirements that apply to any future writer.
 
 ## Quick Start
 
