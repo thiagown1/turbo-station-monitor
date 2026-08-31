@@ -19,8 +19,10 @@ review-verdict:v1:<owner/repo>:pr:<number>:<kind>:head:<headSha>:base:<baseSha>
 
 Only a completed `SUCCESS` approves. Missing, queued, in-progress, neutral,
 skipped, cancelled, timed-out, action-required, and failed results all remain
-blocking. The newest attested workflow run of a given name wins, so an old
-success cannot approve a newer pending or failed rerun.
+blocking. The attested workflow run with the greatest run ID wins, so an old
+success cannot approve a newer pending or failed rerun. Publisher identity and
+outcome are evaluated separately: an exact failure run is trusted evidence of
+rejection, while only matching check/run success is positive approval.
 
 The monitor reads `headRefOid`, `baseRefOid`, labels, reviews, and
 `statusCheckRollup` in one PR snapshot. GitHub scopes `statusCheckRollup` to the
@@ -42,6 +44,9 @@ requires all of the following before accepting it:
 
 Missing REST metadata, an unknown app, an old base, or an old head blocks the
 gate. Expanding the app allowlist requires an explicit code and test change.
+The monitor also compares `baseSha...headSha` through GitHub and requires
+`behind_by == 0`. A head behind the current base, a failed compare, or unknown
+ancestry cannot enter the merge-ready state.
 
 ## Read precedence
 

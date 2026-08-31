@@ -146,13 +146,7 @@ function parseWorkflowRunId(detailsUrl, repo) {
   }
 }
 
-function workflowRunTimestamp(check = {}) {
-  const run = check.workflowRun;
-  if (!run) return Number.NEGATIVE_INFINITY;
-  return Date.parse(run.run_started_at || run.created_at || '') || Number.NEGATIVE_INFINITY;
-}
-
-function hasAttestedWorkflowRun(check, name, revision = {}) {
+function hasAttestedWorkflowIdentity(check, name, revision = {}) {
   const kind = CHECK_KIND_BY_NAME[name];
   if (kind !== 'test' && kind !== 'security') return true;
   const repoPolicy = VERDICT_WORKFLOW_POLICIES[revision.repo];
@@ -162,6 +156,14 @@ function hasAttestedWorkflowRun(check, name, revision = {}) {
   if (!kindPolicy || !run || !runId || Number(run.id) !== runId) return false;
   if (run.event !== 'workflow_dispatch' || run.head_branch !== repoPolicy.defaultBranch) return false;
   if (run.path !== kindPolicy.path || run.display_title !== kindPolicy.title(revision)) return false;
+  return true;
+}
+
+function workflowOutcomeMatches(check, name) {
+  const kind = CHECK_KIND_BY_NAME[name];
+  if (kind !== 'test' && kind !== 'security') return true;
+  const run = check.workflowRun;
+  if (!run) return false;
   const checkState = normalizeState(check);
   if (checkState === 'SUCCESS') return run.status === 'completed' && run.conclusion === 'success';
   if (['FAILURE', 'ACTION_REQUIRED'].includes(checkState)) {
@@ -182,7 +184,7 @@ function matchesRevision(check, name, revision = {}) {
     if (!expected) return false;
     const appSlug = check.app?.slug || check.appSlug || check.app_slug;
     return externalId === expected && TRUSTED_CHECK_APPS.has(appSlug) &&
-      hasAttestedWorkflowRun(check, name, revision);
+      hasAttestedWorkflowIdentity(check, name, revision);
   }
 
   // statusCheckRollup is already scoped to the PR's current head. It does not
@@ -198,14 +200,13 @@ function latestChecksByName(checks = [], revision = {}) {
     if (!matchesRevision(check, name, revision)) return;
 
     const kind = CHECK_KIND_BY_NAME[name];
-    const timestamp = kind === 'test' || kind === 'security'
-      ? workflowRunTimestamp(check)
-      : checkTimestamp(check);
+    const timestamp = checkTimestamp(check);
     const candidate = { check, timestamp, runId: Number(check.workflowRun?.id || 0), index };
     const current = latest.get(name);
-    if (!current || candidate.timestamp > current.timestamp ||
-        (candidate.timestamp === current.timestamp && candidate.runId > current.runId) ||
-        (candidate.timestamp === current.timestamp && candidate.runId === current.runId && candidate.index > current.index)) {
+    const useRunOrder = kind === 'test' || kind === 'security';
+    if (!current || (useRunOrder && candidate.runId > current.runId) ||
+        (!useRunOrder && candidate.timestamp > current.timestamp) ||
+        (candidate.runId === current.runId && candidate.timestamp === current.timestamp && candidate.index > current.index)) {
       latest.set(name, candidate);
     }
   });
@@ -220,6 +221,10 @@ function evaluateNamedCheck(latestChecks, name, seenNames = new Set()) {
       return { name, status: 'blocked', state: 'STALE_REVISION', approved: false, source: 'check' };
     }
     return { name, status: 'missing', state: 'MISSING', approved: false, source: 'missing' };
+  }
+
+  if (!workflowOutcomeMatches(check, name)) {
+    return { name, status: 'blocked', state: 'OUTCOME_MISMATCH', approved: false, source: 'check', check };
   }
 
   return { name, ...classifyState(check), source: 'check', check };
@@ -293,6 +298,20 @@ function evaluateReviewReadiness({ checks = [], labels = [], reviews = [], ...re
       approved: false,
       status: 'changes_requested',
       source: mergeGate.status === 'missing' ? 'operational-label' : 'merge-gate',
+      needsCoderFix,
+      hasCanonicalChecks,
+      mergeGate,
+      test,
+      security,
+    };
+  }
+
+
+  if (revision.baseAncestryCurrent !== true) {
+    return {
+      approved: false,
+      status: 'base_ancestry_unknown',
+      source: 'base-ancestry',
       needsCoderFix,
       hasCanonicalChecks,
       mergeGate,

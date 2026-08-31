@@ -20,6 +20,7 @@ const REVISION = {
   prNumber: 1894,
   headSha: 'a'.repeat(40),
   baseSha: 'b'.repeat(40),
+  baseAncestryCurrent: true,
 };
 
 function check(name, state, startedAt = '2026-08-31T12:00:00Z', extra = {}) {
@@ -205,10 +206,13 @@ test('needs:coder-fix remains an operational blocker even after a successful Mer
 });
 
 test('a newer attested pending rerun cannot approve over an older success', () => {
+  const pending = check(CHECK_NAMES.test, 'IN_PROGRESS', '2026-08-31T12:05:00Z');
+  pending.details_url = `https://github.com/${REVISION.repo}/actions/runs/102/attempts/1`;
+  pending.workflowRun.id = 102;
   const result = evaluateReviewReadiness({
     checks: [
       check(CHECK_NAMES.test, 'SUCCESS', '2026-08-31T12:00:00Z'),
-      check(CHECK_NAMES.test, 'IN_PROGRESS', '2026-08-31T12:05:00Z'),
+      pending,
       check(CHECK_NAMES.security, 'SUCCESS', '2026-08-31T12:00:00Z'),
     ],
     labels: ['reviewed:tests'],
@@ -320,11 +324,11 @@ test('a successful verdict requires the exact attested workflow run provenance',
       ...REVISION,
     });
     assert.equal(result.approved, false);
-    assert.equal(result.test.state, 'STALE_REVISION');
+    assert.equal(result.test.status, 'blocked');
   }
 });
 
-test('verdict reruns are ordered by attested workflow run time, not check timestamps', () => {
+test('a higher attested run id failure invalidates an older approval regardless of timestamps', () => {
   const older = check(CHECK_NAMES.test, 'SUCCESS', '2026-08-31T14:00:00Z');
   older.workflowRun.run_started_at = '2026-08-31T12:00:00Z';
   const newer = check(CHECK_NAMES.test, 'FAILURE', '2026-08-31T11:00:00Z');
@@ -340,7 +344,7 @@ test('verdict reruns are ordered by attested workflow run time, not check timest
 });
 
 test('OCPP verdicts use their main-branch workflow contract and never trust Merge Gate alone', () => {
-  const revision = { repo: 'thiagown1/ocpp_server', prNumber: 77, headSha: 'c'.repeat(40), baseSha: 'd'.repeat(40) };
+  const revision = { repo: 'thiagown1/ocpp_server', prNumber: 77, headSha: 'c'.repeat(40), baseSha: 'd'.repeat(40), baseAncestryCurrent: true };
   const ocppVerdict = (kind, id) => ({
     name: kind === 'test' ? CHECK_NAMES.test : CHECK_NAMES.security,
     status: 'completed', conclusion: 'success', head_sha: revision.headSha,
@@ -383,6 +387,7 @@ test('canonical checks are hydrated from the current head and require trusted RE
   const pr = {
     number: 1894,
     headRefOid: headSha,
+    baseRefOid: baseSha,
     statusCheckRollup: [check(CHECK_NAMES.merge, 'SUCCESS')],
   };
   let command = '';
@@ -391,6 +396,7 @@ test('canonical checks are hydrated from the current head and require trusted RE
     repo,
     run: (cmd) => {
       command = cmd;
+      if (cmd.includes('/compare/')) return JSON.stringify({ behind_by: 0 });
       return JSON.stringify([{
         name: CHECK_NAMES.merge,
         status: 'completed',
@@ -412,6 +418,7 @@ test('canonical checks are hydrated from the current head and require trusted RE
     prNumber: 1894,
     headSha,
     baseSha,
+    baseAncestryCurrent: pr.baseAncestryCurrent,
   });
   assert.equal(result.approved, false);
   assert.equal(result.source, 'missing');
@@ -419,12 +426,13 @@ test('canonical checks are hydrated from the current head and require trusted RE
   const unavailable = {
     number: 1894,
     headRefOid: headSha,
+    baseRefOid: baseSha,
     statusCheckRollup: [check(CHECK_NAMES.merge, 'SUCCESS')],
   };
   let unavailableCalls = 0;
   hydrateCanonicalCheckMetadata(unavailable, {
     repo,
-    run: () => '',
+    run: cmd => cmd.includes('/compare/') ? JSON.stringify({ behind_by: 0 }) : '',
     onUnavailable: () => { unavailableCalls++; },
   });
   assert.equal(unavailableCalls, 1);
@@ -434,11 +442,36 @@ test('canonical checks are hydrated from the current head and require trusted RE
     prNumber: 1894,
     headSha,
     baseSha,
+    baseAncestryCurrent: unavailable.baseAncestryCurrent,
   }).approved, false);
 });
 
+test('base ancestry compare must prove the head contains the current base', () => {
+  for (const compareResult of [{ behind_by: 1 }, null, { status: 'unknown' }]) {
+    const pr = {
+      number: REVISION.prNumber,
+      headRefOid: REVISION.headSha,
+      baseRefOid: REVISION.baseSha,
+      statusCheckRollup: [],
+    };
+    hydrateCanonicalCheckMetadata(pr, {
+      repo: REVISION.repo,
+      run: () => compareResult ? JSON.stringify(compareResult) : '',
+    });
+    const readiness = evaluateReviewReadiness({
+      checks: [],
+      labels: ['reviewed:tests', 'reviewed:security'],
+      reviews: [review('test'), review('sec')],
+      ...REVISION,
+      baseAncestryCurrent: pr.baseAncestryCurrent,
+    });
+    assert.equal(readiness.approved, false);
+    assert.equal(readiness.source, 'base-ancestry');
+  }
+});
+
 test('REST hydration resolves workflow run evidence from the verdict details URL', () => {
-  const pr = { number: REVISION.prNumber, headRefOid: REVISION.headSha, statusCheckRollup: [check(CHECK_NAMES.test, 'SUCCESS')] };
+  const pr = { number: REVISION.prNumber, headRefOid: REVISION.headSha, baseRefOid: REVISION.baseSha, statusCheckRollup: [check(CHECK_NAMES.test, 'SUCCESS')] };
   const commands = [];
   const restCheck = check(CHECK_NAMES.test, 'SUCCESS');
   delete restCheck.workflowRun;
@@ -446,11 +479,12 @@ test('REST hydration resolves workflow run evidence from the verdict details URL
     repo: REVISION.repo,
     run: command => {
       commands.push(command);
+      if (command.includes('/compare/')) return JSON.stringify({ behind_by: 0 });
       return command.includes('/check-runs') ? JSON.stringify([restCheck]) : JSON.stringify(check(CHECK_NAMES.test, 'SUCCESS').workflowRun);
     },
   });
-  assert.equal(commands.length, 2);
-  assert.match(commands[1], /actions\/runs\/101/);
+  assert.equal(commands.length, 3);
+  assert.match(commands[2], /actions\/runs\/101/);
   assert.equal(evaluateReviewReadiness({ checks: pr.statusCheckRollup, ...REVISION }).approved, false);
   assert.equal(evaluateReviewReadiness({ checks: [...pr.statusCheckRollup, check(CHECK_NAMES.security, 'SUCCESS')], ...REVISION }).approved, true);
 });

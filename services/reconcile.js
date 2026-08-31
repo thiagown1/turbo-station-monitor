@@ -113,6 +113,7 @@ function decoratePullRequest(pr, repo) {
     prNumber: pr.number,
     headSha: pr.headRefOid,
     baseSha: pr.baseRefOid,
+    baseAncestryCurrent: pr.baseAncestryCurrent,
   };
   pr.checks = summarizeCiChecks(pr.statusCheckRollup || [], revision);
   pr.reviewReadiness = evaluateReviewReadiness({

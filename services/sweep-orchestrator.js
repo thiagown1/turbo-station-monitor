@@ -68,6 +68,7 @@ function pullRequestRevision(pr) {
     prNumber: pr.number,
     headSha: pr.headRefOid,
     baseSha: pr.baseRefOid,
+    baseAncestryCurrent: pr.baseAncestryCurrent,
   };
 }
 

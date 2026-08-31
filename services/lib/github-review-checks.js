@@ -9,11 +9,28 @@ const {
 
 function hydrateCanonicalCheckMetadata(pr, { repo, run, onUnavailable = () => {} }) {
   const checks = pr.statusCheckRollup || [];
-  if (!hasCanonicalReviewChecks(checks)) return pr;
-
   let checkRuns = null;
   const validRepo = /^[\w.-]+\/[\w.-]+$/.test(repo || '');
   const validHead = /^[0-9a-f]{40}$/i.test(pr.headRefOid || '');
+  const validBase = /^[0-9a-f]{40}$/i.test(pr.baseRefOid || '');
+
+  pr.baseAncestryCurrent = null;
+  if (validRepo && validHead && validBase && typeof run === 'function') {
+    try {
+      const rawCompare = run(
+        `gh api -H "Accept: application/vnd.github+json" "repos/${repo}/compare/${pr.baseRefOid}...${pr.headRefOid}"`,
+        { allowFail: true, timeout: 30000 }
+      );
+      const comparison = rawCompare ? JSON.parse(rawCompare) : null;
+      if (comparison && Number.isInteger(comparison.behind_by)) {
+        pr.baseAncestryCurrent = comparison.behind_by === 0;
+      }
+    } catch {
+      pr.baseAncestryCurrent = null;
+    }
+  }
+
+  if (!hasCanonicalReviewChecks(checks)) return pr;
 
   if (validRepo && validHead && typeof run === 'function') {
     try {
