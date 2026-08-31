@@ -15,6 +15,11 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  evaluateReviewReadiness,
+  summarizeCiChecks,
+} = require('./lib/review-verdicts');
+const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
 
 // ─── Config ────────────────────────────────────────────────────────
 const STATE_PATH = path.join(__dirname, '..', 'state', 'sweep-loop.json');
@@ -55,6 +60,42 @@ function exec(cmd, opts = {}) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function pullRequestRevision(pr) {
+  return {
+    repo: REPO,
+    prNumber: pr.number,
+    headSha: pr.headRefOid,
+    baseSha: pr.baseRefOid,
+  };
+}
+
+function getPullRequestReviewReadiness(pr) {
+  return evaluateReviewReadiness({
+    checks: pr.statusCheckRollup || [],
+    labels: pr.labels || [],
+    reviews: pr.reviews || [],
+    ...pullRequestRevision(pr),
+  });
+}
+
+function fetchPullRequestSnapshot(prNumber) {
+  const raw = exec(
+    `gh pr view ${prNumber} --repo ${REPO} --json number,title,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup 2>/dev/null || echo ""`,
+    { allowFail: true, timeout: 30000 }
+  );
+  if (!raw) return null;
+  try {
+    const pr = JSON.parse(raw);
+    return hydrateCanonicalCheckMetadata(pr, {
+      repo: REPO,
+      run: exec,
+      onUnavailable: () => log(`PR #${prNumber} canonical check metadata unavailable — keeping gate blocked`),
+    });
+  } catch {
+    return null;
+  }
 }
 
 function sendTelegram(text) {
@@ -604,12 +645,20 @@ async function mergeExistingReadyPRs(state) {
   log('═══ PRE-SWEEP — Checking for existing reviewed PRs to merge ═══');
 
   const readyPRsRaw = exec(
-    `gh pr list --repo ${REPO} --state open --base ${TARGET_BRANCH} --label "reviewed:tests" --label "reviewed:security" --json number,title,mergeable --jq '[.[] | select(.mergeable == "MERGEABLE") | {number, title}]' 2>/dev/null || echo "[]"`,
+    `gh pr list --repo ${REPO} --state open --base ${TARGET_BRANCH} --limit 100 --json number,title,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup 2>/dev/null || echo "[]"`,
     { allowFail: true, timeout: 30000 }
   );
 
   let readyPRs = [];
-  try { readyPRs = JSON.parse(readyPRsRaw || '[]'); } catch {}
+  try {
+    readyPRs = JSON.parse(readyPRsRaw || '[]')
+      .map(pr => hydrateCanonicalCheckMetadata(pr, {
+        repo: REPO,
+        run: exec,
+        onUnavailable: () => log(`PR #${pr.number} canonical check metadata unavailable — keeping gate blocked`),
+      }))
+      .filter(pr => pr.mergeable === 'MERGEABLE' && getPullRequestReviewReadiness(pr).approved);
+  } catch {}
 
   if (readyPRs.length === 0) {
     log('No existing reviewed PRs ready to merge.');
@@ -621,11 +670,17 @@ async function mergeExistingReadyPRs(state) {
 
   let merged = 0;
   for (const pr of readyPRs) {
+    // Re-read the current head/base immediately before the write. A verdict
+    // that disappeared or became pending must never inherit stale readiness.
+    const current = fetchPullRequestSnapshot(pr.number);
+    const readiness = current ? getPullRequestReviewReadiness(current) : null;
+    if (!current || !readiness?.approved || current.mergeable !== 'MERGEABLE') {
+      log(`PR #${pr.number} readiness changed — skipping pre-sweep merge`);
+      continue;
+    }
+
     // Safety: only merge PRs targeting our branch, not master/main
-    const baseBranch = exec(
-      `gh pr view ${pr.number} --repo ${REPO} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "unknown"`,
-      { allowFail: true }
-    );
+    const baseBranch = current.baseRefName || 'unknown';
     if (baseBranch === 'master' || baseBranch === 'main') {
       log(`⚠️ PR #${pr.number} targets ${baseBranch} — SKIPPING`);
       continue;
@@ -664,30 +719,20 @@ async function waitForCI(state) {
     for (const finding of state.currentCycle.sweepFindings) {
       if (!finding.prNumber || finding.prStatus === 'ci_green') continue;
 
-      const checksJson = exec(
-        `gh pr checks ${finding.prNumber} --repo ${REPO} --json name,state,conclusion 2>/dev/null || echo "[]"`,
-        { allowFail: true }
-      );
+      const pr = fetchPullRequestSnapshot(finding.prNumber);
 
       try {
-        const checks = JSON.parse(checksJson || '[]');
-        if (checks.length === 0) {
+        if (!pr) {
+          finding.prStatus = 'ci_pending';
           allGreen = false;
           continue;
         }
 
-        const failing = checks.filter(c =>
-          c.conclusion === 'FAILURE' || c.conclusion === 'ERROR' || c.conclusion === 'TIMED_OUT'
-        );
-        const pending = checks.filter(c => !c.conclusion || c.state === 'IN_PROGRESS' || c.state === 'QUEUED');
-        const passing = checks.filter(c =>
-          c.conclusion === 'SUCCESS' || c.conclusion === 'NEUTRAL' || c.conclusion === 'SKIPPED'
-        );
-
-        if (pending.length > 0) {
+        const checks = summarizeCiChecks(pr.statusCheckRollup || [], pullRequestRevision(pr));
+        if (checks.status === 'pending' || checks.status === 'no_checks') {
           finding.prStatus = 'ci_pending';
           allGreen = false;
-        } else if (failing.length > 0) {
+        } else if (checks.status === 'failing') {
           finding.prStatus = 'ci_failed';
           allGreen = false;
 
@@ -746,35 +791,39 @@ async function waitForReviews(state) {
       if (!finding.prNumber || finding.prStatus === 'blocked') continue;
       if (finding.prStatus === 'reviewed') continue;
 
-      const labelsJson = exec(
-        `gh pr view ${finding.prNumber} --repo ${REPO} --json labels --jq '[.labels[].name]' 2>/dev/null || echo "[]"`,
-        { allowFail: true }
-      );
-
       try {
-        const labels = JSON.parse(labelsJson || '[]');
-        const hasTestReview = labels.includes('reviewed:tests');
-        const hasSecReview = labels.includes('reviewed:security');
-        const needsCoderFix = labels.includes('needs:coder-fix');
+        const pr = fetchPullRequestSnapshot(finding.prNumber);
+        if (!pr) {
+          allReviewed = false;
+          continue;
+        }
+        const labels = (pr.labels || []).map(label => label.name || label);
+        const readiness = getPullRequestReviewReadiness(pr);
 
-        if (needsCoderFix) {
+        if (readiness.needsCoderFix) {
           finding.prStatus = 'changes_requested';
           allReviewed = false;
           // The existing webhook pipeline will wake coder automatically
           log(`PR #${finding.prNumber} needs coder fix — existing pipeline handles this`);
-        } else if (hasTestReview && hasSecReview) {
+        } else if (readiness.approved) {
           finding.prStatus = 'reviewed';
-          log(`PR #${finding.prNumber} fully reviewed ✅`);
+          log(`PR #${finding.prNumber} fully reviewed via ${readiness.source} ✅`);
         } else if (finding.prStatus !== 'ci_green') {
           // Still waiting
           allReviewed = false;
         } else {
           allReviewed = false;
-          // Ensure review labels are set
-          if (!labels.includes('needs:test-review') && !hasTestReview) {
+          // Compatibility only: request a legacy reviewer when no canonical
+          // verdict exists yet. A pending/failed check is authoritative and
+          // must never be bypassed by adding an approval-label path.
+          if (!readiness.hasCanonicalChecks &&
+              readiness.test.status === 'missing' &&
+              !labels.includes('needs:test-review')) {
             exec(`gh pr edit ${finding.prNumber} --repo ${REPO} --add-label "needs:test-review"`, { allowFail: true });
           }
-          if (!labels.includes('needs:sec-review') && !hasSecReview) {
+          if (!readiness.hasCanonicalChecks &&
+              readiness.security.status === 'missing' &&
+              !labels.includes('needs:sec-review')) {
             exec(`gh pr edit ${finding.prNumber} --repo ${REPO} --add-label "needs:sec-review"`, { allowFail: true });
           }
         }
@@ -817,9 +866,10 @@ async function mergePRs(state) {
   state.status = 'MERGE';
   saveState(state);
 
-  // Only merge PRs that are reviewed (or at least CI green if reviews timed out)
+  // Only merge PRs that reached an explicit review verdict. CI green without
+  // a verdict is intentionally insufficient.
   const toMerge = state.currentCycle.sweepFindings.filter(f =>
-    f.prNumber && !f.merged && (f.prStatus === 'reviewed' || f.prStatus === 'ci_green') && f.prStatus !== 'blocked'
+    f.prNumber && !f.merged && f.prStatus === 'reviewed'
   );
 
   sendTelegram(`🔀 Ciclo ${state.cycle}: Mergeando ${toMerge.length} PRs...`);
@@ -827,11 +877,17 @@ async function mergePRs(state) {
   for (const finding of toMerge) {
     log(`Merging PR #${finding.prNumber}...`);
 
+    // Reconcile the exact current revision immediately before merging.
+    const current = fetchPullRequestSnapshot(finding.prNumber);
+    const readiness = current ? getPullRequestReviewReadiness(current) : null;
+    if (!current || !readiness?.approved) {
+      log(`PR #${finding.prNumber} no longer has an approved current verdict — skipping`);
+      finding.prStatus = 'review_pending';
+      continue;
+    }
+
     // Check base branch — only merge if target is NOT master/main
-    const baseBranch = exec(
-      `gh pr view ${finding.prNumber} --repo ${REPO} --json baseRefName --jq '.baseRefName' 2>/dev/null || echo "unknown"`,
-      { allowFail: true }
-    );
+    const baseBranch = current.baseRefName || 'unknown';
 
     if (baseBranch === 'master' || baseBranch === 'main') {
       log(`⚠️ PR #${finding.prNumber} targets ${baseBranch} — SKIPPING (safety)`);
@@ -840,10 +896,7 @@ async function mergePRs(state) {
     }
 
     // Check mergeable status
-    const mergeable = exec(
-      `gh pr view ${finding.prNumber} --repo ${REPO} --json mergeable --jq '.mergeable' 2>/dev/null || echo "UNKNOWN"`,
-      { allowFail: true }
-    );
+    const mergeable = current.mergeable || 'UNKNOWN';
 
     if (mergeable === 'CONFLICTING') {
       log(`PR #${finding.prNumber} has conflicts — waking coder to rebase`);
@@ -854,25 +907,10 @@ async function mergePRs(state) {
         );
       } catch {}
 
-      // Wait for rebase (up to 10 min)
-      const rebaseDeadline = Date.now() + 10 * 60 * 1000;
-      let rebased = false;
-      while (Date.now() < rebaseDeadline) {
-        await sleep(60000);
-        const status = exec(
-          `gh pr view ${finding.prNumber} --repo ${REPO} --json mergeable --jq '.mergeable' 2>/dev/null || echo "UNKNOWN"`,
-          { allowFail: true }
-        );
-        if (status === 'MERGEABLE') {
-          rebased = true;
-          break;
-        }
-      }
-      if (!rebased) {
-        log(`PR #${finding.prNumber} still conflicting after rebase attempt — skipping`);
-        finding.prStatus = 'conflict_stuck';
-        continue;
-      }
+      // A rebase creates a new head revision and invalidates the verdict we
+      // just inspected. Return to the review loop instead of merging it here.
+      finding.prStatus = 'rebase_pending';
+      continue;
     }
 
     // Attempt merge

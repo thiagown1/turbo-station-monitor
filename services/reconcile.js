@@ -19,6 +19,11 @@
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  evaluateReviewReadiness,
+  summarizeCiChecks,
+} = require('./lib/review-verdicts');
+const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
 
 // ─── Config ────────────────────────────────────────────────────────
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
@@ -91,89 +96,62 @@ function extractIssueNumber(branchName) {
   return match ? parseInt(match[1]) : null;
 }
 
-function getChecksSummary(pr) {
-  const checks = pr.statusCheckRollup || [];
-  if (checks.length === 0) return { status: 'no_checks', failing: [], pending: [] };
+function decoratePullRequest(pr, repo) {
+  hydrateCanonicalCheckMetadata(pr, {
+    repo,
+    run: exec,
+    onUnavailable: () => {
+      console.error(`  ⚠️  Canonical check metadata unavailable for ${repo}#${pr.number}; keeping gate blocked`);
+    },
+  });
+  pr.repo = repo;
+  pr.labelNames = (pr.labels || []).map(label => label.name || label);
+  pr.issueNumber = extractIssueNumber(pr.headRefName);
 
-  // Keep only the latest run per check name so old failed attempts do not block
-  // the current status when a newer run passed.
-  const latestPerName = new Map();
-  for (const check of checks) {
-    const name = check.name || check.context || 'unknown';
-    const ts = new Date(check.completedAt || check.updatedAt || check.updated_at || '1970-01-01T00:00:00Z').getTime();
-    const current = latestPerName.get(name);
-    const currentTs = current
-      ? new Date(current.completedAt || current.updatedAt || current.updated_at || '1970-01-01T00:00:00Z').getTime()
-      : -1;
-
-    if (!current || ts >= currentTs) {
-      latestPerName.set(name, check);
-    }
-  }
-
-  const latestChecks = Array.from(latestPerName.values());
-  const failing = [];
-  const pending = [];
-  const passing = [];
-
-  for (const check of latestChecks) {
-    const name = check.name || check.context || 'unknown';
-    if (check.status === 'COMPLETED' || check.state) {
-      const conclusion = check.conclusion || check.state;
-      if (conclusion === 'SUCCESS' || conclusion === 'NEUTRAL' || conclusion === 'SKIPPED') {
-        passing.push(name);
-      } else if (conclusion === 'FAILURE' || conclusion === 'ERROR' || conclusion === 'TIMED_OUT') {
-        failing.push(name);
-      } else if (conclusion === 'CANCELLED') {
-        // Ignore cancelled checks
-      } else {
-        passing.push(name); // e.g. Vercel SUCCESS state
-      }
-    } else {
-      pending.push(name);
-    }
-  }
-
-  if (pending.length > 0) return { status: 'pending', failing, pending, passing };
-  if (failing.length > 0) return { status: 'failing', failing, pending, passing };
-  return { status: 'green', failing, pending, passing };
+  const revision = {
+    repo,
+    prNumber: pr.number,
+    headSha: pr.headRefOid,
+    baseSha: pr.baseRefOid,
+  };
+  pr.checks = summarizeCiChecks(pr.statusCheckRollup || [], revision);
+  pr.reviewReadiness = evaluateReviewReadiness({
+    checks: pr.statusCheckRollup || [],
+    labels: pr.labels || [],
+    reviews: pr.reviews || [],
+    ...revision,
+  });
+  return pr;
 }
 
 // ─── Data Collection ───────────────────────────────────────────────
 
 function fetchOpenPRs() {
   const allPRs = [];
-  const seenNumbers = new Set();
+  const seenPullRequests = new Set();
 
   for (const repo of REPOS) {
     try {
       // 1. Fetch bot's own PRs
       const botPRs = gh(
-        `pr list --author ${BOT_AUTHOR} --state open --json number,title,headRefName,mergeable,labels,statusCheckRollup,updatedAt`,
+        `pr list --author ${BOT_AUTHOR} --state open --json number,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup,updatedAt`,
         repo
       );
       for (const pr of botPRs) {
-        pr.repo = repo;
-        pr.labelNames = (pr.labels || []).map(l => l.name || l);
-        pr.issueNumber = extractIssueNumber(pr.headRefName);
-        pr.checks = getChecksSummary(pr);
-        allPRs.push(pr);
-        seenNumbers.add(pr.number);
+        allPRs.push(decoratePullRequest(pr, repo));
+        seenPullRequests.add(`${repo}#${pr.number}`);
       }
 
       // 2. Also fetch PRs from ANY author with needs:coder-fix (e.g. human PRs)
       const coderFixPRs = gh(
-        `pr list --label "needs:coder-fix" --state open --json number,title,headRefName,mergeable,labels,statusCheckRollup,updatedAt`,
+        `pr list --label "needs:coder-fix" --state open --json number,title,headRefName,headRefOid,baseRefName,baseRefOid,mergeable,labels,reviews,statusCheckRollup,updatedAt`,
         repo
       );
       for (const pr of coderFixPRs) {
-        if (seenNumbers.has(pr.number)) continue; // skip duplicates
-        pr.repo = repo;
-        pr.labelNames = (pr.labels || []).map(l => l.name || l);
-        pr.issueNumber = extractIssueNumber(pr.headRefName);
-        pr.checks = getChecksSummary(pr);
-        allPRs.push(pr);
-        seenNumbers.add(pr.number);
+        const identity = `${repo}#${pr.number}`;
+        if (seenPullRequests.has(identity)) continue; // skip duplicates in this repository
+        allPRs.push(decoratePullRequest(pr, repo));
+        seenPullRequests.add(identity);
       }
     } catch (err) {
       console.error(`  ⚠️  Failed to fetch PRs for ${repo}: ${err.message}`);
@@ -301,16 +279,17 @@ function reconcile() {
   };
 
   for (const pr of openPRs) {
-    const prKey = String(pr.number);
+    const prKey = `${pr.repo}#${pr.number}`;
+    const legacyPrKey = String(pr.number);
 
     // Skip explicitly blocked PRs
-    if (blockedPRs.has(pr.number) || hasLabel(pr, 'status:blocked')) {
+    if (blockedPRs.has(prKey) || blockedPRs.has(pr.number) || blockedPRs.has(legacyPrKey) || hasLabel(pr, 'status:blocked')) {
       categories.blocked.push(pr);
       continue;
     }
 
     // Check CI fix attempts
-    const attempts = ciFixAttempts[prKey] || 0;
+    const attempts = ciFixAttempts[prKey] ?? ciFixAttempts[legacyPrKey] ?? 0;
     if (attempts >= MAX_CI_FIX_ATTEMPTS) {
       categories.blocked.push(pr);
       continue;
@@ -321,15 +300,22 @@ function reconcile() {
       categories.conflicting.push(pr);
     } else if (hasLabel(pr, 'needs:coder-fix')) {
       categories.needsCoderFix.push(pr);
+    } else if (pr.reviewReadiness.mergeGate.status !== 'missing') {
+      // Once present, Merge Gate is the authoritative verdict for this exact
+      // head/base revision. Any result other than success remains waiting.
+      if (pr.reviewReadiness.approved) {
+        categories.readyToMerge.push(pr);
+      } else {
+        categories.ciPending.push(pr);
+      }
     } else if (pr.checks.status === 'failing') {
       categories.ciFailing.push(pr);
     } else if (pr.checks.status === 'pending') {
       categories.ciPending.push(pr);
     } else if (pr.checks.status === 'green') {
-      // All checks pass — is it reviewed?
-      const hasTestReview = hasLabel(pr, 'reviewed:tests');
-      const hasSecReview = hasLabel(pr, 'reviewed:security');
-      if (hasTestReview && hasSecReview) {
+      // During migration, any canonical verdict check disables the complete
+      // legacy path. Labels are consulted only when all canonical names are absent.
+      if (pr.reviewReadiness.approved) {
         categories.readyToMerge.push(pr);
       } else {
         // CI green but missing reviews — nothing for coder to do
@@ -369,7 +355,7 @@ function reconcile() {
 
   // Priority 2: CI failures (only if no checks pending)
   for (const pr of categories.ciFailing) {
-    const attempts = ciFixAttempts[String(pr.number)] || 0;
+    const attempts = ciFixAttempts[`${pr.repo}#${pr.number}`] ?? ciFixAttempts[String(pr.number)] ?? 0;
     todo.push({
       action: 'fix_ci',
       pr: pr.number,

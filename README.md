@@ -40,6 +40,11 @@ Runs on a VPS as a set of PM2-managed Node.js services that collect, store, and 
 | `pagarme-status-webhook` | 3004 | `pagarme-status-webhook.js` | Payment status updates → Telegram notifications |
 | `alert-engine` | — | `alert-engine.js` | Advanced alerting with rate limiting, grouping, Telegram |
 
+GitHub review automation follows the fail-closed dual-read contract documented
+in [`docs/REVIEW_VERDICT_COMPATIBILITY.md`](docs/REVIEW_VERDICT_COMPATIBILITY.md).
+Canonical checks are authoritative; legacy approval labels are accepted only
+with a marked native review on the exact current PR head.
+
 ## Quick Start
 
 ```bash

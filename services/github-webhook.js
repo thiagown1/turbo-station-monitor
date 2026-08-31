@@ -18,6 +18,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const { exec, execFile, spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
+const { getMarkedReviewKind } = require('./lib/review-verdicts');
 
 const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
@@ -383,6 +384,7 @@ function handleWebhook(req, res) {
         webhookEvent.review_state = payload.review?.state;
         webhookEvent.review_body = payload.review?.body;
         webhookEvent.review_author = payload.review?.user?.login;
+        webhookEvent.review_commit_sha = payload.review?.commit_id;
         webhookEvent.review_url = payload.review?.html_url;
       } else if (event === 'pull_request') {
         webhookEvent.pr_number = payload.number;
@@ -489,129 +491,52 @@ function handleWebhook(req, res) {
         }
       }
 
-      // ── Defensive label cleanup on submitted reviews ───────────
-      // If SecGuard/Test Engineer actually submit a review, clean stale review-request labels.
+      // ── Operational cleanup on submitted reviews ───────────────
+      // Approval labels are not written here: a generic bot approval cannot
+      // prove which reviewer ran or which revision it covered. During the
+      // migration, only an exact-head, marked CHANGES_REQUESTED review may
+      // keep the operational needs:coder-fix queue moving.
       if (event === 'pull_request_review' && webhookEvent.action === 'submitted' && !isShortTrader) {
-        const reviewAuthor = (webhookEvent.review_author || '').toLowerCase();
         const reviewState = (webhookEvent.review_state || '').toLowerCase();
         const prNumber = webhookEvent.pr_number;
         const repo = webhookEvent.repository || 'thiagown1/turbo_station';
 
-        const cleanupEdits = [];
+        const reviewKind = getMarkedReviewKind({
+          author: { login: webhookEvent.review_author },
+          body: webhookEvent.review_body,
+          commitId: webhookEvent.review_commit_sha,
+        }, webhookEvent.pr_head_sha);
 
-        if (reviewAuthor === 'turbostation-ai' || reviewAuthor === 'secguard') {
-          if (reviewState === 'approved') {
-            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:sec-review" --add-label "reviewed:security"`);
-          } else if (reviewState === 'changes_requested') {
-            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:sec-review" --add-label "needs:coder-fix"`);
-          }
-        }
+        if (reviewState === 'changes_requested' && reviewKind) {
+          const pendingLabel = reviewKind === 'test' ? 'needs:test-review' : 'needs:sec-review';
+          execFile(
+            'gh',
+            ['pr', 'edit', String(prNumber), '--repo', repo, '--add-label', 'needs:coder-fix'],
+            { env: process.env },
+            (error, stdout, stderr) => {
+              if (error) {
+                console.error('[github-webhook] Failed to queue reviewer fix:', error.message);
+                if (stderr) console.error(stderr);
+                return;
+              }
+              if (stdout) console.log('[github-webhook] Reviewer fix queued:', stdout.trim());
 
-        if (reviewAuthor === 'turbostation-ai' || reviewAuthor === 'test-engineer') {
-          if (reviewState === 'approved') {
-            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:test-review" --add-label "reviewed:tests"`);
-          } else if (reviewState === 'changes_requested') {
-            cleanupEdits.push(`gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:test-review" --add-label "needs:coder-fix"`);
-          }
-        }
-
-        if (cleanupEdits.length > 0) {
-          const { exec } = require('child_process');
-          const script = cleanupEdits.join(' && ');
-          exec(script, { env: process.env }, (error, stdout, stderr) => {
-            if (error) {
-              console.error('[github-webhook] Review label cleanup failed:', error.message);
-              if (stderr) console.error(stderr);
-              return;
+              // Pending-review cleanup is best effort and happens only after
+              // the durable coder queue signal was successfully added.
+              execFile(
+                'gh',
+                ['pr', 'edit', String(prNumber), '--repo', repo, '--remove-label', pendingLabel],
+                { env: process.env },
+                (cleanupError) => {
+                  if (cleanupError) {
+                    console.error(`[github-webhook] Could not remove ${pendingLabel}:`, cleanupError.message);
+                  }
+                }
+              );
             }
-            if (stdout) console.log('[github-webhook] Review label cleanup ok:', stdout.trim());
-          });
-        }
-      }
-
-      // ── PR Label-based agent wake — MIGRATED TO GITHUB ACTIONS ─
-      // Replaced by .github/workflows/agent-test-review.yml,
-      // agent-sec-review.yml, agent-coder.yml in turbo_station repo.
-      // The check_run from those workflows shows up in the PR sidebar so
-      // it's visible whether the reviewer agent has responded or stalled —
-      // something this webhook dispatch couldn't surface.
-      // Re-enable by flipping the `if (false &&` below back to its original
-      // condition.
-      if (false && event === 'pull_request' && webhookEvent.action === 'labeled' && !isShortTrader) {
-        const addedLabel = payload.label?.name;
-        const prNumber = webhookEvent.pr_number;
-        const prTitle = webhookEvent.pr_title || '';
-        const prUrl = webhookEvent.pr_url || '';
-        const repo = webhookEvent.repository || 'thiagown1/turbo_station';
-
-        const REVIEW_LABEL_MAP = {
-          'needs:test-review': {
-            agentId: 'test-engineer',
-            name: 'PR Test Review',
-            telegramGroup: '-5142618491',
-            emoji: '🧪',
-            reviewType: 'test',
-          },
-          'needs:sec-review': {
-            agentId: 'secguard',
-            name: 'PR Security Review',
-            telegramGroup: '-5142618491',
-            emoji: '🔒',
-            reviewType: 'security',
-          },
-          'needs:coder-fix': {
-            agentId: 'coder',
-            name: 'PR Fix Requested',
-            telegramGroup: '-5167874742',
-            emoji: '🔧',
-            reviewType: 'fix',
-          },
-        };
-
-        const reviewConfig = REVIEW_LABEL_MAP[addedLabel];
-        if (reviewConfig) {
-          const wakeKey = `review-wake:${reviewConfig.agentId}:${repo}:${prNumber}`;
-          const shouldWake = shouldSendAck({ key: wakeKey, windowMs: 30 * 60 * 1000 }); // 30min debounce
-
-          if (shouldWake) {
-            console.log(`[github-webhook] ${reviewConfig.emoji} Waking ${reviewConfig.agentId} for PR #${prNumber} (label: ${addedLabel})`);
-
-            sendOpenClawAgent({
-              agentId: reviewConfig.agentId,
-              name: reviewConfig.name,
-              channel: 'telegram',
-              to: reviewConfig.telegramGroup,
-              wakeMode: 'now',
-              deliver: true,
-              message: reviewConfig.reviewType === 'fix'
-                ? `${reviewConfig.emoji} PR #${prNumber} needs fixes — ${prTitle}\n\n` +
-                  `Link: ${prUrl}\n\n` +
-                  `Test Engineer or SecGuard found issues that need fixing.\n\n` +
-                  `Instructions:\n` +
-                  `1. Read task-state.json first\n` +
-                  `2. Read the review comments: gh pr view ${prNumber} --repo ${repo} --comments | tail -30\n` +
-                  `3. Check inline review comments: gh api repos/${repo}/pulls/${prNumber}/comments --jq '.[].body'\n` +
-                  `4. Fix the issues in the worktree, commit, push\n` +
-                  `5. Remove label "needs:coder-fix": gh pr edit ${prNumber} --repo ${repo} --remove-label "needs:coder-fix"\n` +
-                  `6. Re-add review labels if needed: gh pr edit ${prNumber} --repo ${repo} --add-label "needs:test-review,needs:sec-review"\n` +
-                  `7. Update task-state.json before finishing`
-                : `${reviewConfig.emoji} PR #${prNumber} needs ${reviewConfig.reviewType} review — ${prTitle}\n\n` +
-                  `Link: ${prUrl}\n\n` +
-                  `Instructions:\n` +
-                  `1. Read HEARTBEAT.md for your full review process\n` +
-                  `2. Read the PR diff: gh pr diff ${prNumber} --repo ${repo}\n` +
-                  `3. Perform your ${reviewConfig.reviewType} review following your checklist\n` +
-                  `4. Submit review via gh pr review\n` +
-                  `5. Update labels: remove "${addedLabel}", add "reviewed:${reviewConfig.reviewType === 'test' ? 'tests' : 'security'}"`,
-            });
-
-            sendTelegramNotification(
-              `${reviewConfig.emoji} PR #${prNumber} — ${prTitle}\nLabel "${addedLabel}" added. Waking ${reviewConfig.agentId}...`,
-              'telegram:-5103508388'
-            );
-          } else {
-            console.log(`[github-webhook] Review wake suppressed (debounce) for ${wakeKey}`);
-          }
+          );
+        } else if (reviewState === 'changes_requested') {
+          console.log('[github-webhook] Ignoring unmarked or stale CHANGES_REQUESTED review');
         }
       }
 
