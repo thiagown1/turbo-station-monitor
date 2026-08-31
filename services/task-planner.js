@@ -1,24 +1,30 @@
 #!/usr/bin/env node
 /**
- * Task Planner v2 — Budget-Aware Priority Queue Builder
+ * Task Planner v2 — Budget-Aware Evidence Planner
  *
  * Integrates real Codex quota (from usage-tracker.js) with GitHub issue
- * backlog to build an optimally-sized, prioritized work queue.
+ * backlog to record an optimally-sized, prioritized blocked-work plan.
  *
  * The key formula:
  *   budget_remaining → max_tasks_to_run → pick top-N by priority score
  *
  * Usage:
  *   node task-planner.js              # Show plan (dry run)
- *   node task-planner.js --apply      # Write queue + set labels on GitHub
- *   node task-planner.js --status     # Quick status of current queue vs budget
+ *   node task-planner.js --apply      # Sanitize executable state + record evidence
+ *   node task-planner.js --status     # Quick status of current plan vs budget
  */
 
 const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const {
+  OPENCLAW_WRITER_ATTESTATION_VARIABLE,
+  canonicalizePrNumber,
+} = require('./lib/openclaw-writer-guard');
+const { writeJsonAtomic, writeWriterEvidence } = require('./lib/writer-evidence-store');
 
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
+const WRITER_EVIDENCE_PATH = path.join(__dirname, '..', 'state', 'writer-repair-evidence-planner.json');
 const BUDGET_STATE_PATH = '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/data/budget-state.json';
 const USAGE_TRACKER = path.join(__dirname, 'usage-tracker.js');
 const REPO = 'thiagown1/turbo_station';
@@ -46,6 +52,18 @@ const TYPE_BOOSTS = {
   'type:refactor': 0,
   'type:chore': -5,
 };
+
+function fetchWriterAttestationValue() {
+  try {
+    const payload = JSON.parse(execSync(
+      `gh api "repos/${REPO}/actions/variables/${OPENCLAW_WRITER_ATTESTATION_VARIABLE}"`,
+      { encoding: 'utf-8', timeout: 15000 }
+    ));
+    return typeof payload.value === 'string' ? payload.value : null;
+  } catch {
+    return null;
+  }
+}
 
 // Category labels for estimating cost
 const COST_ESTIMATES = {
@@ -236,44 +254,102 @@ function buildPlan() {
   };
 }
 
-/**
- * Apply plan to task-state.json and label issues on GitHub
- */
-function applyPlan(plan) {
-  const taskState = readTaskState();
+function blockedTaskIdentity(task) {
+  return [
+    task.repo || REPO,
+    task.action || '',
+    task.prNumber || task.issueNumber || task.number || '',
+    task.branch || '',
+    task.concurrencyKey || '',
+  ].join('|');
+}
 
-  taskState.queue = plan.selected.map(i => ({
-    issueNumber: i.number,
-    issueTitle: i.title,
-    priority: i.priority,
-    phase: 'queued',
-    estimatedCost: `~${i.cost}%`,
-    lastAction: new Date().toISOString(),
-    nextStep: `Create worktree + implement. Priority: ${i.priority}.`,
+function sanitizeLegacyTaskState(currentState, plan, attested, now = new Date().toISOString()) {
+  const taskState = currentState && typeof currentState === 'object' ? currentState : {};
+  const quarantined = [
+    ...(Array.isArray(taskState.activeTasks) ? taskState.activeTasks : []).map(task => ({
+      ...task,
+      repo: task.repo || REPO,
+      quarantinedFrom: 'activeTasks',
+      blockedReason: 'legacy executable task quarantined; manual repair required',
+    })),
+    ...(Array.isArray(taskState.queue) ? taskState.queue : []).map(task => ({
+      ...task,
+      repo: task.repo || REPO,
+      quarantinedFrom: 'queue',
+      blockedReason: 'legacy executable task quarantined; manual repair required',
+    })),
+  ];
+  const selected = (Array.isArray(plan.selected) ? plan.selected : []).map(issue => ({
+    repo: REPO,
+    issueNumber: issue.number,
+    issueTitle: issue.title,
+    concurrencyKey: `openclaw-writer-v1:${REPO}:issue:${canonicalizePrNumber(issue.number)}`,
+    blockedReason: attested
+      ? 'manual writer dispatch required; legacy task-state queue is evidence-only'
+      : `${OPENCLAW_WRITER_ATTESTATION_VARIABLE} is not exactly true`,
   }));
-  taskState.lastUpdated = new Date().toISOString();
-  taskState.lastPlan = {
-    timestamp: new Date().toISOString(),
-    slotsAvailable: plan.slots.total,
-    slotsUsed: plan.selected.length,
-    budgetStatus: plan.budget?.status || 'unknown',
-  };
-
-  fs.writeFileSync(TASK_STATE_PATH, JSON.stringify(taskState, null, 2));
-
-  // Label selected issues as in-progress
-  for (const issue of plan.selected) {
-    try {
-      execSync(`gh issue edit ${issue.number} --repo ${REPO} --add-label "status:in-progress" 2>/dev/null`, { timeout: 10000 });
-    } catch { /* ignore label failures */ }
+  const blockedByIdentity = new Map();
+  for (const task of [
+    ...(Array.isArray(taskState.blockedWriterQueue) ? taskState.blockedWriterQueue : []),
+    ...quarantined,
+    ...selected,
+  ]) {
+    blockedByIdentity.set(blockedTaskIdentity(task), task);
   }
 
-  return taskState;
+  // Allowlist metadata so legacy/custom task-bearing fields cannot survive the
+  // sanitizer under a different name.
+  const nonExecutableState = {
+    ciFixAttempts: taskState.ciFixAttempts && typeof taskState.ciFixAttempts === 'object'
+      ? taskState.ciFixAttempts
+      : {},
+    blockedPRs: Array.isArray(taskState.blockedPRs) ? taskState.blockedPRs : [],
+    lastHeartbeat: taskState.lastHeartbeat || null,
+  };
+
+  return {
+    taskState: {
+      ...nonExecutableState,
+      schema: 'v3',
+      queue: [],
+      activeTasks: [],
+      lastUpdated: now,
+      lastPlan: {
+        timestamp: now,
+        slotsAvailable: plan.slots.total,
+        slotsUsed: selected.length,
+        budgetStatus: plan.budget?.status || 'unknown',
+      },
+    },
+    evidenceTasks: [...blockedByIdentity.values()],
+  };
+}
+
+/**
+ * Apply an evidence-only plan and quarantine every legacy executable task.
+ */
+function applyPlan(plan) {
+  const sanitized = sanitizeLegacyTaskState(
+    readTaskState(),
+    plan,
+    fetchWriterAttestationValue() === 'true'
+  );
+
+  writeJsonAtomic(TASK_STATE_PATH, sanitized.taskState);
+  const evidence = writeWriterEvidence({
+    filePath: WRITER_EVIDENCE_PATH,
+    source: 'legacy-planner',
+    tasks: sanitized.evidenceTasks,
+    generatedAt: sanitized.taskState.lastUpdated,
+  });
+
+  return { taskState: sanitized.taskState, evidence };
 }
 
 function printPlan(plan) {
   console.log('═══════════════════════════════════════════════');
-  console.log('  📋 TASK PLANNER — Budget-Aware Queue Builder');
+  console.log('  📋 TASK PLANNER — Budget-Aware Evidence Planner');
   console.log(`  ${new Date().toISOString()}`);
   console.log('═══════════════════════════════════════════════\n');
 
@@ -284,16 +360,16 @@ function printPlan(plan) {
     console.log(`  📐 Slots:   ${plan.slots.reason}`);
   }
 
-  console.log(`  📊 Backlog: ${plan.totalBacklog} issues | ${plan.activeCount} active | ${plan.selected.length} to queue\n`);
+  console.log(`  📊 Backlog: ${plan.totalBacklog} issues | ${plan.activeCount} legacy active | ${plan.selected.length} to record\n`);
 
   // Selected tasks
   if (plan.selected.length > 0) {
-    console.log('  ✅ Selected for queue (by priority score):');
+    console.log('  🔒 Selected as blocked evidence (by priority score):');
     for (const i of plan.selected) {
       console.log(`     #${i.number} [${i.priority}|${i.score}pts|~${i.cost}%] ${i.title.substring(0, 55)}`);
     }
   } else {
-    console.log('  📭 No new tasks to queue (all active or budget depleted)');
+    console.log('  📭 No new tasks to record (all known or budget depleted)');
   }
 
   // Skipped
@@ -308,24 +384,28 @@ function printPlan(plan) {
   console.log('\n═══════════════════════════════════════════════');
 }
 
-// CLI
-const args = process.argv.slice(2);
-const plan = buildPlan();
+function main(args = process.argv.slice(2)) {
+  const plan = buildPlan();
 
-if (args.includes('--status')) {
-  const b = plan.budget;
-  const statusIcon = { OK: '🟢', SLOW_DOWN: '🟡', PAUSE: '🔴' }[b?.status] || '⚪';
-  console.log(`${statusIcon} slots:${plan.slots.total} active:${plan.activeCount} queued:${plan.selected.length} backlog:${plan.totalBacklog} | 5h:${b?.h5Remaining ?? '?'}% weekly:${b?.weeklyRemaining ?? '?'}%`);
-} else if (args.includes('--apply')) {
-  printPlan(plan);
-  if (plan.selected.length > 0) {
+  if (args.includes('--status')) {
+    const b = plan.budget;
+    const statusIcon = { OK: '🟢', SLOW_DOWN: '🟡', PAUSE: '🔴' }[b?.status] || '⚪';
+    console.log(`${statusIcon} slots:${plan.slots.total} active:${plan.activeCount} queued:${plan.selected.length} backlog:${plan.totalBacklog} | 5h:${b?.h5Remaining ?? '?'}% weekly:${b?.weeklyRemaining ?? '?'}%`);
+  } else if (args.includes('--apply')) {
+    printPlan(plan);
     console.log('\n  Applying...');
     const result = applyPlan(plan);
-    console.log(`  ✅ Queue: ${result.queue.length} items | Active: ${result.activeTasks.length} items`);
+    console.log(`  ✅ Executable queue: ${result.taskState.queue.length} | Active: ${result.taskState.activeTasks.length} | Monitor evidence: ${result.evidence.tasks.length}`);
   } else {
-    console.log('\n  Nothing to apply.');
+    printPlan(plan);
+    console.log('  (Dry run — use --apply to sanitize executable state and record blocked evidence)');
   }
-} else {
-  printPlan(plan);
-  console.log('  (Dry run — use --apply to write queue + label issues)');
 }
+
+if (require.main === module) main();
+
+module.exports = {
+  applyPlan,
+  blockedTaskIdentity,
+  sanitizeLegacyTaskState,
+};

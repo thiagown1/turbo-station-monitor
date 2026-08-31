@@ -9,7 +9,7 @@
  * - Extract relevant fields
  * - Append to github-webhook-queue.jsonl
  * - Send instant ACK to Thiago on Telegram (DM)
- * - Wake OpenClaw for immediate processing
+ * - Record PR/CI evidence without auto-dispatching a code writer
  */
 
 const http = require('http');
@@ -18,7 +18,6 @@ const crypto = require('crypto');
 const fs = require('fs');
 const { exec, execFile, spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
-const { getMarkedReviewKind } = require('./lib/review-verdicts');
 
 const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
@@ -30,9 +29,6 @@ const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin
 const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
 const ACK_DEBOUNCE_PATH = path.join(__dirname, '..', 'github-ack-debounce.json');
-const CI_PENDING_PATH = path.join(__dirname, '..', 'ci-pending-wakes.json');
-const CI_DEBOUNCE_MS = parseInt(process.env.CI_WAKE_DEBOUNCE_MS || '60000', 10); // 60s
-const CODEX_REVIEW_DEBOUNCE_MS = parseInt(process.env.CODEX_REVIEW_DEBOUNCE_MS || '1800000', 10); // 30min
 
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads are small)
 
@@ -44,18 +40,6 @@ function sendTelegramNotification(text, target = 'telegram:-5103508388') {
     (err) => {
       if (err) console.error(`[telegram-notify] CLI failed: ${err.message}`);
       else console.log(`[telegram-notify] Sent to ${target}: ${text.substring(0, 80)}`);
-    }
-  );
-}
-
-function sendNightWorkersPing(text) {
-  execFile(
-    OPENCLAW_CLI,
-    ['message', 'send', '--channel', 'telegram', '--target', 'telegram:-5143783696', '--message', String(text)],
-    { timeout: 10000 },
-    (err) => {
-      if (err) console.error(`[night-workers-ping] CLI failed: ${err.message}`);
-      else console.log(`[night-workers-ping] Sent: ${text.substring(0, 80)}`);
     }
   );
 }
@@ -93,40 +77,7 @@ function getPullRequestUrl({ repository, prNumber, fallbackUrl }) {
   return `https://github.com/${repository}/pull/${prNumber}`;
 }
 
-function sendOpenClawWake(text) {
-  const postData = JSON.stringify({ text, mode: 'now' });
-  const url = new URL('/hooks/wake', OPENCLAW_GATEWAY_URL);
-
-  const req = http.request(
-    {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENCLAW_HOOKS_TOKEN}`,
-        'Content-Length': Buffer.byteLength(postData),
-      },
-    },
-    (res) => {
-      let body = '';
-      res.on('data', (chunk) => (body += chunk));
-      res.on('end', () => {
-        console.log(`[github-webhook] Wake sent (${res.statusCode}): ${body.substring(0, 100)}`);
-      });
-    }
-  );
-
-  req.on('error', (err) => {
-    console.error(`[github-webhook] Wake failed: ${err.message}`);
-  });
-
-  req.write(postData);
-  req.end();
-}
-
-function sendOpenClawAgent({ message, agentId, name, channel, to, wakeMode = 'now', deliver = true }) {
+function sendOpenClawAgentRequest({ message, agentId, name, channel, to, wakeMode = 'now', deliver = true }) {
   const postData = JSON.stringify({
     message,
     agentId,
@@ -200,6 +151,77 @@ function writeJsonFile(filePath, obj) {
   fs.writeFileSync(filePath, JSON.stringify(obj, null, 2));
 }
 
+const TURBO_STATION_REPO = 'thiagown1/turbo_station';
+const TURBO_STATION_CODER_WORKSPACE = '/home/openclaw/.openclaw/workspace-coder/turbo_station';
+const CODER_WORKTREES_ROOT = '/home/openclaw/.openclaw/workspace-coder/worktrees';
+
+function findWorktreeForBranch(porcelain, branch) {
+  const expectedRef = `refs/heads/${branch}`;
+  for (const block of String(porcelain || '').split(/\r?\n\r?\n/)) {
+    const lines = block.split(/\r?\n/);
+    const worktree = lines.find(line => line.startsWith('worktree '))?.slice('worktree '.length);
+    const branchRef = lines.find(line => line.startsWith('branch '))?.slice('branch '.length);
+    if (worktree && branchRef === expectedRef) return worktree;
+  }
+  return null;
+}
+
+function isPathInside(root, candidate) {
+  const relative = path.relative(path.resolve(root), path.resolve(candidate));
+  return relative !== '' && relative !== '..' &&
+    !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function cleanupMergedTurboWorktree(branch, prNumber) {
+  if (!branch) {
+    console.error(`[github-webhook] Refusing PR #${prNumber} cleanup without an exact branch`);
+    return;
+  }
+
+  execFile(
+    'git',
+    ['-C', TURBO_STATION_CODER_WORKSPACE, 'worktree', 'list', '--porcelain'],
+    { timeout: 15000 },
+    (listError, stdout) => {
+      if (listError) {
+        console.error(`[github-webhook] Worktree lookup failed: ${listError.message}`);
+        return;
+      }
+
+      const worktree = findWorktreeForBranch(stdout, branch);
+      if (!worktree) {
+        console.log(`[github-webhook] No registered worktree found for PR #${prNumber}`);
+        return;
+      }
+      if (!isPathInside(CODER_WORKTREES_ROOT, worktree)) {
+        console.error(`[github-webhook] Refusing cleanup outside dedicated worktree root: ${worktree}`);
+        return;
+      }
+
+      execFile(
+        'git',
+        ['-C', TURBO_STATION_CODER_WORKSPACE, 'worktree', 'remove', '--force', worktree],
+        { timeout: 30000 },
+        (removeError) => {
+          if (removeError) {
+            console.error(`[github-webhook] Worktree cleanup failed: ${removeError.message}`);
+            return;
+          }
+          console.log(`[github-webhook] Worktree removed for PR #${prNumber}: ${worktree}`);
+          execFile(
+            'git',
+            ['-C', TURBO_STATION_CODER_WORKSPACE, 'worktree', 'prune'],
+            { timeout: 15000 },
+            (pruneError) => {
+              if (pruneError) console.error(`[github-webhook] Worktree prune failed: ${pruneError.message}`);
+            }
+          );
+        }
+      );
+    }
+  );
+}
+
 function shouldSendAck({ key, windowMs }) {
   const now = Date.now();
   const state = readJsonFileOrDefault(ACK_DEBOUNCE_PATH, {});
@@ -208,89 +230,6 @@ function shouldSendAck({ key, windowMs }) {
   state[key] = now;
   writeJsonFile(ACK_DEBOUNCE_PATH, state);
   return true;
-}
-
-/**
- * Dispatch a single, batched CI wake for all failures accumulated
- * for a given branch key during the debounce window.
- */
-function dispatchBatchedCIWake(branchKey) {
-  const pending = readJsonFileOrDefault(CI_PENDING_PATH, {});
-  const entry = pending[branchKey];
-
-  if (!entry || !entry.failures.length) {
-    console.log(`[github-webhook] CI debounce: no pending failures for ${branchKey}, skipping`);
-    return;
-  }
-
-  // Consume the pending entry
-  const failures = [...entry.failures];
-  delete pending[branchKey];
-  writeJsonFile(CI_PENDING_PATH, pending);
-
-  const [repo, branch] = branchKey.split(':');
-  const repoFull = `${repo}:${branch}`.includes('/') ? repo : branchKey;
-
-  console.log(`[github-webhook] CI debounce: dispatching ${failures.length} batched failure(s) for ${branchKey}`);
-
-  // Separate quality gate issues from code failures
-  const qualityGateFailures = failures.filter(f => f.isPRQualityGate);
-  const codeFailures = failures.filter(f => !f.isPRQualityGate);
-
-  // Build a unified message listing ALL failures
-  const failureList = failures.map(f =>
-    `  - "${f.workflow}" (attempt ${f.count}/${f.maxFixAttempts}) ${f.runUrl}`
-  ).join('\n');
-
-  const maxCount = Math.max(...failures.map(f => f.count));
-  const maxFixAttempts = Math.max(...failures.map(f => f.maxFixAttempts));
-
-  if (qualityGateFailures.length > 0 && codeFailures.length === 0) {
-    // All failures are PR Quality Gate
-    sendOpenClawAgent({
-      agentId: 'coder',
-      name: 'PR Quality Gate Fix',
-      channel: 'telegram',
-      to: '-5167874742',
-      wakeMode: 'now',
-      deliver: true,
-      message:
-        `🔴 PR Quality Gate failed on branch ${branch} (${qualityGateFailures.length} check(s), attempt ${maxCount}/${maxFixAttempts})\n` +
-        `Failures:\n${failureList}\n\n` +
-        `This is a PR BODY template issue, not a code issue.\n\n` +
-        `Instructions:\n` +
-        `1. Find the PR: gh pr list --repo ${repoFull} --head ${branch} --json number,title\n` +
-        `2. Read the failed CI logs for each run above\n` +
-        `3. Read the PR diff to understand scope: gh pr diff PR_NUMBER --repo ${repoFull} | head -100\n` +
-        `4. Write a proper PR body to /tmp/pr-body-fix.md with ALL required sections:\n` +
-        `   ## Resumo\n   ## Acceptance Criteria (with - [x] checkboxes)\n   ## Testes (with "Resultado: ✅")\n   ## Cenários cobertos (with - [x] checkboxes)\n   ## Riscos e Rollback\n` +
-        `5. Update: gh pr edit PR_NUMBER --repo ${repoFull} --body-file /tmp/pr-body-fix.md\n` +
-        `6. Reply with what you did.`,
-    });
-  } else {
-    // Code failures (possibly mixed with quality gate)
-    sendOpenClawAgent({
-      agentId: 'coder',
-      name: 'CI Failure',
-      channel: 'telegram',
-      to: '-5167874742',
-      wakeMode: 'now',
-      deliver: true,
-      message:
-        `🔴 CI Failed: ${failures.length} check(s) on branch ${branch} (attempt ${maxCount}/${maxFixAttempts})\n` +
-        `Failures:\n${failureList}\n\n` +
-        `Instructions:\n` +
-        `1. Read task-state.json first\n` +
-        `2. Find the PR: gh pr list --repo ${repoFull} --head ${branch} --json number,title\n` +
-        `3. Read CI logs for EACH failed run above: gh run view RUN_ID --log-failed --repo ${repoFull}\n` +
-        `4. If the branch has a worktree, use it. Otherwise create one.\n` +
-        `5. Fix ALL issues from the batch, commit, push.\n` +
-        `6. If attempts >= 3: set phase=blocked, add label status:blocked\n` +
-        `7. Update task-state.json before finishing`,
-    });
-  }
-
-  // NOTE: main agent no longer notified — coder handles CI autonomously
 }
 
 function handleHealth(req, res) {
@@ -372,6 +311,7 @@ function handleWebhook(req, res) {
         webhookEvent.pr_url = payload.issue?.html_url || payload.pull_request?.html_url;
         webhookEvent.pr_head_ref = payload.pull_request?.head?.ref;
         webhookEvent.pr_head_sha = payload.pull_request?.head?.sha;
+        webhookEvent.pr_base_sha = payload.pull_request?.base?.sha;
         webhookEvent.comment_body = payload.comment?.body;
         webhookEvent.comment_author = payload.comment?.user?.login;
         webhookEvent.comment_url = payload.comment?.html_url;
@@ -381,6 +321,7 @@ function handleWebhook(req, res) {
         webhookEvent.pr_url = payload.pull_request?.html_url;
         webhookEvent.pr_head_ref = payload.pull_request?.head?.ref;
         webhookEvent.pr_head_sha = payload.pull_request?.head?.sha;
+        webhookEvent.pr_base_sha = payload.pull_request?.base?.sha;
         webhookEvent.review_state = payload.review?.state;
         webhookEvent.review_body = payload.review?.body;
         webhookEvent.review_author = payload.review?.user?.login;
@@ -433,7 +374,7 @@ function handleWebhook(req, res) {
       // Release auto-notes (TestFlight)
       const releaseAutoNotesEnabled = (process.env.RELEASE_AUTONOTES_ENABLED || '1') !== '0';
 
-      // Human intervention resets CI auto-fix counter for the affected branch/PR.
+      // Human intervention resets the CI evidence counter for the affected branch/PR.
       if (isThiagoIntervention && webhookEvent.pr_head_ref) {
         const attempts = readJsonFileOrDefault(CI_ATTEMPTS_PATH, {});
         const branch = webhookEvent.pr_head_ref;
@@ -448,11 +389,11 @@ function handleWebhook(req, res) {
 
         if (resetCount > 0) {
           writeJsonFile(CI_ATTEMPTS_PATH, attempts);
-          console.log(`[github-webhook] Thiago intervention detected on ${branch} — reset ${resetCount} CI auto-fix counter(s)`);
+          console.log(`[github-webhook] Thiago intervention detected on ${branch} — reset ${resetCount} CI evidence counter(s)`);
         }
       }
 
-      // CI failures that need auto-fix (loop protection)
+      // CI failures that need attention (notification loop protection)
       let ciNeedsAttention = false;
       if (event === 'workflow_run' && webhookEvent.action === 'completed' && webhookEvent.conclusion === 'failure') {
         const attempts = readJsonFileOrDefault(CI_ATTEMPTS_PATH, {});
@@ -476,7 +417,7 @@ function handleWebhook(req, res) {
         const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '3', 10);
 
         if (webhookEvent.sha_already_analyzed) {
-          console.log(`[github-webhook] CI skip: SHA already analyzed for ${runKey}, not waking coder`);
+          console.log(`[github-webhook] CI skip: SHA already recorded for ${runKey}`);
         } else if (entry.count < maxFixAttempts) {
           ciNeedsAttention = true;
           entry.count++;
@@ -484,133 +425,41 @@ function handleWebhook(req, res) {
           entry.lastSha = headSha;
           attempts[runKey] = entry;
           writeJsonFile(CI_ATTEMPTS_PATH, attempts);
-          console.log(`[github-webhook] CI fix attempt ${entry.count}/${maxFixAttempts} for ${runKey} (sha=${headSha.substring(0, 8)})`);
+          console.log(`[github-webhook] CI evidence observation ${entry.count}/${maxFixAttempts} for ${runKey} (sha=${headSha.substring(0, 8)})`);
         } else {
-          console.log(`[github-webhook] CI fix limit reached (${maxFixAttempts}/${maxFixAttempts}) for ${runKey}, skipping auto-fix`);
+          console.log(`[github-webhook] CI evidence limit reached (${maxFixAttempts}/${maxFixAttempts}) for ${runKey}`);
           webhookEvent.fix_limit_reached = true;
         }
       }
 
-      // ── Operational cleanup on submitted reviews ───────────────
-      // Approval labels are not written here: a generic bot approval cannot
-      // prove which reviewer ran or which revision it covered. During the
-      // migration, only an exact-head, marked CHANGES_REQUESTED review may
-      // keep the operational needs:coder-fix queue moving.
+      // Submitted reviews are evidence only. In the target repositories,
+      // `needs:coder-fix` can trigger a writer workflow, so this ingress must
+      // never add or remove it (or any pending-review label).
       if (event === 'pull_request_review' && webhookEvent.action === 'submitted' && !isShortTrader) {
         const reviewState = (webhookEvent.review_state || '').toLowerCase();
-        const prNumber = webhookEvent.pr_number;
-        const repo = webhookEvent.repository || 'thiagown1/turbo_station';
-
-        const reviewKind = getMarkedReviewKind({
-          author: { login: webhookEvent.review_author },
-          body: webhookEvent.review_body,
-          commitId: webhookEvent.review_commit_sha,
-        }, webhookEvent.pr_head_sha);
-
-        if (reviewState === 'changes_requested' && reviewKind) {
-          const pendingLabel = reviewKind === 'test' ? 'needs:test-review' : 'needs:sec-review';
-          execFile(
-            'gh',
-            ['pr', 'edit', String(prNumber), '--repo', repo, '--add-label', 'needs:coder-fix'],
-            { env: process.env },
-            (error, stdout, stderr) => {
-              if (error) {
-                console.error('[github-webhook] Failed to queue reviewer fix:', error.message);
-                if (stderr) console.error(stderr);
-                return;
-              }
-              if (stdout) console.log('[github-webhook] Reviewer fix queued:', stdout.trim());
-
-              // Pending-review cleanup is best effort and happens only after
-              // the durable coder queue signal was successfully added.
-              execFile(
-                'gh',
-                ['pr', 'edit', String(prNumber), '--repo', repo, '--remove-label', pendingLabel],
-                { env: process.env },
-                (cleanupError) => {
-                  if (cleanupError) {
-                    console.error(`[github-webhook] Could not remove ${pendingLabel}:`, cleanupError.message);
-                  }
-                }
-              );
-            }
+        if (reviewState === 'changes_requested') {
+          console.log(
+            `[github-webhook] CHANGES_REQUESTED recorded as evidence only; ` +
+            `no writer-triggering label changed for ${webhookEvent.repository}#${webhookEvent.pr_number}`
           );
-        } else if (reviewState === 'changes_requested') {
-          console.log('[github-webhook] Ignoring unmarked or stale CHANGES_REQUESTED review');
         }
       }
 
-      // Auto-cleanup: when a TurboStation-ai PR is merged, remove the worktree
-      const isMergedPR = event === 'pull_request' &&
+      // Cleanup is repository-scoped and argv-only. OCPP has no audited local
+      // workspace mapping here, so its merge event remains evidence-only.
+      const isMergedTurboStationPR = event === 'pull_request' &&
         webhookEvent.action === 'closed' &&
         webhookEvent.pr_merged === true &&
         webhookEvent.pr_author === 'TurboStation-ai' &&
-        !isShortTrader;
+        webhookEvent.repository === TURBO_STATION_REPO;
 
-      if (isMergedPR) {
-        const { exec } = require('child_process');
+      if (isMergedTurboStationPR) {
         const prBranch = payload.pull_request?.head?.ref || '';
         const prNumber = webhookEvent.pr_number;
 
         console.log(`[github-webhook] PR #${prNumber} merged — running auto-cleanup for branch ${prBranch}`);
+        cleanupMergedTurboWorktree(prBranch, prNumber);
 
-        // 1. Remove worktree matching this branch
-        const cleanupScript = `
-          cd /home/openclaw/.openclaw/workspace-coder/turbo_station &&
-          WORKTREE=$(git worktree list --porcelain | grep -B2 "branch refs/heads/${prBranch}" | grep "worktree " | sed 's/worktree //') &&
-          if [ -n "$WORKTREE" ]; then
-            git worktree remove --force "$WORKTREE" 2>/dev/null || true
-            git worktree prune
-            echo "REMOVED: $WORKTREE"
-          else
-            echo "NO_WORKTREE_FOUND"
-          fi
-        `;
-
-        exec(cleanupScript, { timeout: 30000 }, (err, stdout) => {
-          if (err) {
-            console.error(`[github-webhook] Worktree cleanup failed: ${err.message}`);
-          } else {
-            console.log(`[github-webhook] Worktree cleanup: ${stdout.trim()}`);
-          }
-        });
-
-        // 2. Update task-state.json — move task to completedToday
-        try {
-          const taskStatePath = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
-          const taskState = JSON.parse(fs.readFileSync(taskStatePath, 'utf8'));
-
-          // Check activeTasks array
-          const idx2 = taskState.activeTasks?.findIndex(t => t.prNumber === prNumber);
-          if (idx2 >= 0) {
-            taskState.completedToday = taskState.completedToday || [];
-            taskState.completedToday.push({
-              ...taskState.activeTasks.splice(idx2, 1)[0],
-              phase: 'done',
-              lastAction: new Date().toISOString(),
-            });
-          }
-
-          // Check queue
-          const idx = taskState.queue?.findIndex(t => t.prNumber === prNumber);
-          if (idx >= 0) {
-            const task = taskState.queue.splice(idx, 1)[0];
-            taskState.completedToday = taskState.completedToday || [];
-            taskState.completedToday.push({
-              ...task,
-              phase: 'done',
-              lastAction: new Date().toISOString(),
-            });
-          }
-
-          taskState.lastUpdated = new Date().toISOString();
-          fs.writeFileSync(taskStatePath, JSON.stringify(taskState, null, 2));
-          console.log(`[github-webhook] task-state.json updated — PR #${prNumber} moved to completedToday`);
-        } catch (e) {
-          console.error(`[github-webhook] task-state.json update failed: ${e.message}`);
-        }
-
-        // 3. Notify
         sendTelegramNotification(
           `✅ PR #${prNumber} merged! Worktree cleanup running.\n${webhookEvent.pr_title || ''}`,
           'telegram:-5103508388'
@@ -620,7 +469,6 @@ function handleWebhook(req, res) {
       webhookEvent.needs_attention = needsAttention || ciNeedsAttention;
 
       // Append queue
-      const fs = require('fs');
       fs.appendFileSync(QUEUE_PATH, JSON.stringify(webhookEvent) + '\n');
 
       const sender = author || webhookEvent.sender || '';
@@ -716,7 +564,7 @@ function handleWebhook(req, res) {
 
           if (isShortTrader) {
             // Trigger MoneyMan automatically for short_trader events.
-            sendOpenClawAgent({
+            sendOpenClawAgentRequest({
               agentId: 'moneyman',
               name: 'GitHub short_trader',
               channel: 'telegram',
@@ -737,67 +585,11 @@ function handleWebhook(req, res) {
           console.log(`[github-webhook] ACK suppressed (debounce or edited) for ${ackKey}`);
         }
 
-        // Route Turbo Station events directly to the coder agent
+        // PR feedback is evidence, not writer authorization. Turbo Station and
+        // OCPP repairs are dispatched manually with an exact immutable tuple;
+        // no public comment, bot review, or edited event may start the Coder.
         if (!isShortTrader) {
-          if (isCodexReview) {
-            // Codex review comments can arrive in bursts (many inline events).
-            // Coalesce by PR + head SHA to avoid Telegram/PR spam and repeated work.
-            const reviewKey = `codex-review:${webhookEvent.repository}:${webhookEvent.pr_number}:${webhookEvent.pr_head_sha || webhookEvent.pr_head_ref || 'unknown'}`;
-            const shouldDispatchCodexReview = shouldAckThisEvent && shouldSendAck({
-              key: reviewKey,
-              windowMs: CODEX_REVIEW_DEBOUNCE_MS,
-            });
-
-            if (!shouldDispatchCodexReview) {
-              console.log(`[github-webhook] Codex review wake suppressed (debounce): ${reviewKey}`);
-            } else {
-              sendOpenClawAgent({
-                agentId: 'coder',
-                name: 'Codex Review',
-                channel: 'telegram',
-                to: '-5167874742',
-                wakeMode: 'now',
-                // Internal wake only; coder should send one consolidated checkpoint.
-                deliver: false,
-                message:
-                  `🤖 Codex Review on PR #${webhookEvent.pr_number} — ${webhookEvent.pr_title || ''}\n\n` +
-                  `Codex left review comments. Address them in ONE consolidated pass (no repeated spam).\n\n` +
-                  `Instructions:\n` +
-                  `1. Read task-state.json to find the worktree for this PR's branch\n` +
-                  `2. Read ALL Codex comments once: gh pr view ${webhookEvent.pr_number} --repo ${webhookEvent.repository} --comments\n` +
-                  `3. Also check inline review comments once: gh api repos/${webhookEvent.repository}/pulls/${webhookEvent.pr_number}/comments --jq '.[].body'\n` +
-                  `4. Evaluate each suggestion:\n` +
-                  `   - P0/P1 (bugs, security) → MUST fix\n` +
-                  `   - P2 (improvements) → SHOULD fix\n` +
-                  `   - P3 (style/nitpick) → fix if easy, skip if risky\n` +
-                  `5. Implement fixes in the worktree, commit, push\n` +
-                  `6. IMPORTANT: all changes must be BACKWARDS COMPATIBLE\n` +
-                  `7. Post AT MOST ONE PR comment in this run, and only if there is a new commit pushed.\n` +
-                  `8. Update task-state.json before finishing`,
-              });
-            }
-          } else {
-            // Human comment — wake coder directly
-            sendOpenClawAgent({
-              agentId: 'coder',
-              name: 'GitHub Turbo Station',
-              channel: 'telegram',
-              to: '-5167874742',
-              wakeMode: 'now',
-              deliver: true,
-              message:
-                `GitHub event: ${author} (${webhookEvent.action}) on PR #${webhookEvent.pr_number} — ${webhookEvent.pr_title || ''}\n\n` +
-                `Comment: "${preview}"\n\n` +
-                `Instructions:\n` +
-                `1. Read task-state.json first\n` +
-                `2. Read the full comment on GitHub: gh pr view ${webhookEvent.pr_number} --repo ${webhookEvent.repository} --comments | tail -30\n` +
-                `3. If the comment requests a code change: update task-state.json, switch to the relevant worktree, implement the fix\n` +
-                `4. If the comment is just feedback/approval: acknowledge and update task-state.json\n` +
-                `5. Update task-state.json before finishing`,
-            });
-          }
-
-          // NOTE: main agent no longer woken — coder handles PR feedback autonomously
+          console.log(`[github-webhook] PR feedback recorded; manual exact-tuple repair required for ${webhookEvent.repository}#${webhookEvent.pr_number}`);
         }
       } else if (ciNeedsAttention) { 
         const maxFixAttempts = parseInt(process.env.CI_FIX_MAX_ATTEMPTS || '3', 10);
@@ -812,7 +604,7 @@ function handleWebhook(req, res) {
         );
 
         if (isShortTrader) {
-          sendOpenClawAgent({
+          sendOpenClawAgentRequest({
             agentId: 'moneyman',
             name: 'GitHub short_trader CI',
             channel: 'telegram',
@@ -829,67 +621,16 @@ function handleWebhook(req, res) {
           });
         }
 
-        if (false && !isShortTrader) {
-          // ── Debounced CI wake — MIGRATED TO GITHUB ACTIONS ─────────
-          // Replaced by .github/workflows/agent-coder.yml fix-ci job
-          // (workflow_run trigger filtered on conclusion == 'failure').
-          // Concurrency `group: agent-coder-<branch>, cancel-in-progress:
-          // false` provides equivalent debouncing — multiple failing
-          // workflows on the same branch queue one fix-ci run after the
-          // current one. Re-enable by flipping `if (false &&` above.
-          //
-          // Original comment for reference:
-          // Instead of waking the coder immediately for each failing
-          // workflow, buffer failures per branch and dispatch a single
-          // batched wake after CI_DEBOUNCE_MS (default 60s).
-          const pending = readJsonFileOrDefault(CI_PENDING_PATH, {});
-          const branchKey = `${webhookEvent.repository}:${webhookEvent.head_branch}`;
-
-          if (!pending[branchKey]) {
-            pending[branchKey] = { failures: [], firstSeen: Date.now() };
-          }
-
-          pending[branchKey].failures.push({
-            workflow: webhookEvent.workflow_name,
-            runUrl: runUrl || '(no url)',
-            count,
-            maxFixAttempts,
-            isPRQualityGate: (webhookEvent.workflow_name || '').toLowerCase().includes('pr quality gate'),
-            workflowRunId: payload.workflow_run?.id || '',
-          });
-          writeJsonFile(CI_PENDING_PATH, pending);
-
-          // Schedule the batched dispatch (only if this is the first
-          // failure in this debounce window)
-          if (pending[branchKey].failures.length === 1) {
-            console.log(`[github-webhook] CI debounce: first failure for ${branchKey}, dispatching in ${CI_DEBOUNCE_MS}ms`);
-            setTimeout(() => {
-              dispatchBatchedCIWake(branchKey);
-            }, CI_DEBOUNCE_MS);
-          } else {
-            console.log(`[github-webhook] CI debounce: buffered failure #${pending[branchKey].failures.length} for ${branchKey}`);
-          }
-        }
-
-        // Dispatch to Night workers when the CI issue is persisting
-        if (count >= 2) {
-          try {
-            const backlogPath = '/home/openclaw/.openclaw/workspace/groups/telegram/-5143783696-night-workers/BACKLOG.md';
-            const ts = new Date().toISOString();
-            const item = `\n- [${ts}] CI failing: "${webhookEvent.workflow_name}" (${webhookEvent.head_branch}) attempt ${count}/${maxFixAttempts}\n  - Run: ${runUrl || '(no url)'}\n  - Next: investigar logs do run, aplicar fix mínimo, abrir PR/commit e re-rodar CI\n`;
-            fs.appendFileSync(backlogPath, item);
-
-            sendNightWorkersPing(
-              `📨 Dispatch (GitHub Hub → Night workers)\nCI falhou: "${webhookEvent.workflow_name}" (${webhookEvent.head_branch})\n${runUrl || ''}\nTentativa ${count}/${maxFixAttempts}\n\nBacklog: groups/telegram/-5143783696-night-workers/BACKLOG.md`
-            );
-          } catch (e) {
-            console.error('[dispatch] failed:', e.message);
-          }
+        if (!isShortTrader && count >= 2) {
+          console.log(
+            `[github-webhook] Persistent CI failure recorded as evidence only; ` +
+            `manual repair required (${webhookEvent.repository}:${webhookEvent.head_branch}, attempt ${count}/${maxFixAttempts})`
+          );
         }
       } else if (webhookEvent.fix_limit_reached) {
-        sendOpenClawWake(
+        sendTelegramNotification(
           `⚠️ CI fix limit reached: "${webhookEvent.workflow_name}" on ${webhookEvent.head_branch} failed ${process.env.CI_FIX_MAX_ATTEMPTS || '3'} times. ` +
-            `Stopping auto-fix to prevent infinite loop. Notify Thiago with the full diagnosis.`
+            `Automatic repair is disabled; manual diagnosis is required.`
         );
       }
 

@@ -24,9 +24,17 @@ const {
   summarizeCiChecks,
 } = require('./lib/review-verdicts');
 const { hydrateCanonicalCheckMetadata } = require('./lib/github-review-checks');
+const {
+  OPENCLAW_WRITER_ATTESTATION_VARIABLE,
+  buildWriterConcurrencyKey,
+  canonicalizePrNumber,
+  evaluateWriterAuthorization,
+} = require('./lib/openclaw-writer-guard');
+const { writeJsonAtomic, writeWriterEvidence } = require('./lib/writer-evidence-store');
 
 // ─── Config ────────────────────────────────────────────────────────
 const TASK_STATE_PATH = '/home/openclaw/.openclaw/workspace-coder/task-state.json';
+const WRITER_EVIDENCE_PATH = path.join(__dirname, '..', 'state', 'writer-repair-evidence-reconcile.json');
 const TURBO_STATION_DIR = '/home/openclaw/.openclaw/workspace-coder/turbo_station';
 const WORKTREES_DIR = '/home/openclaw/.openclaw/workspace-coder/worktrees';
 const BUDGET_STATE_PATH = '/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/data/budget-state.json';
@@ -82,6 +90,20 @@ function gh(args, repo) {
 
 function hasLabel(pr, name) {
   return (pr.labels || []).some(l => (l.name || l) === name);
+}
+
+function fetchWriterAttestationValue(repo) {
+  const raw = exec(
+    `gh api "repos/${repo}/actions/variables/${OPENCLAW_WRITER_ATTESTATION_VARIABLE}"`,
+    { allowFail: true, timeout: 15000 }
+  );
+  if (!raw) return null;
+  try {
+    const payload = JSON.parse(raw);
+    return typeof payload.value === 'string' ? payload.value : null;
+  } catch {
+    return null;
+  }
 }
 
 function detectPriority(labelNames = []) {
@@ -268,6 +290,9 @@ function reconcile() {
   // 1. Fetch live data from GitHub
   const openPRs = fetchOpenPRs();
   const worktrees = getWorktrees();
+  const writerAttestationValues = Object.fromEntries(
+    REPOS.map(repo => [repo, fetchWriterAttestationValue(repo)])
+  );
 
   // 2. Categorize PRs
   const categories = {
@@ -344,8 +369,12 @@ function reconcile() {
     todo.push({
       action: 'fix_review',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       reason: 'Reviewer requested changes (needs:coder-fix)',
       priority: 100,
@@ -358,8 +387,12 @@ function reconcile() {
     todo.push({
       action: 'fix_ci',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       failingChecks: pr.checks.failing,
       attempts,
@@ -373,8 +406,12 @@ function reconcile() {
     todo.push({
       action: 'rebase',
       pr: pr.number,
+      prNumber: canonicalizePrNumber(pr.number),
       repo: pr.repo,
       branch: pr.headRefName,
+      headSha: pr.headRefOid,
+      baseSha: pr.baseRefOid,
+      concurrencyKey: buildWriterConcurrencyKey({ repo: pr.repo, prNumber: pr.number }),
       title: pr.title,
       reason: 'PR has merge conflicts — must rebase before anything else',
       priority: 110,
@@ -387,6 +424,7 @@ function reconcile() {
       action: 'implement',
       issue: issue.number,
       repo: issue.repo,
+      concurrencyKey: `openclaw-writer-v1:${issue.repo}:issue:${canonicalizePrNumber(issue.number)}`,
       title: issue.title,
       score: issue.score,
       priority: issue.score,
@@ -396,6 +434,45 @@ function reconcile() {
 
   // Sort by priority
   todo.sort((a, b) => b.priority - a.priority);
+
+  // Keep every detected problem as evidence. PR/issue repair is manual-only:
+  // task-state.json is not an authorization or CAS boundary, so its executable
+  // queue stays empty even when the infrastructure attestation is present.
+  const writerQueue = [];
+  const blockedWriterTasks = [];
+  for (const task of todo) {
+    const variableValue = writerAttestationValues[task.repo];
+    if (!task.pr) {
+      blockedWriterTasks.push({
+        ...task,
+        blockedReason: variableValue === 'true'
+          ? 'manual writer dispatch required; task-state queue is evidence-only'
+          : `${OPENCLAW_WRITER_ATTESTATION_VARIABLE} is not exactly true`,
+      });
+      continue;
+    }
+
+    const authorization = evaluateWriterAuthorization({
+      repo: task.repo,
+      prNumber: task.prNumber,
+      expectedHeadSha: task.headSha,
+      expectedBaseSha: task.baseSha,
+      variableValue,
+      currentPr: {
+        number: task.prNumber,
+        state: 'OPEN',
+        headRefOid: task.headSha,
+        baseRefOid: task.baseSha,
+      },
+    });
+    blockedWriterTasks.push({
+      ...task,
+      ...(authorization.tuple || {}),
+      blockedReason: authorization.authorized
+        ? 'manual exact-tuple repair required; task-state queue is evidence-only'
+        : authorization.reason,
+    });
+  }
 
   // 6. Budget check
   const budgetStatus = getBudgetStatus();
@@ -422,6 +499,8 @@ function reconcile() {
     canTakeNewWork,
     newIssuesAvailable: newIssues.length,
     todo,
+    writerQueue,
+    blockedWriterTasks,
     categories: {
       readyToMerge: categories.readyToMerge.map(pr => ({ number: pr.number, title: pr.title?.substring(0, 50), repo: pr.repo })),
       blocked: categories.blocked.map(pr => ({ number: pr.number, title: pr.title?.substring(0, 50), repo: pr.repo })),
@@ -445,25 +524,25 @@ function applyPlan(plan) {
   }
   exec(`cd ${TURBO_STATION_DIR} && git worktree prune`, { allowFail: true });
 
-  // 2. Write minimal task-state.json (v3)
+  // 2. First sanitize the legacy Coder-owned state. It contains no task details
+  // that a model could reinterpret as executable work.
   const newState = {
     schema: 'v3',
     ciFixAttempts: plan.ciFixAttempts,
     blockedPRs: plan.blockedPRs,
     lastHeartbeat: plan.timestamp,
-    // Queue the top items for the coder to pick up (batch fix)
-    queue: plan.todo.slice(0, 5).map(t => ({
-      action: t.action,
-      number: t.pr || t.issue,
-      repo: t.repo,
-      branch: t.branch,
-      title: t.title,
-      reason: t.reason,
-    })),
+    queue: [],
+    activeTasks: [],
   };
 
-  fs.writeFileSync(TASK_STATE_PATH, JSON.stringify(newState, null, 2) + '\n');
-  return newState;
+  writeJsonAtomic(TASK_STATE_PATH, newState);
+  const evidence = writeWriterEvidence({
+    filePath: WRITER_EVIDENCE_PATH,
+    source: 'reconcile',
+    tasks: plan.blockedWriterTasks.slice(0, 20),
+    generatedAt: plan.timestamp,
+  });
+  return { taskState: newState, evidence };
 }
 
 // ─── Output ────────────────────────────────────────────────────────
@@ -506,6 +585,10 @@ function printPlan(plan) {
     console.log(`     ${icon} [${t.priority}] ${t.action} ${ref}: ${t.reason}`);
   }
   if (plan.todo.length > 5) console.log(`     ... and ${plan.todo.length - 5} more`);
+  if (plan.blockedWriterTasks.length > 0) {
+    console.log(`\n  🔒 Writer blocked: ${plan.blockedWriterTasks.length} task(s) retained as evidence`);
+    console.log(`     Set ${OPENCLAW_WRITER_ATTESTATION_VARIABLE}=true only after the documented writer controls are operational.`);
+  }
 
   // Ready to merge (for human awareness)
   if (plan.categories.readyToMerge.length > 0) {
@@ -534,7 +617,8 @@ function printStatus(plan) {
     `ci:${plan.openPRs.ciFailing}`,
     `conflict:${plan.openPRs.conflicting}`,
     `wt:${plan.worktrees.total}(${plan.worktrees.stale}stale)`,
-    `todo:${plan.todo.length}`,
+    `todo:${plan.writerQueue.length}`,
+    `writer-blocked:${plan.blockedWriterTasks.length}`,
     `new:${plan.newIssuesAvailable}`,
   ];
   console.log(parts.join(' | '));
@@ -556,7 +640,8 @@ try {
     console.log('\n  Applying...');
     const result = applyPlan(plan);
     console.log(`  ✅ Cleaned ${plan.worktrees.stale} stale worktrees`);
-    console.log(`  ✅ task-state.json updated (v3, ${plan.todo.length} queued items)`);
+    console.log(`  ✅ task-state.json sanitized (queue=${result.taskState.queue.length}, active=${result.taskState.activeTasks.length})`);
+    console.log(`  ✅ Monitor evidence recorded (${result.evidence.tasks.length} blocked)`);
 
     // Auto-adjust heartbeat frequency based on workload
     try {

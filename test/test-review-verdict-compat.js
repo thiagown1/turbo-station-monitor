@@ -535,5 +535,6 @@ test('reconcile, sweep, and webhook stay wired to the fail-closed compatibility 
   assert.match(sweep, /f\.prNumber && !f\.merged && f\.prStatus === 'reviewed'/);
   assert.doesNotMatch(sweep, /f\.prStatus === 'reviewed' \|\| f\.prStatus === 'ci_green'/);
   assert.doesNotMatch(webhook, /reviewed:tests|reviewed:security/);
-  assert.match(webhook, /--add-label', 'needs:coder-fix'/);
+  assert.doesNotMatch(webhook, /--add-label', 'needs:coder-fix'/);
+  assert.match(webhook, /CHANGES_REQUESTED recorded as evidence only/);
 });
