@@ -89,7 +89,9 @@ exponentially. During a rolling OCPP deployment only, a `404` falls back to
 `/api/logs/history`; other errors never trigger a deep-history fallback.
 Each HTTP request, including JSON body consumption, is aborted after ten
 seconds. A busy bounded tail is drained oldest-page-first with zero delay
-between pages. If the raw cap was exhausted,
+between pages. The initial bootstrap `start_time` is frozen across every page
+and retry until the tail is fully drained; an advancing wall clock cannot move
+the lower bound past undispatched records. If the raw cap was exhausted,
 the collector logs an explicit continuity gap, consumes the available rows and
 reanchors from server metadata instead of retrying the same page forever.
 

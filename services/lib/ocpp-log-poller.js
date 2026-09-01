@@ -38,16 +38,17 @@ function createOcppLogPoller(options) {
   let inFlight = null;
   let cursorIso = null;
   let pageCursor = null;
+  let recoveryStartIso = null;
   let backoffMs = intervalMs;
   let generation = 0;
 
   function buildUrl(pathname) {
     const params = new URLSearchParams();
     params.set('limit', String(limit));
-    params.set(
-      'start_time',
-      cursorIso || new Date(now() - bootstrapMs).toISOString(),
-    );
+    if (!cursorIso && !recoveryStartIso) {
+      recoveryStartIso = new Date(now() - bootstrapMs).toISOString();
+    }
+    params.set('start_time', cursorIso || recoveryStartIso);
     if (pathname === '/api/logs/recent' && pageCursor) {
       params.set('cursor', pageCursor);
     }
@@ -153,6 +154,7 @@ function createOcppLogPoller(options) {
       : null;
     if (!hasMore) {
       pageCursor = null;
+      recoveryStartIso = null;
       const resumeCursor = cursorAfter(body?.data?.resume_from);
       if (resumeCursor && (!nextCursor || resumeCursor > nextCursor)) {
         nextCursor = resumeCursor;
@@ -168,6 +170,7 @@ function createOcppLogPoller(options) {
       // only by timestamp. The new server always supplies next_cursor.
       pageCursor = null;
       if (nextCursor) cursorIso = nextCursor;
+      recoveryStartIso = null;
     }
 
     backoffMs = intervalMs;

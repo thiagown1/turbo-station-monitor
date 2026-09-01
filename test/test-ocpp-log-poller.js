@@ -141,6 +141,41 @@ test('bounded pages use the opaque cursor without skipping equal timestamps', as
   assert.equal(poller.getCursor(), '2026-09-01T12:00:00.001Z');
 });
 
+test('bootstrap pagination freezes its time anchor while the clock advances', async () => {
+  const urls = [];
+  let call = 0;
+  let nowMs = Date.parse('2026-09-01T12:00:45Z');
+  const poller = createOcppLogPoller({
+    fetchFn: async (url) => {
+      urls.push(url);
+      call += 1;
+      return call === 1
+        ? response(200, { data: {
+          has_more: true,
+          next_cursor: 'opaque-page-2',
+          entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'first' }],
+        } })
+        : response(200, { data: {
+          has_more: false,
+          resume_from: '2026-09-01T12:00:00Z',
+          entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'second' }],
+        } });
+    },
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    now: () => nowMs,
+  });
+
+  await poller.pollOnce();
+  nowMs += 30_000;
+  await poller.pollOnce();
+
+  const first = new URL(urls[0]);
+  const second = new URL(urls[1]);
+  assert.equal(second.searchParams.get('start_time'), first.searchParams.get('start_time'));
+  assert.equal(second.searchParams.get('cursor'), 'opaque-page-2');
+});
+
 test('scheduler waits for completion and honors Retry-After without overlap', async () => {
   const scheduled = [];
   let resolveFetch;
