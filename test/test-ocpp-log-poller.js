@@ -66,20 +66,44 @@ test('404 rolls safely to history during a staged deployment', async () => {
   assert.match(urls[1], /\/history\?/);
 });
 
-test('truncated recovery never advances the cursor', async () => {
-  let processed = 0;
+test('truncated recovery records the gap, consumes the page, and keeps draining', async () => {
+  const processed = [];
+  const errors = [];
   const poller = createOcppLogPoller({
     fetchFn: async () => response(200, { data: {
       truncated: true,
+      has_more: true,
+      resume_from: '2026-09-01T12:00:05Z',
       entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'x' }],
     } }),
     baseUrl: 'https://logs.example', token: 'test',
-    processEntry: () => { processed += 1; }, isDuplicate: () => false,
+    processEntry: (entry) => { processed.push(entry); }, isDuplicate: () => false,
+    logger: { log: () => {}, error: (...args) => errors.push(args.join(' ')) },
   });
 
-  await assert.rejects(poller.pollOnce(), /truncated/);
-  assert.equal(poller.getCursor(), null);
-  assert.equal(processed, 0);
+  const result = await poller.pollOnce();
+  assert.equal(result.continuityLost, true);
+  assert.equal(result.nextDelayMs, 0);
+  assert.equal(processed.length, 1);
+  assert.equal(poller.getCursor(), '2026-09-01T12:00:00.001Z');
+  assert.match(errors[0], /continuity gap/);
+});
+
+test('an empty truncated page reanchors at resume_from instead of looping forever', async () => {
+  const poller = createOcppLogPoller({
+    fetchFn: async () => response(200, { data: {
+      truncated: true,
+      has_more: false,
+      resume_from: '2026-09-01T12:00:05Z',
+      entries: [],
+    } }),
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    logger: { log: () => {}, error: () => {} },
+  });
+
+  await poller.pollOnce();
+  assert.equal(poller.getCursor(), '2026-09-01T12:00:05.001Z');
 });
 
 test('scheduler waits for completion and honors Retry-After without overlap', async () => {
@@ -129,4 +153,30 @@ test('Retry-After supports seconds and HTTP dates', () => {
   assert.equal(parseRetryAfter('2', now), 2000);
   assert.equal(parseRetryAfter('Tue, 01 Sep 2026 12:00:03 GMT', now), 3000);
   assert.equal(parseRetryAfter('invalid', now), null);
+});
+
+test('a stalled recovery request aborts at its deadline', async () => {
+  const requestTimers = [];
+  let seenSignal;
+  const poller = createOcppLogPoller({
+    fetchFn: async (url, options) => {
+      seenSignal = options.signal;
+      return new Promise(() => {});
+    },
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    requestTimeoutMs: 10_000,
+    setRequestTimeoutFn: (fn, delay) => {
+      requestTimers.push({ fn, delay });
+      return requestTimers.length;
+    },
+    clearRequestTimeoutFn: () => {},
+  });
+
+  const pending = poller.pollOnce();
+  assert.equal(requestTimers[0].delay, 10_000);
+  requestTimers[0].fn();
+
+  await assert.rejects(pending, /timed out/);
+  assert.equal(seenSignal.aborted, true);
 });

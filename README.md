@@ -87,6 +87,10 @@ bounded `/api/logs/recent` endpoint every five seconds, schedules each poll
 from completion, coalesces concurrent calls, honors `Retry-After`, and backs off
 exponentially. During a rolling OCPP deployment only, a `404` falls back to
 `/api/logs/history`; other errors never trigger a deep-history fallback.
+Each HTTP request is aborted after ten seconds. A busy bounded tail is drained
+oldest-page-first with zero delay between pages. If the raw cap was exhausted,
+the collector logs an explicit continuity gap, consumes the available rows and
+reanchors from server metadata instead of retrying the same page forever.
 
 `ocpp_raw` defaults to 48 hours and `ocpp_events` to seven days. SQLite runs in
 WAL mode with `busy_timeout=5000`; TTL cleanup deletes at most four batches of
