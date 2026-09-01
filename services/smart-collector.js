@@ -3,16 +3,17 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const StateTracker = require('./state-tracker');
+const { createOcppLogPoller } = require('./lib/ocpp-log-poller');
+const { deleteExpiredInChunks } = require('./lib/sqlite-retention');
 
 // Config
-const WS_URL = 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
-const DEFAULT_TOKEN = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJkYXNoYm9hcmRfaWQiOiJvcGVuY2xhdy1tb25pdG9yIiwicm9sZSI6Im1vbml0b3IiLCJwZXJtaXNzaW9ucyI6WyJsb2dzLnJlYWQiLCJsb2dzLmZpbHRlciJdLCJpYXQiOjE3NzA4MTcxOTAsImlzcyI6Im9jcHAtc2VydmVyIiwic3ViIjoib3BlbmNsYXctbW9uaXRvciJ9.toiKVkIbGcmeVx-RRQh7Zt8lXLCbfFDGqyC9qbYoAPM';
-const TOKEN = process.env.OCPP_LOGS_TOKEN || process.env.OCPP_DASHBOARD_TOKEN || DEFAULT_TOKEN;
+const WS_URL = process.env.OCPP_LOGS_WS_URL || 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
+const TOKEN = process.env.OCPP_LOGS_TOKEN || process.env.OCPP_DASHBOARD_TOKEN;
 
 // REST fallback polling (WS can be silent depending on server/file watcher)
-const REST_BASE_URL = 'https://logs.ocpp.turbostation.com.br';
+const REST_BASE_URL = process.env.OCPP_LOGS_REST_URL || 'https://logs.ocpp.turbostation.com.br';
 const REST_POLL_INTERVAL_MS = 5000;
-const REST_POLL_LIMIT = 500;
+const REST_POLL_LIMIT = 1000;
 
 // Raw retention (TTL)
 // NOTE: ocpp_raw grows fast; keep it short and rely on ocpp_events for long-term.
@@ -31,6 +32,7 @@ const DB_PATH = path.join(DB_DIR, 'ocpp.db');
 fs.mkdirSync(DB_DIR, { recursive: true });
 const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
+db.pragma('busy_timeout = 5000');
 
 // Ensure tables exist (auto-recovery)
 // - ocpp_raw: full websocket log entry JSON (unfiltered)
@@ -120,8 +122,15 @@ const HEARTBEAT_DB_INTERVAL = 5 * 60 * 1000; // Save 1 heartbeat per charger eve
 const METER_VALUE_DB_INTERVAL = 5 * 60 * 1000; // Save 1 meter value per charger every 5 min
 
 let restPollStarted = false;
-let restPollInterval = null; // interval handle for REST polling
-let lastRestCursorIso = null; // ISO timestamp of last ingested REST entry
+const restPoller = createOcppLogPoller({
+    fetchFn: (...args) => fetch(...args),
+    baseUrl: REST_BASE_URL,
+    token: TOKEN,
+    processEntry,
+    isDuplicate,
+    intervalMs: REST_POLL_INTERVAL_MS,
+    limit: REST_POLL_LIMIT,
+});
 
 // === WS HEALTH TRACKING ===
 // Only actual log payloads prove that the OCPP stream is healthy. Status and
@@ -161,78 +170,19 @@ function cleanExpiredDedupeKeys() {
 }
 
 // === REST FALLBACK (only when WS is silent) ===
-async function pollOcppLogsRestOnce() {
-    try {
-        const params = new URLSearchParams();
-        params.set('limit', String(REST_POLL_LIMIT));
-        // Use cursor if we have one; else grab a small recent window
-        if (lastRestCursorIso) {
-            params.set('start_time', lastRestCursorIso);
-        } else {
-            // last 2 minutes (bootstrap)
-            params.set('start_time', new Date(Date.now() - 2 * 60 * 1000).toISOString());
-        }
-
-        const url = `${REST_BASE_URL}/api/logs/history?${params.toString()}`;
-        const res = await fetch(url, {
-            headers: {
-                Authorization: `Bearer ${TOKEN}`
-            }
-        });
-        if (!res.ok) throw new Error(`REST ${res.status}`);
-        const body = await res.json();
-        const entries = body?.data?.entries || [];
-        if (!Array.isArray(entries) || entries.length === 0) return;
-
-        // Ensure chronological order so cursor moves forward
-        entries.sort((a, b) => String(a.timestamp).localeCompare(String(b.timestamp)));
-
-        let ingested = 0;
-        for (const e of entries) {
-            // Dedup: skip if already processed via WS
-            if (isDuplicate(e.timestamp, e.message)) continue;
-
-            processEntry({
-                timestamp: e.timestamp,
-                level: e.level,
-                logger: e.logger,
-                message: e.message
-            });
-            ingested++;
-        }
-
-        if (ingested > 0) {
-            console.log(`🌐 [rest-poll] ingested ${ingested} entries (${entries.length - ingested} deduped)`);
-        }
-
-        // Advance cursor to last entry timestamp (plus 1ms to avoid duplicates)
-        const lastTs = entries[entries.length - 1]?.timestamp;
-        if (lastTs) {
-            const t = new Date(lastTs).getTime();
-            if (!Number.isNaN(t)) lastRestCursorIso = new Date(t + 1).toISOString();
-        }
-    } catch (e) {
-        console.error('[rest-poll] error:', e.message);
-    }
-}
-
 function startRestPolling() {
     if (restPollStarted) return;
     restPollStarted = true;
 
     console.log(`🌐 REST fallback ACTIVATED (WS silent for ${WS_SILENCE_THRESHOLD_MS / 1000}s)`);
-    pollOcppLogsRestOnce();
-    restPollInterval = setInterval(pollOcppLogsRestOnce, REST_POLL_INTERVAL_MS);
+    restPoller.start();
 }
 
 function stopRestPolling() {
     if (!restPollStarted) return;
     restPollStarted = false;
 
-    if (restPollInterval) {
-        clearInterval(restPollInterval);
-        restPollInterval = null;
-    }
+    restPoller.stop();
     console.log('🌐 REST fallback PAUSED (WS recovered)');
 }
 
@@ -926,9 +876,11 @@ function startPeriodicTasks() {
         try {
             const ttlMs = OCPP_RAW_TTL_HOURS * 60 * 60 * 1000;
             const cutoff = Date.now() - ttlMs;
-            const res = db.prepare('DELETE FROM ocpp_raw WHERE timestamp < ?').run(cutoff);
-            if (res.changes > 0) {
-                console.log(`🧹 TTL: deleted ${res.changes} ocpp_raw rows older than ${OCPP_RAW_TTL_HOURS}h`);
+            const deleted = deleteExpiredInChunks(db, {
+                table: 'ocpp_raw', cutoff, batchSize: 5000, maxBatches: 4,
+            });
+            if (deleted > 0) {
+                console.log(`🧹 TTL: deleted ${deleted} ocpp_raw rows older than ${OCPP_RAW_TTL_HOURS}h`);
             }
         } catch (e) {
             console.error('TTL cleanup error (raw):', e.message);
@@ -938,9 +890,11 @@ function startPeriodicTasks() {
         try {
             const eventsTtlMs = OCPP_EVENTS_TTL_DAYS * 24 * 60 * 60 * 1000;
             const eventsCutoff = Date.now() - eventsTtlMs;
-            const res2 = db.prepare('DELETE FROM ocpp_events WHERE timestamp < ?').run(eventsCutoff);
-            if (res2.changes > 0) {
-                console.log(`🧹 TTL: deleted ${res2.changes} ocpp_events rows older than ${OCPP_EVENTS_TTL_DAYS}d`);
+            const deleted = deleteExpiredInChunks(db, {
+                table: 'ocpp_events', cutoff: eventsCutoff, batchSize: 5000, maxBatches: 4,
+            });
+            if (deleted > 0) {
+                console.log(`🧹 TTL: deleted ${deleted} ocpp_events rows older than ${OCPP_EVENTS_TTL_DAYS}d`);
             }
         } catch (e) {
             console.error('TTL cleanup error (events):', e.message);
@@ -998,6 +952,11 @@ module.exports = {
 };
 
 if (require.main === module) {
+    if (!TOKEN) {
+        console.error('OCPP_LOGS_TOKEN (or OCPP_DASHBOARD_TOKEN) is required');
+        db.close();
+        process.exit(1);
+    }
     // Start
     connect();
     startPeriodicTasks();

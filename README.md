@@ -54,6 +54,10 @@ and separate activation requirements that apply to any future writer.
 # Install dependencies
 npm install
 
+# Required by ocpp-collector; inject with PM2/secret management in production.
+# Never commit the value.
+export OCPP_LOGS_TOKEN='<read-only monitor token>'
+
 # Start all services
 npm start          # or: pm2 start ecosystem.config.js
 
@@ -70,10 +74,41 @@ All data is stored in SQLite (WAL mode) under `db/`:
 
 | Database | Size | Contents |
 |---|---|---|
-| `db/ocpp.db` | ~10 GB | OCPP charger events (`ocpp_raw`, `ocpp_events`) |
+| `db/ocpp.db` | large; measure on host | OCPP charger events (`ocpp_raw`, `ocpp_events`) |
 | `db/vercel.db` | ~580 MB | Vercel deployment logs |
 | `db/mobile.db` | ~3.4 MB | Mobile app telemetry (`mobile_raw`, `mobile_events`) |
 | `db/logs.db` | ~30 MB | Legacy shared log table (deprecated) |
+
+### OCPP collection and retention
+
+The collector uses WebSocket as the primary transport. Only after 30 seconds
+without an actual log payload does it enable REST recovery. Recovery calls the
+bounded `/api/logs/recent` endpoint every five seconds, schedules each poll
+from completion, coalesces concurrent calls, honors `Retry-After`, and backs off
+exponentially. During a rolling OCPP deployment only, a `404` falls back to
+`/api/logs/history`; other errors never trigger a deep-history fallback.
+
+`ocpp_raw` defaults to 48 hours and `ocpp_events` to seven days. SQLite runs in
+WAL mode with `busy_timeout=5000`; TTL cleanup deletes at most four batches of
+5,000 rows per cycle rather than holding the only writer lock for the entire
+backlog. Do not run `VACUUM` in the hot path.
+
+The database is a derived observability store for alerts, trend analysis and
+suggestions. The Turbo Station dashboard continues to query the OCPP service's
+per-charger files, so a monitor/SQLite outage does not break operator history.
+
+Before changing indexes or retention on an existing production database,
+capture these read-only measurements on the monitor host:
+
+```bash
+sqlite3 db/ocpp.db 'PRAGMA journal_mode; PRAGMA busy_timeout; PRAGMA page_count; PRAGMA freelist_count;'
+sqlite3 db/ocpp.db 'SELECT "ocpp_raw",count(*),min(timestamp),max(timestamp) FROM ocpp_raw UNION ALL SELECT "ocpp_events",count(*),min(timestamp),max(timestamp) FROM ocpp_events;'
+sqlite3 db/ocpp.db 'EXPLAIN QUERY PLAN SELECT * FROM ocpp_events WHERE charger_id=? AND timestamp>=? ORDER BY timestamp DESC LIMIT 100;'
+```
+
+Create a composite index only if the real query plan/latency shows it is needed,
+using an explicit off-peak migration and rollback plan. Never build a large
+index opportunistically during collector startup.
 
 ## Payment-credit release signal
 
