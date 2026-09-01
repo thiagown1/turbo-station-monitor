@@ -54,9 +54,9 @@ and separate activation requirements that apply to any future writer.
 # Install dependencies
 npm install
 
-# Required by ocpp-collector; inject with PM2/secret management in production.
-# Never commit the value.
-export OCPP_LOGS_TOKEN='<read-only monitor token>'
+# Required by ocpp-collector. Put this in the managed production `.env`, which
+# ecosystem.config.js injects into PM2; never commit the real value.
+OCPP_LOGS_TOKEN='<read-only monitor token>'
 
 # Start all services
 npm start          # or: pm2 start ecosystem.config.js
@@ -149,7 +149,12 @@ A signed GitHub `push` webhook for `main` starts `scripts/deploy-monitor.js` as
 an independent worker. The worker waits for the exact commit's `CI` push run to
 finish successfully, fetches and fast-forwards the production checkout, runs a
 clean dependency install, restarts only affected PM2 services, verifies their
-health endpoints, and records the deployed SHA.
+health endpoints, and records the deployed SHA. If `ocpp-collector` is among
+the affected services, the worker first requires a non-empty
+`OCPP_LOGS_TOKEN`/`OCPP_DASHBOARD_TOKEN` from the managed `.env` before changing
+the checkout. After restart it requires two stable PM2 `online` samples; a
+missing secret therefore blocks before merge/install/restart instead of leaving
+the collector in a crash loop or reporting a false-success deploy.
 
 The production checkout must be clean. Local source edits make the deploy fail
 closed so operational hotfixes cannot be overwritten silently. See

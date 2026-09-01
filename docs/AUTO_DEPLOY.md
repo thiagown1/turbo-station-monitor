@@ -13,9 +13,13 @@ The worker publishes only when all of these conditions hold:
 2. The GitHub Actions `CI` push run for that exact SHA completed successfully.
 3. `origin/main` resolves to the same SHA immediately before mutation.
 4. The production checkout has no tracked or untracked source drift.
-5. Dependency installation succeeds.
-6. Every affected PM2 restart succeeds.
-7. Health checks for affected HTTP services return 2xx.
+5. When `ocpp-collector` is affected, its managed `.env` already contains a
+   non-empty `OCPP_LOGS_TOKEN` or legacy `OCPP_DASHBOARD_TOKEN`. This preflight
+   runs before merge, dependency installation, or restart.
+6. Dependency installation succeeds.
+7. Every affected PM2 restart succeeds.
+8. Health checks for affected HTTP services return 2xx; the non-HTTP collector
+   must remain `online` for two consecutive PM2 samples without restarting.
 
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
 is `db/.monitor-deploy.lock`. Both are runtime state and remain outside Git.
@@ -68,6 +72,8 @@ Do not run `git reset --hard` before classifying the drift.
 
 - `GITHUB_WEBHOOK_SECRET`
 - `SUPPORT_API_SECRET` or `MONITOR_API_SECRET`
+- `OCPP_LOGS_TOKEN` (or `OCPP_DASHBOARD_TOKEN`) whenever `ocpp-collector` is
+  selected for restart; provision it in the managed `.env`, not in source
 - `MONITOR_DEPLOY_WHATSAPP_CONV` (falls back to `ALERT_WHATSAPP_CONV`)
 - `SUPPORT_API_BASE` (defaults to `http://127.0.0.1:3005`)
 - Working authenticated `gh`, `git`, `npm`, and PM2 installations at the paths

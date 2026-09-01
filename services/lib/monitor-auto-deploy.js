@@ -70,6 +70,19 @@ function servicesForFiles(files) {
   return services;
 }
 
+function assertServiceEnvironment(services, env = process.env) {
+  const selected = new Set(services || []);
+  if (selected.has('ocpp-collector')) {
+    const token = String(env.OCPP_LOGS_TOKEN || env.OCPP_DASHBOARD_TOKEN || '').trim();
+    if (!token) {
+      throw new Error(
+        'ocpp-collector requires OCPP_LOGS_TOKEN (or OCPP_DASHBOARD_TOKEN) ' +
+        'in the managed .env before deployment; no service was restarted'
+      );
+    }
+  }
+}
+
 function execFilePromise(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     execFile(command, args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, ...options }, (error, stdout, stderr) => {
@@ -146,6 +159,47 @@ async function verifyHealth(services, { check = requestHealth, sleepFn = sleep, 
     }
     if (lastError) throw new Error(`${service} health check failed: ${lastError.message}`);
   }
+}
+
+async function verifyPm2Online(services, {
+  run = execFilePromise,
+  sleepFn = sleep,
+  pm2Bin = process.env.PM2_BIN || '/home/openclaw/.npm-global/bin/pm2',
+  repoDir,
+  attempts = 12,
+  stableSamples = 2,
+} = {}) {
+  const selected = [...new Set(services || [])];
+  if (!selected.length) return;
+
+  const stable = new Map();
+  let lastDescription = 'not found';
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const { stdout } = await run(pm2Bin, ['jlist'], { cwd: repoDir, timeout: 30000 });
+    let apps;
+    try {
+      apps = JSON.parse(stdout || '[]');
+    } catch (error) {
+      throw new Error(`PM2 process health returned invalid JSON: ${error.message}`);
+    }
+
+    let allStable = true;
+    for (const service of selected) {
+      const app = apps.find((candidate) => candidate?.name === service);
+      const status = app?.pm2_env?.status || 'missing';
+      const restartTime = Number(app?.pm2_env?.restart_time ?? -1);
+      lastDescription = `${service} is ${status} (restarts=${restartTime})`;
+      const previous = stable.get(service);
+      const count = status === 'online' && previous?.restartTime === restartTime
+        ? previous.count + 1
+        : status === 'online' ? 1 : 0;
+      stable.set(service, { restartTime, count });
+      if (count < stableSamples) allStable = false;
+    }
+    if (allStable) return;
+    if (attempt < attempts) await sleepFn(1000);
+  }
+  throw new Error(`PM2 service health failed: ${lastDescription}`);
 }
 
 function readStateSha(statePath, fallbackSha, fsImpl = fs) {
@@ -274,6 +328,8 @@ async function deployMonitor({
   run = execFilePromise,
   waitForCi = waitForSuccessfulCi,
   checkHealth = verifyHealth,
+  checkProcesses = verifyPm2Online,
+  env = process.env,
   fsImpl = fs,
   gitBin = process.env.GIT_BIN || '/usr/bin/git',
   npmBin = process.env.NPM_BIN || '/usr/bin/npm',
@@ -323,6 +379,9 @@ async function deployMonitor({
     const { stdout: diffOut } = await run(gitBin, ['diff', '--name-only', deployedSha, targetSha], { cwd: repoDir });
     const changedFiles = diffOut.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const services = servicesForFiles(changedFiles);
+    // This runs before merge/install/restart so a missing secret cannot leave
+    // new code on disk with the collector in a PM2 crash loop.
+    assertServiceEnvironment(services, env);
 
     if (headSha !== targetSha) {
       await run(gitBin, ['merge', '--ff-only', targetSha], { cwd: repoDir });
@@ -338,6 +397,10 @@ async function deployMonitor({
 
     await restartServices(immediateServices, { run, pm2Bin, repoDir });
     await checkHealth(immediateServices);
+    await checkProcesses(
+      immediateServices.filter((service) => service === 'ocpp-collector'),
+      { run, pm2Bin, repoDir }
+    );
     await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
 
     fsImpl.writeFileSync(statePath, `${targetSha}\n`, 'utf8');
@@ -424,6 +487,8 @@ module.exports = {
   servicesForFiles,
   waitForSuccessfulCi,
   verifyHealth,
+  verifyPm2Online,
+  assertServiceEnvironment,
   deployMonitor,
   acquireLockWithRetry,
   execFilePromise,

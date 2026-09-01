@@ -52,6 +52,10 @@ module.exports = {
       instances: 1,
       exec_mode: 'fork',
       autorestart: true,
+      // Fail visibly instead of spinning forever if a required secret or
+      // startup dependency is unavailable. Auto-deploy also preflights the
+      // collector token before this process is touched.
+      max_restarts: 10,
       watch: false,
       max_memory_restart: '200M',
       error_file: './logs/collector-error.log',

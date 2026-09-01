@@ -13,6 +13,8 @@ const {
   deployMonitor,
   notifyDeploy,
   restartServices,
+  assertServiceEnvironment,
+  verifyPm2Online,
   SELF_SERVICE,
 } = require('../services/lib/monitor-auto-deploy');
 
@@ -44,6 +46,51 @@ async function expectReject(name, fn, pattern) {
     [...ALL_SERVICES].sort()
   );
   console.log('  ✅ maps the real git diff to affected PM2 services');
+
+  assert.throws(
+    () => assertServiceEnvironment(['ocpp-collector'], {}),
+    /OCPP_LOGS_TOKEN.*before deployment/
+  );
+  assert.doesNotThrow(() => assertServiceEnvironment(
+    ['ocpp-collector'],
+    { OCPP_LOGS_TOKEN: 'read-only-test-token' }
+  ));
+  assert.doesNotThrow(() => assertServiceEnvironment(['support-copilot'], {}));
+  assert.match(
+    fs.readFileSync(path.join(__dirname, '..', '.env.example'), 'utf8'),
+    /^OCPP_LOGS_TOKEN=$/m
+  );
+  const collectorApp = require('../ecosystem.config').apps.find((app) => app.name === 'ocpp-collector');
+  assert.strictEqual(collectorApp.max_restarts, 10, 'collector crash loops are bounded');
+  console.log('  ✅ requires and documents the collector token before restart');
+
+  let pm2Samples = 0;
+  await verifyPm2Online(['ocpp-collector'], {
+    run: async (_command, args) => {
+      assert.deepStrictEqual(args, ['jlist']);
+      pm2Samples += 1;
+      return { stdout: JSON.stringify([{
+        name: 'ocpp-collector',
+        pm2_env: { status: 'online', restart_time: 0 },
+      }]) };
+    },
+    sleepFn: async () => {},
+    attempts: 2,
+    stableSamples: 2,
+  });
+  assert.strictEqual(pm2Samples, 2);
+  await expectReject(
+    'collector not online',
+    () => verifyPm2Online(['ocpp-collector'], {
+      run: async () => ({ stdout: JSON.stringify([{
+        name: 'ocpp-collector', pm2_env: { status: 'errored', restart_time: 10 },
+      }]) }),
+      sleepFn: async () => {},
+      attempts: 1,
+    }),
+    /ocpp-collector.*errored/
+  );
+  console.log('  ✅ verifies the non-HTTP collector stays online after restart');
 
   await expectReject(
     'failed CI',
@@ -134,6 +181,34 @@ async function expectReject(name, fn, pattern) {
   assert.ok(!dirtyCalls.some((call) => call.includes('merge')));
   assert.ok(!dirtyCalls.some((call) => call.includes('ci')));
   console.log('  ✅ refuses a dirty production checkout before changing it');
+
+  const missingTokenDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-missing-token-'));
+  fs.mkdirSync(path.join(missingTokenDir, 'db'), { recursive: true });
+  const missingTokenCalls = [];
+  await expectReject(
+    'missing collector token preflight',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: missingTokenDir,
+      env: {},
+      run: async (command, args) => {
+        missingTokenCalls.push([command, ...args]);
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'fetch') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+        if (args[0] === 'status') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+        if (args[0] === 'diff') return { stdout: 'services/smart-collector.js\n' };
+        return { stdout: '' };
+      },
+      checkHealth: async () => { throw new Error('preflight must run before health checks'); },
+    }),
+    /OCPP_LOGS_TOKEN.*before deployment/
+  );
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'merge'));
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'restart'));
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'ci'));
+  console.log('  ✅ blocks collector deploy before merge/install/restart when its token is absent');
 
   const cleanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-clean-'));
   fs.mkdirSync(path.join(cleanDir, 'services', 'support-copilot'), { recursive: true });
@@ -293,6 +368,8 @@ async function expectReject(name, fn, pattern) {
     sha: NEW_SHA,
     repoDir: selfDir,
     run: selfRun,
+    env: { OCPP_LOGS_TOKEN: 'read-only-test-token' },
+    checkProcesses: async (services) => assert.deepStrictEqual(services, ['ocpp-collector']),
     checkHealth: async (services) => { healthChecked = services; },
   });
 
