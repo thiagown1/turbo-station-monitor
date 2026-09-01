@@ -37,6 +37,7 @@ function createOcppLogPoller(options) {
   let timer = null;
   let inFlight = null;
   let cursorIso = null;
+  let pageCursor = null;
   let backoffMs = intervalMs;
   let generation = 0;
 
@@ -47,6 +48,9 @@ function createOcppLogPoller(options) {
       'start_time',
       cursorIso || new Date(now() - bootstrapMs).toISOString(),
     );
+    if (pathname === '/api/logs/recent' && pageCursor) {
+      params.set('cursor', pageCursor);
+    }
     return `${baseUrl}${pathname}?${params.toString()}`;
   }
 
@@ -144,13 +148,27 @@ function createOcppLogPoller(options) {
     // Once the page is drained, resume_from also skips scanned raw records that
     // did not match a filter. During pagination it must not jump past entries
     // still advertised by has_more.
+    const nextPageCursor = typeof body?.data?.next_cursor === 'string'
+      ? body.data.next_cursor
+      : null;
     if (!hasMore) {
+      pageCursor = null;
       const resumeCursor = cursorAfter(body?.data?.resume_from);
       if (resumeCursor && (!nextCursor || resumeCursor > nextCursor)) {
         nextCursor = resumeCursor;
       }
+      if (nextCursor) cursorIso = nextCursor;
+    } else if (nextPageCursor) {
+      // Keep the original time anchor while draining this bounded snapshot.
+      // The opaque server cursor carries an exclusive timestamp tie-breaker,
+      // so equal-millisecond records neither loop nor get skipped.
+      pageCursor = nextPageCursor;
+    } else {
+      // Compatibility with the first rolling-deployment version, which paged
+      // only by timestamp. The new server always supplies next_cursor.
+      pageCursor = null;
+      if (nextCursor) cursorIso = nextCursor;
     }
-    if (nextCursor) cursorIso = nextCursor;
 
     backoffMs = intervalMs;
     if (ingested > 0) {

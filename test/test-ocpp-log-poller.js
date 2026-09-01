@@ -73,6 +73,7 @@ test('truncated recovery records the gap, consumes the page, and keeps draining'
     fetchFn: async () => response(200, { data: {
       truncated: true,
       has_more: true,
+      next_cursor: 'bounded-page-2',
       resume_from: '2026-09-01T12:00:05Z',
       entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'x' }],
     } }),
@@ -85,7 +86,7 @@ test('truncated recovery records the gap, consumes the page, and keeps draining'
   assert.equal(result.continuityLost, true);
   assert.equal(result.nextDelayMs, 0);
   assert.equal(processed.length, 1);
-  assert.equal(poller.getCursor(), '2026-09-01T12:00:00.001Z');
+  assert.equal(poller.getCursor(), null);
   assert.match(errors[0], /continuity gap/);
 });
 
@@ -104,6 +105,40 @@ test('an empty truncated page reanchors at resume_from instead of looping foreve
 
   await poller.pollOnce();
   assert.equal(poller.getCursor(), '2026-09-01T12:00:05.001Z');
+});
+
+test('bounded pages use the opaque cursor without skipping equal timestamps', async () => {
+  const urls = [];
+  let call = 0;
+  const poller = createOcppLogPoller({
+    fetchFn: async (url) => {
+      urls.push(url);
+      call += 1;
+      return call === 1
+        ? response(200, { data: {
+          has_more: true,
+          next_cursor: 'opaque-page-2',
+          entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'first' }],
+        } })
+        : response(200, { data: {
+          has_more: false,
+          resume_from: '2026-09-01T12:00:00Z',
+          entries: [{ timestamp: '2026-09-01T12:00:00Z', message: 'second' }],
+        } });
+    },
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    now: () => Date.parse('2026-09-01T12:00:45Z'),
+  });
+
+  await poller.pollOnce();
+  await poller.pollOnce();
+
+  const first = new URL(urls[0]);
+  const second = new URL(urls[1]);
+  assert.equal(second.searchParams.get('cursor'), 'opaque-page-2');
+  assert.equal(second.searchParams.get('start_time'), first.searchParams.get('start_time'));
+  assert.equal(poller.getCursor(), '2026-09-01T12:00:00.001Z');
 });
 
 test('scheduler waits for completion and honors Retry-After without overlap', async () => {
