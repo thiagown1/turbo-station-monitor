@@ -38,6 +38,7 @@ function createOcppLogPoller(options) {
   let inFlight = null;
   let cursorIso = null;
   let backoffMs = intervalMs;
+  let generation = 0;
 
   function buildUrl(pathname) {
     const params = new URLSearchParams();
@@ -174,8 +175,8 @@ function createOcppLogPoller(options) {
     return inFlight;
   }
 
-  function schedule(delayMs) {
-    if (!started) return;
+  function schedule(delayMs, scheduledGeneration = generation) {
+    if (!started || scheduledGeneration !== generation) return;
     timer = setTimeoutFn(async () => {
       let nextDelayMs = intervalMs;
       try {
@@ -186,10 +187,10 @@ function createOcppLogPoller(options) {
         backoffMs = Math.min(maxBackoffMs, Math.max(intervalMs, backoffMs * 2));
         nextDelayMs = retryAfterMs == null
           ? backoffMs
-          : Math.min(maxBackoffMs, Math.max(intervalMs, retryAfterMs));
+          : Math.max(intervalMs, retryAfterMs);
         logger.error('[rest-poll] error:', error.message);
       } finally {
-        schedule(nextDelayMs);
+        schedule(nextDelayMs, scheduledGeneration);
       }
     }, delayMs);
   }
@@ -197,11 +198,13 @@ function createOcppLogPoller(options) {
   function start() {
     if (started) return;
     started = true;
-    schedule(0);
+    generation += 1;
+    schedule(0, generation);
   }
 
   function stop() {
     started = false;
+    generation += 1;
     if (timer) clearTimeoutFn(timer);
     timer = null;
   }

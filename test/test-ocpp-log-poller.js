@@ -148,6 +148,58 @@ test('scheduler waits for completion and honors Retry-After without overlap', as
   poller.stop();
 });
 
+test('Retry-After is not shortened by the local exponential-backoff cap', async () => {
+  const scheduled = [];
+  const poller = createOcppLogPoller({
+    fetchFn: async () => response(429, {}, { 'retry-after': '300' }),
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    intervalMs: 5000,
+    maxBackoffMs: 60_000,
+    setTimeoutFn: (fn, delay) => {
+      scheduled.push({ fn, delay });
+      return scheduled.length;
+    },
+    clearTimeoutFn: () => {},
+    logger: { log: () => {}, error: () => {} },
+  });
+
+  poller.start();
+  await scheduled.shift().fn();
+
+  assert.equal(scheduled.at(-1).delay, 300_000);
+  poller.stop();
+});
+
+test('a stopped scheduler generation cannot reschedule after restart', async () => {
+  const scheduled = [];
+  let resolveFetch;
+  const poller = createOcppLogPoller({
+    fetchFn: async () => new Promise((resolve) => { resolveFetch = resolve; }),
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    intervalMs: 5000,
+    setTimeoutFn: (fn, delay) => {
+      scheduled.push({ fn, delay });
+      return scheduled.length;
+    },
+    clearTimeoutFn: () => {},
+  });
+
+  poller.start();
+  const staleTick = scheduled.shift().fn();
+  poller.stop();
+  poller.start();
+  const currentTick = scheduled.shift().fn();
+
+  resolveFetch(response(200, { data: { entries: [] } }));
+  await Promise.all([staleTick, currentTick]);
+
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduled[0].delay, 5000);
+  poller.stop();
+});
+
 test('Retry-After supports seconds and HTTP dates', () => {
   const now = Date.parse('2026-09-01T12:00:00Z');
   assert.equal(parseRetryAfter('2', now), 2000);
