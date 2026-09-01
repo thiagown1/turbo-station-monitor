@@ -87,15 +87,17 @@ bounded `/api/logs/recent` endpoint every five seconds, schedules each poll
 from completion, coalesces concurrent calls, honors `Retry-After`, and backs off
 exponentially. During a rolling OCPP deployment only, a `404` falls back to
 `/api/logs/history`; other errors never trigger a deep-history fallback.
-Each HTTP request is aborted after ten seconds. A busy bounded tail is drained
-oldest-page-first with zero delay between pages. If the raw cap was exhausted,
+Each HTTP request, including JSON body consumption, is aborted after ten
+seconds. A busy bounded tail is drained oldest-page-first with zero delay
+between pages. If the raw cap was exhausted,
 the collector logs an explicit continuity gap, consumes the available rows and
 reanchors from server metadata instead of retrying the same page forever.
 
 `ocpp_raw` defaults to 48 hours and `ocpp_events` to seven days. SQLite runs in
-WAL mode with `busy_timeout=5000`; TTL cleanup deletes at most four batches of
-5,000 rows per cycle rather than holding the only writer lock for the entire
-backlog. Do not run `VACUUM` in the hot path.
+WAL mode with `busy_timeout=5000`; each TTL cycle deletes at most four batches
+of 5,000 rows. A saturated cycle schedules another pass through `setImmediate`,
+yielding the event loop and SQLite writer lock between bounded passes until the
+expired backlog is drained. Do not run `VACUUM` in the hot path.
 
 The database is a derived observability store for alerts, trend analysis and
 suggestions. The Turbo Station dashboard continues to query the OCPP service's

@@ -40,4 +40,51 @@ function deleteExpiredInChunks(db, options) {
   return deleted;
 }
 
-module.exports = { deleteExpiredInChunks };
+function createRetentionDrainer(options) {
+  const {
+    runCycle,
+    scheduleFn = setImmediate,
+    onError = (error) => { throw error; },
+  } = options;
+
+  if (typeof runCycle !== 'function') throw new TypeError('runCycle is required');
+  if (typeof scheduleFn !== 'function') throw new TypeError('scheduleFn must be a function');
+  if (typeof onError !== 'function') throw new TypeError('onError must be a function');
+
+  let active = false;
+
+  function run() {
+    if (!active) return;
+    let saturated;
+    try {
+      saturated = Boolean(runCycle());
+    } catch (error) {
+      active = false;
+      onError(error);
+      return;
+    }
+
+    if (saturated) {
+      // Yield between bounded deletion cycles so pending collector writes get
+      // a chance to acquire SQLite's single-writer lock.
+      scheduleFn(run);
+    } else {
+      active = false;
+    }
+  }
+
+  return {
+    start() {
+      if (active) return false;
+      active = true;
+      run();
+      return true;
+    },
+    stop() {
+      active = false;
+    },
+    isActive: () => active,
+  };
+}
+
+module.exports = { createRetentionDrainer, deleteExpiredInChunks };

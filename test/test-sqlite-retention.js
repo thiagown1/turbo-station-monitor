@@ -7,7 +7,10 @@ const path = require('node:path');
 const test = require('node:test');
 const Database = require('better-sqlite3');
 
-const { deleteExpiredInChunks } = require('../services/lib/sqlite-retention');
+const {
+  createRetentionDrainer,
+  deleteExpiredInChunks,
+} = require('../services/lib/sqlite-retention');
 
 test('retention deletes bounded batches and keeps fresh rows', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ocpp-retention-'));
@@ -38,4 +41,29 @@ test('retention rejects an interpolated table name', () => {
     () => deleteExpiredInChunks({}, { table: 'ocpp_raw; DROP TABLE x', cutoff: 1 }),
     /unsafe SQLite table/,
   );
+});
+
+test('retention keeps yielding while a cycle is saturated and coalesces starts', () => {
+  const scheduled = [];
+  let cycles = 0;
+  const drainer = createRetentionDrainer({
+    runCycle: () => {
+      cycles += 1;
+      return cycles < 3;
+    },
+    scheduleFn: (fn) => scheduled.push(fn),
+  });
+
+  assert.equal(drainer.start(), true);
+  assert.equal(cycles, 1);
+  assert.equal(scheduled.length, 1);
+  assert.equal(drainer.start(), false);
+
+  scheduled.shift()();
+  assert.equal(cycles, 2);
+  assert.equal(scheduled.length, 1);
+  scheduled.shift()();
+  assert.equal(cycles, 3);
+  assert.equal(scheduled.length, 0);
+  assert.equal(drainer.isActive(), false);
 });

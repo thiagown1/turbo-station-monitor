@@ -63,10 +63,10 @@ function createOcppLogPoller(options) {
       : new Date(timestampMs + 1).toISOString();
   }
 
-  async function fetchWithTimeout(url, options) {
+  async function fetchJsonWithTimeout(url, options) {
     const controller = new AbortController();
     let timeout;
-    const deadline = new Promise((resolve, reject) => {
+    const deadline = new Promise((_resolve, reject) => {
       timeout = setRequestTimeoutFn(() => {
         controller.abort();
         reject(new Error(`REST request timed out after ${requestTimeoutMs}ms`));
@@ -75,7 +75,13 @@ function createOcppLogPoller(options) {
 
     try {
       return await Promise.race([
-        fetchFn(url, { ...options, signal: controller.signal }),
+        (async () => {
+          const response = await fetchFn(url, { ...options, signal: controller.signal });
+          // Keep the same deadline active through body consumption. Receiving
+          // headers is not completion when a server can stall or trickle JSON.
+          const body = response.ok ? await response.json() : null;
+          return { response, body };
+        })(),
         deadline,
       ]);
     } finally {
@@ -84,23 +90,23 @@ function createOcppLogPoller(options) {
   }
 
   async function fetchRecoveryPage() {
-    let response = await fetchWithTimeout(buildUrl('/api/logs/recent'), {
+    let result = await fetchJsonWithTimeout(buildUrl('/api/logs/recent'), {
       headers: { Authorization: `Bearer ${token}` },
     });
 
     // Allows a safe rolling deployment: old OCPP servers do not expose the
     // bounded endpoint yet. Once the server is upgraded, the hot path no longer
     // touches deep history.
-    if (response.status === 404) {
-      response = await fetchWithTimeout(buildUrl('/api/logs/history'), {
+    if (result.response.status === 404) {
+      result = await fetchJsonWithTimeout(buildUrl('/api/logs/history'), {
         headers: { Authorization: `Bearer ${token}` },
       });
     }
-    return response;
+    return result;
   }
 
   async function runPoll() {
-    const response = await fetchRecoveryPage();
+    const { response, body } = await fetchRecoveryPage();
     if (!response.ok) {
       const retryAfterMs = parseRetryAfter(response.headers?.get?.('retry-after'), now());
       const error = new Error(`REST ${response.status}`);
@@ -109,7 +115,6 @@ function createOcppLogPoller(options) {
       throw error;
     }
 
-    const body = await response.json();
     const entries = body?.data?.entries || [];
     if (!Array.isArray(entries)) throw new Error('REST payload has no entries array');
     const continuityLost = Boolean(body?.data?.truncated);

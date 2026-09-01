@@ -180,3 +180,35 @@ test('a stalled recovery request aborts at its deadline', async () => {
   await assert.rejects(pending, /timed out/);
   assert.equal(seenSignal.aborted, true);
 });
+
+test('the request deadline remains active while the JSON body is stalled', async () => {
+  const requestTimers = [];
+  let seenSignal;
+  const poller = createOcppLogPoller({
+    fetchFn: async (url, options) => {
+      seenSignal = options.signal;
+      return {
+        status: 200,
+        ok: true,
+        headers: { get: () => null },
+        json: async () => new Promise(() => {}),
+      };
+    },
+    baseUrl: 'https://logs.example', token: 'test',
+    processEntry: () => {}, isDuplicate: () => false,
+    requestTimeoutMs: 10_000,
+    setRequestTimeoutFn: (fn, delay) => {
+      requestTimers.push({ fn, delay });
+      return requestTimers.length;
+    },
+    clearRequestTimeoutFn: () => {},
+  });
+
+  const pending = poller.pollOnce();
+  await Promise.resolve();
+  assert.equal(requestTimers[0].delay, 10_000);
+  requestTimers[0].fn();
+
+  await assert.rejects(pending, /timed out/);
+  assert.equal(seenSignal.aborted, true);
+});

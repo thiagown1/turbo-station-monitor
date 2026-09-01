@@ -4,7 +4,7 @@ const path = require('path');
 const Database = require('better-sqlite3');
 const StateTracker = require('./state-tracker');
 const { createOcppLogPoller } = require('./lib/ocpp-log-poller');
-const { deleteExpiredInChunks } = require('./lib/sqlite-retention');
+const { createRetentionDrainer, deleteExpiredInChunks } = require('./lib/sqlite-retention');
 
 // Config
 const WS_URL = process.env.OCPP_LOGS_WS_URL || 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
@@ -872,13 +872,19 @@ function startPeriodicTasks() {
 
     // TTL cleanup for ocpp_raw
     // Keep it cheap: delete old rows and let SQLite reuse pages; VACUUM can be done manually/off-peak.
-    setInterval(() => {
+    const retentionDrainer = createRetentionDrainer({
+      runCycle: () => {
+        let saturated = false;
+        const batchSize = 5000;
+        const maxBatches = 4;
+
         try {
             const ttlMs = OCPP_RAW_TTL_HOURS * 60 * 60 * 1000;
             const cutoff = Date.now() - ttlMs;
             const deleted = deleteExpiredInChunks(db, {
-                table: 'ocpp_raw', cutoff, batchSize: 5000, maxBatches: 4,
+                table: 'ocpp_raw', cutoff, batchSize, maxBatches,
             });
+            saturated = saturated || deleted === batchSize * maxBatches;
             if (deleted > 0) {
                 console.log(`🧹 TTL: deleted ${deleted} ocpp_raw rows older than ${OCPP_RAW_TTL_HOURS}h`);
             }
@@ -891,15 +897,20 @@ function startPeriodicTasks() {
             const eventsTtlMs = OCPP_EVENTS_TTL_DAYS * 24 * 60 * 60 * 1000;
             const eventsCutoff = Date.now() - eventsTtlMs;
             const deleted = deleteExpiredInChunks(db, {
-                table: 'ocpp_events', cutoff: eventsCutoff, batchSize: 5000, maxBatches: 4,
+                table: 'ocpp_events', cutoff: eventsCutoff, batchSize, maxBatches,
             });
+            saturated = saturated || deleted === batchSize * maxBatches;
             if (deleted > 0) {
                 console.log(`🧹 TTL: deleted ${deleted} ocpp_events rows older than ${OCPP_EVENTS_TTL_DAYS}d`);
             }
         } catch (e) {
             console.error('TTL cleanup error (events):', e.message);
         }
-    }, OCPP_RAW_TTL_CLEAN_INTERVAL_MS);
+        return saturated;
+      },
+      onError: (error) => console.error('TTL cleanup error:', error.message),
+    });
+    setInterval(() => retentionDrainer.start(), OCPP_RAW_TTL_CLEAN_INTERVAL_MS);
 
     // Clean transaction -1 error counters every hour
     setInterval(() => {
