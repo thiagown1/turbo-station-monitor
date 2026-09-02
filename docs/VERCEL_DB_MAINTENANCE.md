@@ -75,6 +75,26 @@ diagnostic boundary described above.
 `--force` does not alter the 14-day cutoff, chunk size, aggregation, or
 no-`VACUUM` policy. Unknown command-line arguments fail closed.
 
+## Physical disk boundary
+
+Chunked `DELETE` frees SQLite pages for reuse but does not shrink the physical
+`vercel.db` file. The live cleanup keeps one PASSIVE checkpoint after deletion;
+this avoids an exclusive checkpoint and normally bounds WAL growth, but it does
+not truncate a WAL while readers are busy and does not guarantee immediate disk
+reclaim. Dry-run performs no checkpoint at all.
+
+There is no read-only operation that reclaims physical SQLite space. Safe
+read-only assessment can measure the files with `stat`/`du` and inspect
+`page_count`/`freelist_count` on a controlled snapshot. Do not run even nominal
+read-only SQLite diagnostics against the live WAL source under the dry-run
+contract, because they can touch shared-memory sidecars.
+
+If assessment proves physical reclaim is necessary, design it as a separate
+maintenance operation, for example a validated `VACUUM INTO`/backup-and-swap on
+a different target with enough headroom. That requires its own authorization,
+backup/restore proof, writer coordination, health checks, and rollback plan;
+this runbook does not authorize or execute it.
+
 ## Verification and rollback
 
 The safety regression suite uses disposable SQLite databases only:
