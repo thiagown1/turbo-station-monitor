@@ -6,8 +6,10 @@ const path = require('path');
 const { execFile } = require('child_process');
 const {
   REQUIRED_MONITOR_PROCESSES,
-  parsePm2Inventory,
+  parsePm2Apps,
+  inventoryCounts,
   assertRequiredInventory,
+  assertProcessStatuses,
   hasUnixSocketListener,
 } = require('./pm2-topology');
 
@@ -289,8 +291,13 @@ async function assertPm2PersistenceSafe({
   } catch (error) {
     throw new Error(`persisted PM2 inventory is unavailable at ${dumpPath}: ${error.message}`);
   }
-  const persisted = parsePm2Inventory(persistedRaw, 'persisted PM2 inventory');
+  const persistedApps = parsePm2Apps(persistedRaw, 'persisted PM2 inventory');
+  const persisted = inventoryCounts(persistedApps);
   assertRequiredInventory(persisted, { label: 'persisted PM2 inventory' });
+  assertProcessStatuses(persistedApps, {
+    requiredOnline: REQUIRED_MONITOR_PROCESSES,
+    label: 'persisted PM2 inventory',
+  });
 
   let procNetUnix;
   try {
@@ -303,7 +310,12 @@ async function assertPm2PersistenceSafe({
   }
 
   const { stdout } = await run(pm2Bin, ['jlist'], { cwd: repoDir, timeout: 30000 });
-  const live = parsePm2Inventory(stdout, 'live PM2 inventory');
+  const liveApps = parsePm2Apps(stdout, 'live PM2 inventory');
+  const live = inventoryCounts(liveApps);
+  assertProcessStatuses(liveApps, {
+    requiredOnline: REQUIRED_MONITOR_PROCESSES,
+    label: 'live PM2 inventory',
+  });
 
   const missing = [];
   for (const [name, expectedCount] of persisted) {

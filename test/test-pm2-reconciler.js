@@ -94,6 +94,17 @@ test('approved dump requires the curated monitor core and exact readable executa
   assert.equal(approved.processes.size, fixture.apps.length);
   assert.equal(approved.requiredOnline.size, REQUIRED_MONITOR_PROCESSES.length);
 
+  const stoppedDump = fixture.apps.map((app) => app.name === 'alert-engine'
+    ? { ...app, pm2_env: { ...app.pm2_env, status: 'stopped' } }
+    : app);
+  assert.throws(
+    () => validateApprovedDump({
+      manifestRaw: JSON.stringify(fixture.manifest),
+      dumpRaw: JSON.stringify(stoppedDump),
+    }),
+    /alert-engine.*stopped/i,
+  );
+
   const incompleteManifest = {
     ...fixture.manifest,
     processes: fixture.manifest.processes.filter((p) => p.name !== 'whatsapp-gateway'),
@@ -205,6 +216,13 @@ test('invalid dump, unexpected apps, errored apps and crash loops fail without f
         ? { ...app, pm2_env: { ...app.pm2_env, status: 'errored' } }
         : app),
       pattern: /alert-engine.*errored/i,
+    },
+    {
+      name: 'registered cron errored',
+      apps: (f) => f.apps.map((app) => app.name === 'cleanup-vercel-db'
+        ? { ...app, pm2_env: { ...app.pm2_env, status: 'errored' } }
+        : app),
+      pattern: /cleanup-vercel-db.*errored/i,
     },
     {
       name: 'crash-loop',

@@ -52,11 +52,50 @@ async function expectReject(name, fn, pattern) {
   const dumpPath = path.join(pm2FixtureDir, 'dump.pm2');
   const procNetUnixPath = path.join(pm2FixtureDir, 'proc-net-unix');
   const socketPath = path.join(pm2FixtureDir, 'rpc.sock');
-  const requiredApps = REQUIRED_MONITOR_PROCESSES.map((name) => ({ name }));
+  const requiredApps = REQUIRED_MONITOR_PROCESSES.map((name) => ({
+    name,
+    pm2_env: { status: 'online' },
+  }));
   fs.writeFileSync(dumpPath, JSON.stringify(requiredApps));
   fs.writeFileSync(
     procNetUnixPath,
     `Num RefCount Protocol Flags Type St Inode Path\n0001: 00000002 00000000 00010000 0001 01 42 ${socketPath}\n`
+  );
+
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps.map((app) => (
+    app.name === 'alert-engine'
+      ? { ...app, pm2_env: { status: 'stopped' } }
+      : app
+  ))));
+  let stoppedDumpCliCalls = 0;
+  await expectReject(
+    'stopped required process in persisted PM2 topology',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => { stoppedDumpCliCalls += 1; return { stdout: '[]' }; },
+    }),
+    /persisted.*alert-engine.*stopped/i
+  );
+  assert.strictEqual(stoppedDumpCliCalls, 0, 'stopped persisted service is rejected before jlist');
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps));
+
+  await expectReject(
+    'stopped required process in live PM2 topology',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => ({
+        stdout: JSON.stringify(requiredApps.map((app) => (
+          app.name === 'support-copilot'
+            ? { ...app, pm2_env: { status: 'errored' } }
+            : app
+        ))),
+      }),
+    }),
+    /live.*support-copilot.*errored/i
   );
   const safeTopology = await assertPm2PersistenceSafe({
     dumpPath,

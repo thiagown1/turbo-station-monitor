@@ -21,7 +21,8 @@ and daemon recovery cannot mutate PM2 concurrently. On every run it:
 
 The persisted dump is re-read and revalidated immediately before the systemd
 restart. An unapproved/changed dump, unexpected live process, path mismatch,
-present-but-stopped/errored required process, or three unstable restarts fails
+present-but-stopped/errored required process, errored scheduled registration,
+or three unstable restarts fails
 with a non-zero systemd result and a structured journal line. Those cases need
 targeted diagnosis; the watchdog never enters a whole-daemon restart loop.
 Successful recovery is rate-limited to once per 15 minutes. The timestamp is

@@ -42,12 +42,13 @@ Changes to `ecosystem.config.js`, root dependency manifests, or shared
 changes restart only the corresponding PM2 process.
 
 Before any merge, install, restart, or save, the worker reads the existing
-`dump.pm2`, verifies the required monitor core, and confirms a live listening
-PM2 RPC socket through `/proc/net/unix`. It never calls `pm2 jlist` against an
-absent daemon because that command can create a new empty daemon. After the
-targeted restarts it repeats the live-versus-saved comparison immediately
-before `pm2 save`; missing and unexpected entries both fail closed. A docs-only
-deploy does not touch PM2 and therefore does not rewrite the saved topology.
+`dump.pm2`, verifies that the required monitor core was saved online, and
+confirms a live listening PM2 RPC socket through `/proc/net/unix`. It never
+calls `pm2 jlist` against an absent daemon because that command can create a new
+empty daemon. After the targeted restarts it repeats the live-versus-saved
+comparison immediately before `pm2 save`; missing, unexpected, stopped, and
+errored required entries all fail closed. A docs-only deploy does not touch PM2
+and therefore does not rewrite the saved topology.
 
 ## Failure behavior
 

@@ -98,7 +98,12 @@ function classifyLiveTopology(liveApps, approved, crashLoopThreshold) {
     const spec = approved.processes.get(name);
     if (!spec) continue;
     if (app.execPath !== spec.execPath) pathMismatches.push(`${name} (${app.execPath || '(empty)'})`);
-    if (spec.mode === 'online' && app.status !== 'online') notOnline.push(`${name} is ${app.status}`);
+    if (spec.mode === 'online' && app.status !== 'online') {
+      notOnline.push(`${name} is ${app.status}`);
+    }
+    if (spec.mode === 'registered' && !['online', 'stopped'].includes(app.status)) {
+      notOnline.push(`${name} is ${app.status}`);
+    }
     if (app.unstableRestarts >= crashLoopThreshold) {
       crashLoops.push(`${name} has ${app.unstableRestarts} unstable restarts`);
     }

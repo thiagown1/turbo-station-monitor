@@ -135,10 +135,22 @@ function validateApprovedDump({
     }
   }
 
+  const requiredOnline = [...processes.values()]
+    .filter((processSpec) => processSpec.mode === 'online')
+    .map((processSpec) => processSpec.name);
+  const registeredOnly = [...processes.values()]
+    .filter((processSpec) => processSpec.mode === 'registered')
+    .map((processSpec) => processSpec.name);
+  assertProcessStatuses(apps, {
+    requiredOnline,
+    registeredOnly,
+    label: 'persisted PM2 inventory',
+  });
+
   return {
     processes,
-    requiredOnline: new Set([...processes.values()].filter((p) => p.mode === 'online').map((p) => p.name)),
-    registeredOnly: new Set([...processes.values()].filter((p) => p.mode === 'registered').map((p) => p.name)),
+    requiredOnline: new Set(requiredOnline),
+    registeredOnly: new Set(registeredOnly),
     dumpApps: apps,
     dumpFingerprint: crypto.createHash('sha256').update(String(dumpRaw)).digest('hex'),
   };
@@ -148,6 +160,26 @@ function inventoryCounts(apps) {
   const counts = new Map();
   for (const app of apps || []) counts.set(app.name, (counts.get(app.name) || 0) + 1);
   return counts;
+}
+
+function assertProcessStatuses(apps, {
+  requiredOnline = [],
+  registeredOnly = [],
+  label = 'PM2 inventory',
+} = {}) {
+  const modes = new Map([
+    ...requiredOnline.map((name) => [name, new Set(['online'])]),
+    ...registeredOnly.map((name) => [name, new Set(['online', 'stopped'])]),
+  ]);
+  const invalid = [];
+  for (const app of apps || []) {
+    const allowed = modes.get(app.name);
+    if (allowed && !allowed.has(app.status)) invalid.push(`${app.name} is ${app.status}`);
+  }
+  if (invalid.length) {
+    throw new Error(`${label} has unsafe required process status: ${invalid.join(', ')}`);
+  }
+  return apps;
 }
 
 function parsePm2Inventory(raw, label) {
@@ -186,6 +218,7 @@ module.exports = {
   validateApprovedDump,
   defaultPathProbe,
   inventoryCounts,
+  assertProcessStatuses,
   parsePm2Inventory,
   assertRequiredInventory,
   hasUnixSocketListener,
