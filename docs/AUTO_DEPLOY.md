@@ -13,9 +13,16 @@ The worker publishes only when all of these conditions hold:
 2. The GitHub Actions `CI` push run for that exact SHA completed successfully.
 3. `origin/main` resolves to the same SHA immediately before mutation.
 4. The production checkout has no tracked or untracked source drift.
-5. Dependency installation succeeds.
-6. Every affected PM2 restart succeeds.
-7. Health checks for affected HTTP services return 2xx.
+5. When `ocpp-collector` is affected, its managed `.env` already contains a
+   non-empty `OCPP_LOGS_TOKEN` or legacy `OCPP_DASHBOARD_TOKEN`. This preflight
+   runs before merge, dependency installation, or restart.
+6. The live PM2 inventory exactly matches the persisted `dump.pm2` inventory.
+   A missing service (partially recreated daemon) or an extra ad-hoc process
+   blocks the deploy before merge, installation, restart, or `pm2 save`.
+7. Dependency installation succeeds.
+8. Every affected PM2 restart succeeds.
+9. Health checks for affected HTTP services return 2xx; the non-HTTP collector
+   must remain `online` for two consecutive PM2 samples without restarting.
 
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
 is `db/.monitor-deploy.lock`. Both are runtime state and remain outside Git.
@@ -39,6 +46,12 @@ Changes to `ecosystem.config.js`, root dependency manifests, or shared
 `services/lib/` code restart every managed monitor service. Service-specific
 changes restart only the corresponding PM2 process.
 
+The PM2 inventory is checked again after restart and immediately before
+`pm2 save`, closing the window for a concurrent daemon change. A deploy that
+does not restart any service does not rewrite `dump.pm2`. Adding or removing a
+managed process is an explicit reconciliation operation; auto-deploy never
+turns an incomplete or ad-hoc runtime into the reboot topology.
+
 ## Failure behavior
 
 The worker fails closed. It does not reset, stash, discard, or overwrite local
@@ -49,6 +62,12 @@ configured WhatsApp conversation through the authenticated support-copilot API.
 No automatic destructive rollback is performed. If a restart or health check
 fails, keep the deployed marker on the previous SHA and perform the documented
 manual recovery after inspecting logs and the exact release diff.
+
+If the PM2 topology gate fails, compare `pm2 jlist` with
+`${PM2_HOME:-/home/openclaw/.pm2}/dump.pm2`. Do not run `pm2 resurrect` or
+`pm2 save` as a shortcut: classify every missing/extra process first, especially
+WhatsApp, payment, and automation services, then reconcile only the approved
+allowlist.
 
 ## Recovering a dirty production checkout
 
@@ -68,6 +87,8 @@ Do not run `git reset --hard` before classifying the drift.
 
 - `GITHUB_WEBHOOK_SECRET`
 - `SUPPORT_API_SECRET` or `MONITOR_API_SECRET`
+- `OCPP_LOGS_TOKEN` (or `OCPP_DASHBOARD_TOKEN`) whenever `ocpp-collector` is
+  selected for restart; provision it in the managed `.env`, not in source
 - `MONITOR_DEPLOY_WHATSAPP_CONV` (falls back to `ALERT_WHATSAPP_CONV`)
 - `SUPPORT_API_BASE` (defaults to `http://127.0.0.1:3005`)
 - Working authenticated `gh`, `git`, `npm`, and PM2 installations at the paths

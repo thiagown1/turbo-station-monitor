@@ -13,6 +13,9 @@ const {
   deployMonitor,
   notifyDeploy,
   restartServices,
+  assertServiceEnvironment,
+  assertPm2PersistenceSafe,
+  verifyPm2Online,
   SELF_SERVICE,
 } = require('../services/lib/monitor-auto-deploy');
 
@@ -44,6 +47,113 @@ async function expectReject(name, fn, pattern) {
     [...ALL_SERVICES].sort()
   );
   console.log('  ✅ maps the real git diff to affected PM2 services');
+
+  assert.throws(
+    () => assertServiceEnvironment(['ocpp-collector'], {}),
+    /OCPP_LOGS_TOKEN.*before deployment/
+  );
+  assert.doesNotThrow(() => assertServiceEnvironment(
+    ['ocpp-collector'],
+    { OCPP_LOGS_TOKEN: 'read-only-test-token' }
+  ));
+  assert.doesNotThrow(() => assertServiceEnvironment(['support-copilot'], {}));
+  assert.match(
+    fs.readFileSync(path.join(__dirname, '..', '.env.example'), 'utf8'),
+    /^OCPP_LOGS_TOKEN=$/m
+  );
+  const collectorApp = require('../ecosystem.config').apps.find((app) => app.name === 'ocpp-collector');
+  assert.strictEqual(collectorApp.max_restarts, 10, 'collector crash loops are bounded');
+  console.log('  ✅ requires and documents the collector token before restart');
+
+  let pm2Samples = 0;
+  await verifyPm2Online(['ocpp-collector'], {
+    run: async (_command, args) => {
+      assert.deepStrictEqual(args, ['jlist']);
+      pm2Samples += 1;
+      return { stdout: JSON.stringify([{
+        name: 'ocpp-collector',
+        pm2_env: { status: 'online', restart_time: 0 },
+      }]) };
+    },
+    sleepFn: async () => {},
+    attempts: 2,
+    stableSamples: 2,
+  });
+  assert.strictEqual(pm2Samples, 2);
+  await expectReject(
+    'collector not online',
+    () => verifyPm2Online(['ocpp-collector'], {
+      run: async () => ({ stdout: JSON.stringify([{
+        name: 'ocpp-collector', pm2_env: { status: 'errored', restart_time: 10 },
+      }]) }),
+      sleepFn: async () => {},
+      attempts: 1,
+    }),
+    /ocpp-collector.*errored/
+  );
+  console.log('  ✅ verifies the non-HTTP collector stays online after restart');
+
+  const pm2DumpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-pm2-dump-'));
+  const pm2DumpPath = path.join(pm2DumpDir, 'dump.pm2');
+  fs.writeFileSync(pm2DumpPath, JSON.stringify([
+    { name: 'ocpp_hub' },
+    { name: 'ocpp-collector' },
+    { name: 'support-copilot' },
+  ]));
+  await assertPm2PersistenceSafe({
+    dumpPath: pm2DumpPath,
+    run: async (_command, args) => {
+      assert.deepStrictEqual(args, ['jlist']);
+      return { stdout: JSON.stringify([
+        { name: 'ocpp_hub' },
+        { name: 'ocpp-collector' },
+        { name: 'support-copilot' },
+      ]) };
+    },
+  });
+  await expectReject(
+    'incomplete live pm2 inventory',
+    () => assertPm2PersistenceSafe({
+      dumpPath: pm2DumpPath,
+      run: async () => ({ stdout: JSON.stringify([
+        { name: 'ocpp_hub' },
+        { name: 'ocpp-collector' },
+      ]) }),
+    }),
+    /missing.*support-copilot.*refusing/i
+  );
+  await expectReject(
+    'unexpected live pm2 process',
+    () => assertPm2PersistenceSafe({
+      dumpPath: pm2DumpPath,
+      run: async () => ({ stdout: JSON.stringify([
+        { name: 'ocpp_hub' },
+        { name: 'ocpp-collector' },
+        { name: 'support-copilot' },
+        { name: 'temporary-debug-process' },
+      ]) }),
+    }),
+    /not persisted.*temporary-debug-process.*refusing/i
+  );
+  await assertPm2PersistenceSafe({
+    dumpPath: pm2DumpPath,
+    allowedAdditions: ['mobile-telemetry'],
+    run: async () => ({ stdout: JSON.stringify([
+      { name: 'ocpp_hub' },
+      { name: 'ocpp-collector' },
+      { name: 'support-copilot' },
+      { name: 'mobile-telemetry' },
+    ]) }),
+  });
+  await expectReject(
+    'invalid persisted pm2 inventory',
+    () => assertPm2PersistenceSafe({
+      dumpPath: path.join(pm2DumpDir, 'missing.pm2'),
+      run: async () => ({ stdout: '[]' }),
+    }),
+    /persisted PM2 inventory.*unavailable/i
+  );
+  console.log('  ✅ refuses to overwrite an incomplete or unexpected PM2 topology');
 
   await expectReject(
     'failed CI',
@@ -135,6 +245,68 @@ async function expectReject(name, fn, pattern) {
   assert.ok(!dirtyCalls.some((call) => call.includes('ci')));
   console.log('  ✅ refuses a dirty production checkout before changing it');
 
+  const missingTokenDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-missing-token-'));
+  fs.mkdirSync(path.join(missingTokenDir, 'db'), { recursive: true });
+  const missingTokenCalls = [];
+  await expectReject(
+    'missing collector token preflight',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: missingTokenDir,
+      env: {},
+      run: async (command, args) => {
+        missingTokenCalls.push([command, ...args]);
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'fetch') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+        if (args[0] === 'status') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+        if (args[0] === 'diff') return { stdout: 'services/smart-collector.js\n' };
+        return { stdout: '' };
+      },
+      checkHealth: async () => { throw new Error('preflight must run before health checks'); },
+    }),
+    /OCPP_LOGS_TOKEN.*before deployment/
+  );
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'merge'));
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'restart'));
+  assert.ok(!missingTokenCalls.some((call) => call[1] === 'ci'));
+  console.log('  ✅ blocks collector deploy before merge/install/restart when its token is absent');
+
+  const incompletePm2Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-incomplete-pm2-'));
+  fs.mkdirSync(path.join(incompletePm2Dir, 'db'), { recursive: true });
+  const incompletePm2Calls = [];
+  let pm2Preflights = 0;
+  await expectReject(
+    'incomplete PM2 topology preflight',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: incompletePm2Dir,
+      run: async (command, args) => {
+        incompletePm2Calls.push([command, ...args]);
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'fetch') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+        if (args[0] === 'status') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+        if (args[0] === 'diff') return { stdout: 'services/alert-engine.js\n' };
+        return { stdout: '' };
+      },
+      checkPm2Persistence: async () => {
+        pm2Preflights += 1;
+        throw new Error('PM2 topology mismatch; refusing restart/save');
+      },
+      checkHealth: async () => { throw new Error('PM2 preflight must run before health checks'); },
+    }),
+    /PM2 topology mismatch/
+  );
+  assert.strictEqual(pm2Preflights, 1);
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'merge'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'ci'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'restart'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'save'));
+  console.log('  ✅ checks PM2 topology before merge, install, restart or save');
+
   const cleanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-clean-'));
   fs.mkdirSync(path.join(cleanDir, 'services', 'support-copilot'), { recursive: true });
   fs.mkdirSync(path.join(cleanDir, 'db'), { recursive: true });
@@ -151,11 +323,13 @@ async function expectReject(name, fn, pattern) {
     if (args[0] === 'diff') return { stdout: 'services/support-copilot/lib/contador.js\n' };
     return { stdout: '' };
   };
+  let cleanPm2Checks = 0;
   const result = await deployMonitor({
     sha: NEW_SHA,
     repoDir: cleanDir,
     run,
     checkHealth: async (services) => assert.deepStrictEqual(services, ['support-copilot']),
+    checkPm2Persistence: async () => { cleanPm2Checks += 1; },
   });
   assert.deepStrictEqual(result.services, ['support-copilot']);
   assert.ok(calls.some((call) => call[1] === 'merge' && call.includes('--ff-only')));
@@ -168,6 +342,7 @@ async function expectReject(name, fn, pattern) {
   assert.ok(restartCall.includes('ecosystem.config.js'), 'restart relê o ecosystem.config.js');
   assert.ok(restartCall.includes('--only'), 'restart usa --only');
   assert.ok(restartCall.includes('--update-env'), 'restart atualiza o env');
+  assert.strictEqual(cleanPm2Checks, 2, 'checks PM2 before mutation and immediately before save');
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
@@ -190,6 +365,7 @@ async function expectReject(name, fn, pattern) {
       return { stdout: '' };
     },
     checkHealth: async () => {},
+    checkPm2Persistence: async () => {},
     lockSleepFn: async () => {
       lockSleeps += 1;
       fs.unlinkSync(waitingLockPath);
@@ -293,7 +469,10 @@ async function expectReject(name, fn, pattern) {
     sha: NEW_SHA,
     repoDir: selfDir,
     run: selfRun,
+    env: { OCPP_LOGS_TOKEN: 'read-only-test-token' },
+    checkProcesses: async (services) => assert.deepStrictEqual(services, ['ocpp-collector']),
     checkHealth: async (services) => { healthChecked = services; },
+    checkPm2Persistence: async () => {},
   });
 
   assert.ok(selfResult.services.includes(SELF_SERVICE), 'o webhook está entre os afetados');
@@ -335,9 +514,33 @@ async function expectReject(name, fn, pattern) {
       return { stdout: '' };
     },
     checkHealth: async () => {},
+    checkPm2Persistence: async () => {},
   });
   assert.deepStrictEqual(plainResult.deferredServices, [], 'sem webhook afetado, nada a adiar');
   console.log('  ✅ defers nothing when the webhook is not affected');
+
+  const docsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-docs-only-'));
+  fs.mkdirSync(path.join(docsDir, 'db'), { recursive: true });
+  const docsCalls = [];
+  const docsResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: docsDir,
+    run: async (command, args) => {
+      docsCalls.push([command, ...args]);
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'diff') return { stdout: 'docs/AUTO_DEPLOY.md\n' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => {},
+    checkPm2Persistence: async () => { throw new Error('docs-only deploy must not inspect PM2'); },
+  });
+  assert.deepStrictEqual(docsResult.services, []);
+  assert.ok(!docsCalls.some((call) => call[1] === 'restart'));
+  assert.ok(!docsCalls.some((call) => call[1] === 'save'));
+  console.log('  ✅ does not rewrite PM2 persistence for a docs-only deploy');
 
   // The deferred restart the caller runs uses the same ecosystem-aware command.
   const deferredCalls = [];
