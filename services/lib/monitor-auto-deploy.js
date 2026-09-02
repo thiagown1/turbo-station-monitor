@@ -202,6 +202,85 @@ async function verifyPm2Online(services, {
   throw new Error(`PM2 service health failed: ${lastDescription}`);
 }
 
+function parsePm2Inventory(raw, label) {
+  let apps;
+  try {
+    apps = JSON.parse(raw || '[]');
+  } catch (error) {
+    throw new Error(`${label} returned invalid JSON: ${error.message}`);
+  }
+  if (!Array.isArray(apps) || !apps.length) {
+    throw new Error(`${label} is empty; refusing to replace the persisted PM2 topology`);
+  }
+
+  const counts = new Map();
+  for (const app of apps) {
+    const name = String(app?.name || '').trim();
+    if (!name) throw new Error(`${label} contains an unnamed process; refusing PM2 save`);
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return counts;
+}
+
+/**
+ * Protect the reboot topology before any PM2 mutation and immediately before
+ * `pm2 save`. A partially re-created daemon must never overwrite dump.pm2:
+ * doing so makes every missing service disappear at the next reboot. Extra
+ * ad-hoc processes are rejected too, so a narrow deploy cannot persist them by
+ * accident. New managed services require an explicit, separately reviewed
+ * reconciliation and can be admitted by name through allowedAdditions.
+ */
+async function assertPm2PersistenceSafe({
+  run = execFilePromise,
+  pm2Bin = process.env.PM2_BIN || '/home/openclaw/.npm-global/bin/pm2',
+  repoDir,
+  fsImpl = fs,
+  dumpPath = process.env.PM2_DUMP_PATH || path.join(process.env.PM2_HOME || '/home/openclaw/.pm2', 'dump.pm2'),
+  allowedAdditions = [],
+} = {}) {
+  let persistedRaw;
+  try {
+    persistedRaw = fsImpl.readFileSync(dumpPath, 'utf8');
+  } catch (error) {
+    throw new Error(`persisted PM2 inventory is unavailable at ${dumpPath}: ${error.message}`);
+  }
+
+  const persisted = parsePm2Inventory(persistedRaw, 'persisted PM2 inventory');
+  const { stdout } = await run(pm2Bin, ['jlist'], { cwd: repoDir, timeout: 30000 });
+  const live = parsePm2Inventory(stdout, 'live PM2 inventory');
+  const permittedExtraCounts = new Map();
+  for (const nameValue of allowedAdditions || []) {
+    const name = String(nameValue || '').trim();
+    if (name) permittedExtraCounts.set(name, (permittedExtraCounts.get(name) || 0) + 1);
+  }
+
+  const missing = [];
+  for (const [name, expectedCount] of persisted) {
+    const liveCount = live.get(name) || 0;
+    if (liveCount < expectedCount) missing.push(`${name} (${liveCount}/${expectedCount})`);
+  }
+
+  const unexpected = [];
+  for (const [name, liveCount] of live) {
+    const maximum = (persisted.get(name) || 0) + (permittedExtraCounts.get(name) || 0);
+    if (liveCount > maximum) unexpected.push(`${name} (${liveCount}/${maximum})`);
+  }
+
+  if (missing.length || unexpected.length) {
+    const details = [
+      missing.length ? `missing from live PM2: ${missing.join(', ')}` : null,
+      unexpected.length ? `live but not persisted: ${unexpected.join(', ')}` : null,
+    ].filter(Boolean).join('; ');
+    throw new Error(`PM2 topology mismatch (${details}); refusing restart/save until an operator reconciles it`);
+  }
+
+  return {
+    dumpPath,
+    persisted: Object.fromEntries(persisted),
+    live: Object.fromEntries(live),
+  };
+}
+
 function readStateSha(statePath, fallbackSha, fsImpl = fs) {
   try {
     return assertCommitSha(fsImpl.readFileSync(statePath, 'utf8'));
@@ -329,6 +408,7 @@ async function deployMonitor({
   waitForCi = waitForSuccessfulCi,
   checkHealth = verifyHealth,
   checkProcesses = verifyPm2Online,
+  checkPm2Persistence = assertPm2PersistenceSafe,
   env = process.env,
   fsImpl = fs,
   gitBin = process.env.GIT_BIN || '/usr/bin/git',
@@ -379,9 +459,17 @@ async function deployMonitor({
     const { stdout: diffOut } = await run(gitBin, ['diff', '--name-only', deployedSha, targetSha], { cwd: repoDir });
     const changedFiles = diffOut.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const services = servicesForFiles(changedFiles);
+    const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
+    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
     // This runs before merge/install/restart so a missing secret cannot leave
     // new code on disk with the collector in a PM2 crash loop.
     assertServiceEnvironment(services, env);
+    if (services.size) {
+      // The live daemon must already match the persisted reboot topology. This
+      // catches a freshly recreated or split-brain PM2 daemon before any
+      // service is touched.
+      await checkPm2Persistence({ run, pm2Bin, repoDir, fsImpl });
+    }
 
     if (headSha !== targetSha) {
       await run(gitBin, ['merge', '--ff-only', targetSha], { cwd: repoDir });
@@ -392,16 +480,19 @@ async function deployMonitor({
       await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
     }
 
-    const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
-    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
-
     await restartServices(immediateServices, { run, pm2Bin, repoDir });
     await checkHealth(immediateServices);
     await checkProcesses(
       immediateServices.filter((service) => service === 'ocpp-collector'),
       { run, pm2Bin, repoDir }
     );
-    await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
+    if (immediateServices.length) {
+      // Re-check after restarts so a concurrent PM2 change cannot be captured
+      // by the global save. Documentation-only deploys do not mutate PM2 and
+      // therefore never rewrite dump.pm2.
+      await checkPm2Persistence({ run, pm2Bin, repoDir, fsImpl });
+      await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
+    }
 
     fsImpl.writeFileSync(statePath, `${targetSha}\n`, 'utf8');
     log(`[auto-deploy] deployed ${targetSha.slice(0, 8)}; restarted: ${immediateServices.join(', ') || 'none'}`);
@@ -488,6 +579,7 @@ module.exports = {
   waitForSuccessfulCi,
   verifyHealth,
   verifyPm2Online,
+  assertPm2PersistenceSafe,
   assertServiceEnvironment,
   deployMonitor,
   acquireLockWithRetry,
