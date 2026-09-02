@@ -269,8 +269,10 @@ module.exports = {
     {
       // Nightly vercel.db maintenance: prune rows older than 14 days.
       // cron_restart fires it once at 03:00 UTC; autorestart:false so it runs
-      // to completion and exits rather than being kept alive. This entry was
-      // MISSING from ecosystem before — the job was pm2-started ad hoc (~2026-07-01)
+      // to completion and exits rather than being kept alive. The script only
+      // permits an unforced start during [03:00, 03:15) UTC, so registering the
+      // ecosystem at another time cannot trigger an immediate cleanup. This
+      // entry was MISSING before — the job was pm2-started ad hoc (~2026-07-01)
       // and only lived in the pm2 dump, so `pm2 start ecosystem.config.js` on a
       // fresh box would silently drop it. Pairs with the no-VACUUM / chunked-delete
       // rewrite of scripts/cleanup-vercel.js (fixes the ~18min nightly ingest stall).
