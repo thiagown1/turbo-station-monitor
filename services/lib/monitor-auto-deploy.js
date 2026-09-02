@@ -6,6 +6,7 @@ const path = require('path');
 const { execFile } = require('child_process');
 const {
   REQUIRED_MONITOR_PROCESSES,
+  DISABLED_MONITOR_PROCESSES,
   parsePm2Apps,
   inventoryCounts,
   assertRequiredInventory,
@@ -31,12 +32,16 @@ const SERVICE_RULES = [
   ['services/whatsapp-gateway/', ['whatsapp-gateway']],
   ['services/ai-subscription-gateway/', ['ai-openclaw-agent']],
   ['services/smart-collector.js', ['ocpp-collector']],
-  ['services/alert-processor.js', ['ocpp-alerts']],
   ['services/vercel-drain.js', ['vercel-drain']],
   ['services/github-webhook.js', ['github-webhook']],
   ['services/mobile-telemetry/', ['mobile-telemetry']],
   ['services/pagarme-status-webhook.js', ['pagarme-status-webhook']],
   ['services/alert-engine.js', ['alert-engine']],
+];
+
+const DISABLED_SERVICE_RULES = [
+  ['services/alert-processor.js', ['ocpp-alerts']],
+  ['scripts/cleanup-vercel.js', ['cleanup-vercel-db']],
 ];
 
 const HEALTH_ENDPOINTS = {
@@ -52,22 +57,38 @@ function assertCommitSha(value) {
   return sha;
 }
 
-function servicesForFiles(files) {
+function deploymentPlanForFiles(files) {
   const normalized = files.map((file) => String(file || '').replace(/\\/g, '/')).filter(Boolean);
-  if (normalized.some((file) =>
+  const sharedChange = normalized.some((file) =>
     file === 'ecosystem.config.js' ||
     file === 'package.json' ||
     file === 'package-lock.json' ||
     file.startsWith('services/lib/')
-  )) return new Set(ALL_SERVICES);
+  );
+  if (sharedChange) {
+    return {
+      services: new Set(ALL_SERVICES),
+      deferredDisabledServices: new Set(DISABLED_MONITOR_PROCESSES),
+    };
+  }
 
   const services = new Set();
+  const deferredDisabledServices = new Set();
   for (const file of normalized) {
     for (const [prefix, names] of SERVICE_RULES) {
       if (file === prefix || file.startsWith(prefix)) names.forEach((name) => services.add(name));
     }
+    for (const [prefix, names] of DISABLED_SERVICE_RULES) {
+      if (file === prefix || file.startsWith(prefix)) {
+        names.forEach((name) => deferredDisabledServices.add(name));
+      }
+    }
   }
-  return services;
+  return { services, deferredDisabledServices };
+}
+
+function servicesForFiles(files) {
+  return deploymentPlanForFiles(files).services;
 }
 
 function execFilePromise(command, args, options = {}) {
@@ -296,6 +317,7 @@ async function assertPm2PersistenceSafe({
   assertRequiredInventory(persisted, { label: 'persisted PM2 inventory' });
   assertProcessStatuses(persistedApps, {
     requiredOnline: REQUIRED_MONITOR_PROCESSES,
+    disabledAbsent: DISABLED_MONITOR_PROCESSES,
     label: 'persisted PM2 inventory',
   });
 
@@ -314,6 +336,7 @@ async function assertPm2PersistenceSafe({
   const live = inventoryCounts(liveApps);
   assertProcessStatuses(liveApps, {
     requiredOnline: REQUIRED_MONITOR_PROCESSES,
+    disabledAbsent: DISABLED_MONITOR_PROCESSES,
     label: 'live PM2 inventory',
   });
 
@@ -393,7 +416,7 @@ async function deployMonitor({
     const deployedSha = readStateSha(statePath, headSha, fsImpl);
     const { stdout: diffOut } = await run(gitBin, ['diff', '--name-only', deployedSha, targetSha], { cwd: repoDir });
     const changedFiles = diffOut.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const services = servicesForFiles(changedFiles);
+    const { services, deferredDisabledServices } = deploymentPlanForFiles(changedFiles);
     const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
     const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
     if (services.size) {
@@ -409,9 +432,9 @@ async function deployMonitor({
       await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
     }
 
-    await restartServices(immediateServices, { run, pm2Bin, repoDir });
-    await checkHealth(immediateServices);
     if (immediateServices.length) {
+      await restartServices(immediateServices, { run, pm2Bin, repoDir });
+      await checkHealth(immediateServices);
       await checkPm2Persistence({ run, pm2Bin, repoDir, fsImpl });
       await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
     }
@@ -421,6 +444,9 @@ async function deployMonitor({
     if (deferredServices.length) {
       log(`[auto-deploy] deferred to last (it spawns this worker): ${deferredServices.join(', ')}`);
     }
+    if (deferredDisabledServices.size) {
+      log(`[auto-deploy] code updated but operator-gated service(s) kept disabled: ${[...deferredDisabledServices].join(', ')}`);
+    }
     return {
       status: 'deployed',
       targetSha,
@@ -429,6 +455,7 @@ async function deployMonitor({
       services: [...services],
       immediateServices,
       deferredServices,
+      deferredDisabledServices: [...deferredDisabledServices],
     };
   } finally {
     try { fsImpl.unlinkSync(lockPath); } catch {}
@@ -498,6 +525,7 @@ module.exports = {
   HEALTH_ENDPOINTS,
   assertCommitSha,
   servicesForFiles,
+  deploymentPlanForFiles,
   waitForSuccessfulCi,
   verifyHealth,
   deployMonitor,
@@ -507,5 +535,6 @@ module.exports = {
   restartServices,
   assertPm2PersistenceSafe,
   REQUIRED_MONITOR_PROCESSES,
+  DISABLED_MONITOR_PROCESSES,
   SELF_SERVICE,
 };

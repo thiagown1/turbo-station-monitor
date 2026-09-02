@@ -9,8 +9,8 @@ The reconciler shares `db/.monitor-deploy.lock` with auto-deploy, so a deploy
 and daemon recovery cannot mutate PM2 concurrently. On every run it:
 
 1. reads a root-owned approval manifest and `dump.pm2`;
-2. requires the exact approved process set, all 11 long-lived monitor services,
-   and an exact absolute executable path for every entry;
+2. requires the exact approved process set, all 10 safe long-lived monitor
+   services, and an exact absolute executable path for every entry;
 3. confirms each path exists (and is executable for native entries);
 4. reads `/proc/net/unix` before any PM2 CLI call, avoiding the `jlist` behavior
    that can spawn a fresh empty daemon;
@@ -22,7 +22,8 @@ and daemon recovery cannot mutate PM2 concurrently. On every run it:
 The persisted dump is re-read and revalidated immediately before the systemd
 restart. An unapproved/changed dump, unexpected live process, path mismatch,
 present-but-stopped/errored required process, errored scheduled registration,
-or three unstable restarts fails
+any operator-gated process present in the dump/live daemon, or three unstable
+restarts fails
 with a non-zero systemd result and a structured journal line. Those cases need
 targeted diagnosis; the watchdog never enters a whole-daemon restart loop.
 Successful recovery is rate-limited to once per 15 minutes. The timestamp is
@@ -42,6 +43,14 @@ Every process has one mode:
 
 - `online`: long-lived and required to be `online`;
 - `registered`: must remain present, but `stopped` between cron runs is valid.
+- `disabled`: path remains reviewed, but the entry must be absent from both
+  `dump.pm2` and the live daemon. This is intentionally stricter than
+  registered-and-stopped because a PM2 cron may wake a stopped process.
+
+`ocpp-alerts` and `cleanup-vercel-db` stay `disabled` until their own explicit
+activation approvals. The former sends external alerts; the latter deletes
+production rows on its 03:00 UTC cron. Changing code never grants permission to
+register either process.
 
 The manifest must be owned by root and mode `0600`. Never copy environment
 fields out of `dump.pm2`; only names, modes, and executable paths belong here.

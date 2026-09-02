@@ -7,6 +7,7 @@ const os = require('os');
 const path = require('path');
 const {
   REQUIRED_MONITOR_PROCESSES,
+  DISABLED_MONITOR_PROCESSES,
   validateApprovedDump,
 } = require('../services/lib/pm2-topology');
 const { reconcilePm2 } = require('../services/lib/pm2-reconciler');
@@ -26,7 +27,8 @@ function makeFixture() {
   fs.mkdirSync(executableDir);
   const processSpecs = [
     ...REQUIRED_MONITOR_PROCESSES.map((name) => ({ name, mode: 'online' })),
-    { name: 'cleanup-vercel-db', mode: 'registered' },
+    { name: 'blog-generator', mode: 'registered' },
+    ...DISABLED_MONITOR_PROCESSES.map((name) => ({ name, mode: 'disabled' })),
   ].map((spec) => {
     const execPath = path.join(executableDir, `${spec.name}.js`);
     fs.writeFileSync(execPath, '// fixture\n');
@@ -39,7 +41,7 @@ function makeFixture() {
   const lockPath = path.join(dir, 'pm2.lock');
   const statePath = path.join(dir, 'pm2-state.json');
   const manifest = { version: 1, processes: processSpecs };
-  const apps = processSpecs.map(({ name, mode, execPath }) => ({
+  const apps = processSpecs.filter(({ mode }) => mode !== 'disabled').map(({ name, mode, execPath }) => ({
     name,
     pm_exec_path: execPath,
     exec_interpreter: 'node',
@@ -91,8 +93,9 @@ test('approved dump requires the curated monitor core and exact readable executa
     manifestRaw: JSON.stringify(fixture.manifest),
     dumpRaw: JSON.stringify(fixture.apps),
   });
-  assert.equal(approved.processes.size, fixture.apps.length);
+  assert.equal(approved.processes.size, fixture.apps.length + DISABLED_MONITOR_PROCESSES.length);
   assert.equal(approved.requiredOnline.size, REQUIRED_MONITOR_PROCESSES.length);
+  assert.deepEqual([...approved.disabled].sort(), [...DISABLED_MONITOR_PROCESSES].sort());
 
   const stoppedDump = fixture.apps.map((app) => app.name === 'alert-engine'
     ? { ...app, pm2_env: { ...app.pm2_env, status: 'stopped' } }
@@ -117,6 +120,32 @@ test('approved dump requires the curated monitor core and exact readable executa
     /manifest.*missing required.*whatsapp-gateway/i,
   );
 
+  const missingDisabledContract = {
+    ...fixture.manifest,
+    processes: fixture.manifest.processes.filter((p) => p.name !== 'ocpp-alerts'),
+  };
+  assert.throws(
+    () => validateApprovedDump({
+      manifestRaw: JSON.stringify(missingDisabledContract),
+      dumpRaw: JSON.stringify(fixture.apps),
+    }),
+    /manifest.*operator-gated.*disabled.*ocpp-alerts/i,
+  );
+
+  const activatedWithoutApproval = {
+    ...fixture.manifest,
+    processes: fixture.manifest.processes.map((p) => p.name === 'cleanup-vercel-db'
+      ? { ...p, mode: 'registered' }
+      : p),
+  };
+  assert.throws(
+    () => validateApprovedDump({
+      manifestRaw: JSON.stringify(activatedWithoutApproval),
+      dumpRaw: JSON.stringify(fixture.apps),
+    }),
+    /manifest.*operator-gated.*disabled.*cleanup-vercel-db/i,
+  );
+
   const mismatched = fixture.apps.map((app) => (
     app.name === 'ocpp-collector' ? { ...app, pm_exec_path: path.join(fixture.dir, 'other.js') } : app
   ));
@@ -126,6 +155,23 @@ test('approved dump requires the curated monitor core and exact readable executa
       dumpRaw: JSON.stringify(mismatched),
     }),
     /ocpp-collector.*executable path mismatch/i,
+  );
+
+  const unsafeDisabledDump = [
+    ...fixture.apps,
+    {
+      name: 'ocpp-alerts',
+      pm_exec_path: fixture.manifest.processes.find((p) => p.name === 'ocpp-alerts').execPath,
+      exec_interpreter: 'node',
+      pm2_env: { status: 'stopped', unstable_restarts: 0, restart_time: 0 },
+    },
+  ];
+  assert.throws(
+    () => validateApprovedDump({
+      manifestRaw: JSON.stringify(fixture.manifest),
+      dumpRaw: JSON.stringify(unsafeDisabledDump),
+    }),
+    /operator-gated.*must be absent.*ocpp-alerts/i,
   );
 });
 
@@ -219,10 +265,19 @@ test('invalid dump, unexpected apps, errored apps and crash loops fail without f
     },
     {
       name: 'registered cron errored',
-      apps: (f) => f.apps.map((app) => app.name === 'cleanup-vercel-db'
+      apps: (f) => f.apps.map((app) => app.name === 'blog-generator'
         ? { ...app, pm2_env: { ...app.pm2_env, status: 'errored' } }
         : app),
-      pattern: /cleanup-vercel-db.*errored/i,
+      pattern: /blog-generator.*errored/i,
+    },
+    {
+      name: 'disabled process unexpectedly registered',
+      apps: (f) => [...f.apps, {
+        name: 'cleanup-vercel-db',
+        pm_exec_path: f.manifest.processes.find((p) => p.name === 'cleanup-vercel-db').execPath,
+        pm2_env: { status: 'stopped', unstable_restarts: 0, restart_time: 0 },
+      }],
+      pattern: /operator-gated.*must be absent.*cleanup-vercel-db/i,
     },
     {
       name: 'crash-loop',

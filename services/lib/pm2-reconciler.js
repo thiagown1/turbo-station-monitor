@@ -89,15 +89,22 @@ function classifyLiveTopology(liveApps, approved, crashLoopThreshold) {
     if (live.has(app.name)) duplicates.push(app.name);
     else live.set(app.name, app);
   }
-  const missing = [...approved.processes.keys()].filter((name) => !live.has(name));
+  const missing = [...approved.processes.values()]
+    .filter((spec) => spec.mode !== 'disabled' && !live.has(spec.name))
+    .map((spec) => spec.name);
   const unexpected = [...live.keys()].filter((name) => !approved.processes.has(name));
   const pathMismatches = [];
   const notOnline = [];
+  const forbiddenDisabled = [];
   const crashLoops = [];
   for (const [name, app] of live) {
     const spec = approved.processes.get(name);
     if (!spec) continue;
     if (app.execPath !== spec.execPath) pathMismatches.push(`${name} (${app.execPath || '(empty)'})`);
+    if (spec.mode === 'disabled') {
+      forbiddenDisabled.push(`${name} is registered (${app.status})`);
+      continue;
+    }
     if (spec.mode === 'online' && app.status !== 'online') {
       notOnline.push(`${name} is ${app.status}`);
     }
@@ -108,7 +115,7 @@ function classifyLiveTopology(liveApps, approved, crashLoopThreshold) {
       crashLoops.push(`${name} has ${app.unstableRestarts} unstable restarts`);
     }
   }
-  return { live, missing, unexpected, duplicates, pathMismatches, notOnline, crashLoops };
+  return { live, missing, unexpected, duplicates, pathMismatches, notOnline, forbiddenDisabled, crashLoops };
 }
 
 function assertNoUnsafeLiveState(state) {
@@ -116,6 +123,7 @@ function assertNoUnsafeLiveState(state) {
     state.unexpected.length ? `unexpected live PM2 process(es): ${state.unexpected.join(', ')}` : null,
     state.duplicates.length ? `duplicate live PM2 process(es): ${state.duplicates.join(', ')}` : null,
     state.pathMismatches.length ? `live executable path mismatch: ${state.pathMismatches.join(', ')}` : null,
+    state.forbiddenDisabled.length ? `operator-gated PM2 process(es) must be absent: ${state.forbiddenDisabled.join(', ')}` : null,
     state.notOnline.length ? state.notOnline.join(', ') : null,
     state.crashLoops.length ? state.crashLoops.join(', ') : null,
   ].filter(Boolean);

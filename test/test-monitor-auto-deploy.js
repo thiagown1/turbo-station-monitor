@@ -9,12 +9,14 @@ const {
   ALL_SERVICES,
   assertCommitSha,
   servicesForFiles,
+  deploymentPlanForFiles,
   waitForSuccessfulCi,
   deployMonitor,
   notifyDeploy,
   restartServices,
   assertPm2PersistenceSafe,
   REQUIRED_MONITOR_PROCESSES,
+  DISABLED_MONITOR_PROCESSES,
   SELF_SERVICE,
 } = require('../services/lib/monitor-auto-deploy');
 
@@ -46,6 +48,14 @@ async function expectReject(name, fn, pattern) {
     [...ALL_SERVICES].sort()
   );
   assert.deepStrictEqual([...ALL_SERVICES].sort(), [...REQUIRED_MONITOR_PROCESSES].sort());
+  const alertPlan = deploymentPlanForFiles(['services/alert-processor.js']);
+  assert.deepStrictEqual([...alertPlan.services], []);
+  assert.deepStrictEqual([...alertPlan.deferredDisabledServices], ['ocpp-alerts']);
+  const sharedPlan = deploymentPlanForFiles(['services/lib/service-port.js']);
+  assert.deepStrictEqual(
+    [...sharedPlan.deferredDisabledServices].sort(),
+    [...DISABLED_MONITOR_PROCESSES].sort()
+  );
   console.log('  ✅ maps the real git diff to affected PM2 services');
 
   const pm2FixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-pm2-persistence-'));
@@ -107,6 +117,26 @@ async function expectReject(name, fn, pattern) {
     },
   });
   assert.strictEqual(safeTopology.live.size, REQUIRED_MONITOR_PROCESSES.length);
+
+  for (const disabledName of DISABLED_MONITOR_PROCESSES) {
+    await expectReject(
+      `disabled process ${disabledName} in persisted PM2 topology`,
+      () => {
+        fs.writeFileSync(dumpPath, JSON.stringify([
+          ...requiredApps,
+          { name: disabledName, pm2_env: { status: 'stopped' } },
+        ]));
+        return assertPm2PersistenceSafe({
+          dumpPath,
+          procNetUnixPath,
+          socketPath,
+          run: async () => ({ stdout: JSON.stringify(requiredApps) }),
+        });
+      },
+      new RegExp(`${disabledName}.*must be absent`, 'i')
+    );
+  }
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps));
 
   let deadDaemonCliCalls = 0;
   fs.writeFileSync(procNetUnixPath, 'Num RefCount Protocol Flags Type St Inode Path\n');
@@ -311,6 +341,7 @@ async function expectReject(name, fn, pattern) {
     checkPm2Persistence: async () => { pm2Preflights += 1; },
   });
   assert.deepStrictEqual(result.services, ['support-copilot']);
+  assert.deepStrictEqual(result.deferredDisabledServices, []);
   assert.ok(calls.some((call) => call[1] === 'merge' && call.includes('--ff-only')));
   assert.ok(calls.some((call) => call[1] === 'ci' && call.includes('--omit=dev')));
   // Through the ecosystem file, not the bare name: a bare `pm2 restart <name>`
@@ -453,6 +484,11 @@ async function expectReject(name, fn, pattern) {
   });
 
   assert.ok(selfResult.services.includes(SELF_SERVICE), 'o webhook está entre os afetados');
+  assert.deepStrictEqual(
+    [...selfResult.deferredDisabledServices].sort(),
+    [...DISABLED_MONITOR_PROCESSES].sort(),
+    'mudança compartilhada publica código sem ativar serviços operator-gated'
+  );
   assert.deepStrictEqual(selfResult.deferredServices, [SELF_SERVICE], 'webhook adiado para o fim');
   assert.ok(!selfResult.immediateServices.includes(SELF_SERVICE), 'webhook fora da rodada imediata');
 
@@ -494,6 +530,7 @@ async function expectReject(name, fn, pattern) {
     checkPm2Persistence: async () => {},
   });
   assert.deepStrictEqual(plainResult.deferredServices, [], 'sem webhook afetado, nada a adiar');
+  assert.deepStrictEqual(plainResult.deferredDisabledServices, []);
   console.log('  ✅ defers nothing when the webhook is not affected');
 
   const docsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-docs-only-'));
@@ -516,9 +553,35 @@ async function expectReject(name, fn, pattern) {
     checkPm2Persistence: async () => { throw new Error('docs-only deploy must not inspect PM2'); },
   });
   assert.deepStrictEqual(docsResult.services, []);
+  assert.deepStrictEqual(docsResult.deferredDisabledServices, []);
   assert.ok(!docsCalls.some((call) => call[1] === 'restart'));
   assert.ok(!docsCalls.some((call) => call[1] === 'save'));
   console.log('  ✅ does not rewrite PM2 persistence for a docs-only deploy');
+
+  const disabledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-disabled-only-'));
+  fs.mkdirSync(path.join(disabledDir, 'db'), { recursive: true });
+  const disabledCalls = [];
+  const disabledResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: disabledDir,
+    run: async (command, args) => {
+      disabledCalls.push([command, ...args]);
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'fetch') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+      if (args[0] === 'diff') return { stdout: 'services/alert-processor.js\n' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => { throw new Error('disabled-only deploy must not health-check a process'); },
+    checkPm2Persistence: async () => { throw new Error('disabled-only deploy must not persist PM2'); },
+  });
+  assert.deepStrictEqual(disabledResult.services, []);
+  assert.deepStrictEqual(disabledResult.deferredDisabledServices, ['ocpp-alerts']);
+  assert.ok(!disabledCalls.some((call) => call[1] === 'restart'));
+  assert.ok(!disabledCalls.some((call) => call[1] === 'save'));
+  console.log('  ✅ publishes operator-gated code without starting or persisting it');
 
   // The deferred restart the caller runs uses the same ecosystem-aware command.
   const deferredCalls = [];
