@@ -168,6 +168,7 @@ function acquireLock(lockPath, fsImpl = fs) {
       if (running) {
         try { process.kill(pid, 0); } catch (probeError) {
           if (probeError.code === 'ESRCH') running = false;
+          else if (probeError.code === 'EPERM') running = true;
           else throw probeError;
         }
       }

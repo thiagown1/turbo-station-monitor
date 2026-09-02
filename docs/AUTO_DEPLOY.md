@@ -67,6 +67,10 @@ If the topology guard fails, compare the absolute-path command
 approved targets from their tracked ecosystem files; a later deployment may
 persist the topology only after both inventories agree.
 
+Daemon-loss recovery is separately documented in
+[`PM2_RECOVERY_WATCHDOG.md`](PM2_RECOVERY_WATCHDOG.md). The timer is not enabled
+by this repository or by auto-deploy.
+
 ## Recovering a dirty production checkout
 
 Do not run `git reset --hard` before classifying the drift.

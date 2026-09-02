@@ -112,6 +112,11 @@ The production checkout must be clean. Local source edits make the deploy fail
 closed so operational hotfixes cannot be overwritten silently. See
 [`docs/AUTO_DEPLOY.md`](docs/AUTO_DEPLOY.md) for recovery and verification.
 
+An optional, fail-closed systemd timer for validated PM2 daemon recovery is
+documented in
+[`docs/PM2_RECOVERY_WATCHDOG.md`](docs/PM2_RECOVERY_WATCHDOG.md). It is never
+installed or enabled by auto-deploy.
+
 `deploy-autowatch` is unrelated: it watches OCPP server versions after an OCPP
 production release; it does not publish this repository.
 

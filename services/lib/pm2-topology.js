@@ -1,5 +1,9 @@
 'use strict';
 
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
 const REQUIRED_MONITOR_PROCESSES = Object.freeze([
   'mosim-logtail',
   'ocpp-collector',
@@ -14,14 +18,14 @@ const REQUIRED_MONITOR_PROCESSES = Object.freeze([
   'whatsapp-gateway',
 ]);
 
-function parsePm2Apps(raw, label = 'PM2 inventory') {
+function parsePm2Apps(raw, label = 'PM2 inventory', { allowEmpty = false } = {}) {
   let apps;
   try {
     apps = JSON.parse(String(raw || ''));
   } catch (error) {
     throw new Error(`${label} returned invalid JSON: ${error.message}`);
   }
-  if (!Array.isArray(apps) || !apps.length) {
+  if (!Array.isArray(apps) || (!allowEmpty && !apps.length)) {
     throw new Error(`${label} is empty; refusing to trust or persist the PM2 topology`);
   }
 
@@ -39,6 +43,105 @@ function parsePm2Apps(raw, label = 'PM2 inventory') {
       interpreter: String(app?.exec_interpreter || env.exec_interpreter || '').trim(),
     };
   });
+}
+
+function parseRecoveryManifest(raw) {
+  let manifest;
+  try {
+    manifest = JSON.parse(String(raw || ''));
+  } catch (error) {
+    throw new Error(`PM2 recovery manifest returned invalid JSON: ${error.message}`);
+  }
+  if (!manifest || manifest.version !== 1 || !Array.isArray(manifest.processes) || !manifest.processes.length) {
+    throw new Error('PM2 recovery manifest must have version 1 and a non-empty processes array');
+  }
+
+  const processes = new Map();
+  for (const [index, value] of manifest.processes.entries()) {
+    const name = String(value?.name || '').trim();
+    const mode = String(value?.mode || '').trim();
+    const execPath = String(value?.execPath || '').trim();
+    if (!name) throw new Error(`PM2 recovery manifest process ${index} has no name`);
+    if (processes.has(name)) throw new Error(`PM2 recovery manifest contains duplicate process ${name}`);
+    if (!['online', 'registered'].includes(mode)) {
+      throw new Error(`PM2 recovery manifest process ${name} has invalid mode ${mode || '(empty)'}`);
+    }
+    if (!path.isAbsolute(execPath)) {
+      throw new Error(`PM2 recovery manifest process ${name} needs an absolute executable path`);
+    }
+    processes.set(name, { name, mode, execPath });
+  }
+
+  const missingCore = REQUIRED_MONITOR_PROCESSES.filter((name) => {
+    const spec = processes.get(name);
+    return !spec || spec.mode !== 'online';
+  });
+  if (missingCore.length) {
+    throw new Error(`PM2 recovery manifest is missing required online monitor process(es): ${missingCore.join(', ')}`);
+  }
+  return processes;
+}
+
+function defaultPathProbe(execPath, { executable = false, fsImpl = fs } = {}) {
+  const stat = fsImpl.statSync(execPath);
+  if (!stat.isFile()) throw new Error('not a regular file');
+  fsImpl.accessSync(execPath, fs.constants.R_OK);
+  if (executable) fsImpl.accessSync(execPath, fs.constants.X_OK);
+  return true;
+}
+
+/**
+ * Validate the exact, operator-curated reboot inventory before systemd is ever
+ * allowed to resurrect it. The manifest is deliberately external/root-owned in
+ * production; dump.pm2 may contain environment values and is never logged.
+ */
+function validateApprovedDump({
+  manifestRaw,
+  dumpRaw,
+  pathProbe = defaultPathProbe,
+  fsImpl = fs,
+} = {}) {
+  const processes = parseRecoveryManifest(manifestRaw);
+  const apps = parsePm2Apps(dumpRaw, 'persisted PM2 inventory');
+  const byName = new Map();
+  for (const app of apps) {
+    if (byName.has(app.name)) {
+      throw new Error(`persisted PM2 inventory contains duplicate process ${app.name}`);
+    }
+    byName.set(app.name, app);
+  }
+
+  const missing = [...processes.keys()].filter((name) => !byName.has(name));
+  const unexpected = [...byName.keys()].filter((name) => !processes.has(name));
+  if (missing.length || unexpected.length) {
+    const details = [
+      missing.length ? `missing approved process(es): ${missing.join(', ')}` : null,
+      unexpected.length ? `unapproved process(es): ${unexpected.join(', ')}` : null,
+    ].filter(Boolean).join('; ');
+    throw new Error(`persisted PM2 inventory does not match the recovery manifest (${details})`);
+  }
+
+  for (const [name, spec] of processes) {
+    const app = byName.get(name);
+    if (!app.execPath || app.execPath !== spec.execPath) {
+      throw new Error(
+        `${name} executable path mismatch: dump=${app.execPath || '(empty)'}, approved=${spec.execPath}`,
+      );
+    }
+    try {
+      pathProbe(app.execPath, { executable: app.interpreter === 'none', fsImpl });
+    } catch (error) {
+      throw new Error(`${name} executable path is unavailable or unsafe: ${error.message}`);
+    }
+  }
+
+  return {
+    processes,
+    requiredOnline: new Set([...processes.values()].filter((p) => p.mode === 'online').map((p) => p.name)),
+    registeredOnly: new Set([...processes.values()].filter((p) => p.mode === 'registered').map((p) => p.name)),
+    dumpApps: apps,
+    dumpFingerprint: crypto.createHash('sha256').update(String(dumpRaw)).digest('hex'),
+  };
 }
 
 function inventoryCounts(apps) {
@@ -79,6 +182,9 @@ function hasUnixSocketListener(procNetUnix, socketPath) {
 module.exports = {
   REQUIRED_MONITOR_PROCESSES,
   parsePm2Apps,
+  parseRecoveryManifest,
+  validateApprovedDump,
+  defaultPathProbe,
   inventoryCounts,
   parsePm2Inventory,
   assertRequiredInventory,
