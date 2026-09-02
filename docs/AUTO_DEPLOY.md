@@ -13,9 +13,12 @@ The worker publishes only when all of these conditions hold:
 2. The GitHub Actions `CI` push run for that exact SHA completed successfully.
 3. `origin/main` resolves to the same SHA immediately before mutation.
 4. The production checkout has no tracked or untracked source drift.
-5. Dependency installation succeeds.
-6. Every affected PM2 restart succeeds.
-7. Health checks for affected HTTP services return 2xx.
+5. For a service-bearing change, the saved `dump.pm2` contains all 10 safe
+   long-lived monitor services, contains no operator-gated process, and exactly
+   matches the live PM2 inventory.
+6. Dependency installation succeeds.
+7. Every affected PM2 restart succeeds.
+8. Health checks for affected HTTP services return 2xx.
 
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
 is `db/.monitor-deploy.lock`. Both are runtime state and remain outside Git.
@@ -36,8 +39,21 @@ successfully deployed SHA and the requested SHA. The webhook payload's commit
 file list is not trusted as the deployment source of truth.
 
 Changes to `ecosystem.config.js`, root dependency manifests, or shared
-`services/lib/` code restart every managed monitor service. Service-specific
-changes restart only the corresponding PM2 process.
+`services/lib/` code restart the 10 always-on monitor services. Service-specific
+changes restart only the corresponding always-on PM2 process. Changes to
+`services/alert-processor.js` or `scripts/cleanup-vercel.js` publish the code but
+record `ocpp-alerts`/`cleanup-vercel-db` as deferred-disabled: auto-deploy never
+starts, restarts, or persists either operator-gated service.
+
+Before any merge, install, restart, or save, the worker reads the existing
+`dump.pm2`, verifies that the required monitor core was saved online, and
+confirms a live listening PM2 RPC socket through `/proc/net/unix`. It never
+calls `pm2 jlist` against an absent daemon because that command can create a new
+empty daemon. After the targeted restarts it repeats the live-versus-saved
+comparison immediately before `pm2 save`; missing, unexpected, stopped, and
+errored required entries, plus any registered operator-gated entry, all fail
+closed. A docs-only or operator-gated-only deploy does not touch PM2 and
+therefore does not rewrite the saved topology.
 
 ## Failure behavior
 
@@ -49,6 +65,17 @@ configured WhatsApp conversation through the authenticated support-copilot API.
 No automatic destructive rollback is performed. If a restart or health check
 fails, keep the deployed marker on the previous SHA and perform the documented
 manual recovery after inspecting logs and the exact release diff.
+
+If the topology guard fails, compare the absolute-path command
+`/home/openclaw/.npm-global/bin/pm2 jlist` with
+`${PM2_HOME:-/home/openclaw/.pm2}/dump.pm2`. Do not run `pm2 resurrect` or
+`pm2 save` as a shortcut. Classify every missing/extra process and recover only
+approved targets from their tracked ecosystem files; a later deployment may
+persist the topology only after both inventories agree.
+
+Daemon-loss recovery is separately documented in
+[`PM2_RECOVERY_WATCHDOG.md`](PM2_RECOVERY_WATCHDOG.md). The timer is not enabled
+by this repository or by auto-deploy.
 
 ## Recovering a dirty production checkout
 

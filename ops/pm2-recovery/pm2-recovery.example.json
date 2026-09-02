@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "processes": [
+    { "name": "mosim-logtail", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/mosim-logtail/index.js" },
+    { "name": "ocpp-collector", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/smart-collector.js" },
+    { "name": "ocpp-alerts", "mode": "disabled", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/alert-processor.js" },
+    { "name": "vercel-drain", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/vercel-drain.js" },
+    { "name": "github-webhook", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/github-webhook.js" },
+    { "name": "mobile-telemetry", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/mobile-telemetry/index.js" },
+    { "name": "pagarme-status-webhook", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/pagarme-status-webhook.js" },
+    { "name": "alert-engine", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/alert-engine.js" },
+    { "name": "ai-openclaw-agent", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/ai-subscription-gateway/index.js" },
+    { "name": "support-copilot", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/support-copilot/index.js" },
+    { "name": "whatsapp-gateway", "mode": "online", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/services/whatsapp-gateway/index.js" },
+    { "name": "cleanup-vercel-db", "mode": "disabled", "execPath": "/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/scripts/cleanup-vercel.js" }
+  ]
+}

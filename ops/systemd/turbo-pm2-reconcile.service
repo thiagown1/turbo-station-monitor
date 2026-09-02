@@ -1,0 +1,28 @@
+[Unit]
+Description=Validate and reconcile the approved OpenClaw PM2 topology
+After=network.target pm2-openclaw.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+Environment=PM2_HOME=/home/openclaw/.pm2
+Environment=PM2_BIN=/home/openclaw/.npm-global/bin/pm2
+Environment=PM2_SYSTEMCTL_BIN=/usr/bin/systemctl
+Environment=PM2_SYSTEMD_UNIT=pm2-openclaw.service
+Environment=MONITOR_REPO_DIR=/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor
+Environment=PM2_RECOVERY_MANIFEST=/etc/turbo-station-monitor/pm2-recovery.json
+Environment=PM2_RECONCILE_LOCK=/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/db/.monitor-deploy.lock
+Environment=PM2_RECONCILE_STATE=/var/lib/turbo-station-monitor/pm2-reconcile-state.json
+ExecStart=/usr/bin/node /usr/local/lib/turbo-station-monitor/pm2-reconciler.js
+TimeoutStartSec=90
+StateDirectory=turbo-station-monitor
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/openclaw/.openclaw/workspace/skills/turbo-station-monitor/db
+
+[Install]
+WantedBy=multi-user.target

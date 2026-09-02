@@ -34,6 +34,18 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const {
+  createSilentBaileysLogger,
+  ensurePrivateAuthDirectory,
+  hardenAuthTree,
+  secureSaveCreds,
+  safeErrorCode,
+} = require('./security');
+
+// Baileys writes authentication material throughout the session. A restrictive
+// process umask protects new key files even when the library does not pass an
+// explicit mode to fs.writeFile.
+process.umask(0o077);
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -42,6 +54,9 @@ const BASE_AUTH_DIR = process.env.GATEWAY_AUTH_DIR || path.join(__dirname, 'auth
 const WEBHOOK_URL = process.env.GATEWAY_WEBHOOK_URL || 'http://localhost:3005/api/support/ingest/evolution';
 const WEBHOOK_SECRET = process.env.EVOLUTION_WEBHOOK_SECRET || '';
 const LOG_TAG = '[whatsapp-gw]';
+
+ensurePrivateAuthDirectory(BASE_AUTH_DIR);
+hardenAuthTree(BASE_AUTH_DIR);
 
 // ─── Instance store ────────────────────────────────────────────────────────
 
@@ -59,7 +74,7 @@ const LOG_TAG = '[whatsapp-gw]';
  */
 const instances = new Map();
 
-const logger = pino({ level: 'warn' });
+const logger = createSilentBaileysLogger(pino);
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
@@ -104,17 +119,14 @@ function sendWebhook(instanceName, event, data) {
   };
 
   const req = http.request(options, (res) => {
-    let body = '';
-    res.on('data', c => body += c);
-    res.on('end', () => {
-      if (res.statusCode >= 300) {
-        console.error(`${LOG_TAG} [${instanceName}] Webhook ${event} failed: ${res.statusCode} — ${body}`);
-      }
-    });
+    if (res.statusCode >= 300) {
+      console.error(`${LOG_TAG} [${instanceName}] Webhook ${event} failed: status=${res.statusCode}`);
+    }
+    res.resume();
   });
 
   req.on('error', (err) => {
-    console.error(`${LOG_TAG} [${instanceName}] Webhook ${event} error:`, err.message);
+    console.error(`${LOG_TAG} [${instanceName}] Webhook ${event} error=${safeErrorCode(err)}`);
   });
 
   req.write(payload);
@@ -125,7 +137,8 @@ function sendWebhook(instanceName, event, data) {
 
 async function startInstance(name) {
   const dir = authDir(name);
-  fs.mkdirSync(dir, { recursive: true });
+  ensurePrivateAuthDirectory(dir);
+  hardenAuthTree(dir);
 
   let inst = instances.get(name);
   if (!inst) {
@@ -182,9 +195,6 @@ async function startInstance(name) {
       inst.qr = qr;
       inst.state = 'connecting';
       console.log(`${LOG_TAG} [${name}] QR code generated — GET /instance/${name}/qr to retrieve`);
-      qrcode.generate(qr, { small: true }, (text) => {
-        console.log(`${LOG_TAG} [${name}] QR:\n${text}`);
-      });
     }
 
     if (connection === 'open') {
@@ -201,7 +211,7 @@ async function startInstance(name) {
         }
       } catch {}
 
-      console.log(`${LOG_TAG} [${name}] ✅ Connected! Phone: ${inst.phoneNumber || 'unknown'}`);
+      console.log(`${LOG_TAG} [${name}] Connected`);
       sendWebhook(name, 'connection.update', { state: 'open', phone: inst.phoneNumber });
     }
 
@@ -233,14 +243,19 @@ async function startInstance(name) {
         inst.reconnectTimer = setTimeout(() => {
           console.log(`${LOG_TAG} [${name}] Restarting for new QR code...`);
           startInstance(name).catch(err => {
-            console.error(`${LOG_TAG} [${name}] Restart after logout failed:`, err.message);
+            console.error(`${LOG_TAG} [${name}] Restart after logout failed: error=${safeErrorCode(err)}`);
           });
         }, 3000);
       }
     }
   });
 
-  sock.ev.on('creds.update', saveCreds);
+  const savePrivateCreds = secureSaveCreds(saveCreds, dir);
+  sock.ev.on('creds.update', () => {
+    savePrivateCreds().catch((err) => {
+      console.error(`${LOG_TAG} [${name}] Credential persistence failed: error=${safeErrorCode(err)}`);
+    });
+  });
 
   // ─── Message handler ───────────────────────────────────────────────
 
@@ -282,11 +297,11 @@ async function startInstance(name) {
           webhookData.mediaMimetype = msg.message[webhookData.messageType]?.mimetype || 'application/octet-stream';
           console.log(`${LOG_TAG} [${name}] Downloaded media: ${webhookData.messageType} (${buffer.length} bytes)`);
         } catch (err) {
-          console.error(`${LOG_TAG} [${name}] Media download failed:`, err.message);
+          console.error(`${LOG_TAG} [${name}] Media download failed: error=${safeErrorCode(err)}`);
         }
       }
 
-      console.log(`${LOG_TAG} [${name}] Message from ${msg.key.remoteJid} (fromMe=${msg.key.fromMe}): ${webhookData.messageType}`);
+      console.log(`${LOG_TAG} [${name}] Message received (fromMe=${!!msg.key.fromMe}): ${webhookData.messageType}`);
       sendWebhook(name, 'messages.upsert', webhookData);
     }
   });
@@ -307,7 +322,7 @@ function autoStartExisting() {
     if (fs.existsSync(credsFile)) {
       console.log(`${LOG_TAG} Auto-starting instance: ${name}`);
       startInstance(name).catch(err => {
-        console.error(`${LOG_TAG} [${name}] Auto-start failed:`, err.message);
+        console.error(`${LOG_TAG} [${name}] Auto-start failed: error=${safeErrorCode(err)}`);
       });
     }
   }
@@ -378,7 +393,7 @@ app.post('/instance/create', async (req, res) => {
 
     res.status(201).json(summary);
   } catch (err) {
-    console.error(`${LOG_TAG} [${name}] Create failed:`, err.message);
+    console.error(`${LOG_TAG} [${name}] Create failed: error=${safeErrorCode(err)}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -459,7 +474,7 @@ app.post('/instance/:name/disconnect', async (req, res) => {
       await inst.sock.logout();
       console.log(`${LOG_TAG} [${name}] Logged out from WhatsApp`);
     } catch (err) {
-      console.warn(`${LOG_TAG} [${name}] Logout error (may already be disconnected):`, err.message);
+      console.warn(`${LOG_TAG} [${name}] Logout error (may already be disconnected): error=${safeErrorCode(err)}`);
     }
     try { inst.sock.end(); } catch {}
     inst.sock = null;
@@ -526,10 +541,10 @@ app.post('/message/sendText/:instance', async (req, res) => {
 
   try {
     const result = await inst.sock.sendMessage(jid, { text });
-    console.log(`${LOG_TAG} [${req.params.instance}] Sent text to ${jid}`);
+    console.log(`${LOG_TAG} [${req.params.instance}] Sent text`);
     res.json({ ok: true, key: result.key });
   } catch (err) {
-    console.error(`${LOG_TAG} [${req.params.instance}] Send failed:`, err.message);
+    console.error(`${LOG_TAG} [${req.params.instance}] Send failed: error=${safeErrorCode(err)}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -560,10 +575,10 @@ app.post('/message/sendMedia/:instance', async (req, res) => {
     }
 
     const result = await inst.sock.sendMessage(jid, content);
-    console.log(`${LOG_TAG} [${req.params.instance}] Sent ${mediatype} to ${jid}`);
+    console.log(`${LOG_TAG} [${req.params.instance}] Sent ${mediatype}`);
     res.json({ ok: true, key: result.key });
   } catch (err) {
-    console.error(`${LOG_TAG} [${req.params.instance}] Send media failed:`, err.message);
+    console.error(`${LOG_TAG} [${req.params.instance}] Send media failed: error=${safeErrorCode(err)}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -608,7 +623,7 @@ app.get('/group/:instance/:jid/metadata', async (req, res) => {
       })),
     });
   } catch (err) {
-    console.error(`${LOG_TAG} [${req.params.instance}] Group metadata failed for ${jid}:`, err.message);
+    console.error(`${LOG_TAG} [${req.params.instance}] Group metadata failed: error=${safeErrorCode(err)}`);
     res.status(500).json({ error: err.message });
   }
 });
@@ -660,8 +675,8 @@ app.get('/qr', (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`${LOG_TAG} API listening on port ${PORT}`);
-  console.log(`${LOG_TAG} Webhook target: ${WEBHOOK_URL}`);
-  console.log(`${LOG_TAG} Auth base dir: ${BASE_AUTH_DIR}`);
+  console.log(`${LOG_TAG} Webhook target configured`);
+  console.log(`${LOG_TAG} Private auth storage initialized`);
 
   // Auto-start any previously paired instances
   autoStartExisting();

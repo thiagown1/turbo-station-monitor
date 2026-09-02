@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically verify the approved OpenClaw PM2 topology
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=2min
+AccuracySec=15s
+RandomizedDelaySec=15s
+Persistent=false
+Unit=turbo-pm2-reconcile.service
+
+[Install]
+WantedBy=timers.target
