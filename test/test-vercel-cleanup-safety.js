@@ -9,9 +9,11 @@ const path = require('node:path');
 const Database = require('better-sqlite3');
 
 const {
+  CLEANUP_ENABLED_ENV,
   CLEANUP_START_HOUR_UTC,
   CLEANUP_START_WINDOW_MINUTES,
   isWithinScheduledStartWindow,
+  isLiveCleanupEnabled,
   parseCliArgs,
   runCleanup,
 } = require('../scripts/cleanup-vercel');
@@ -85,6 +87,14 @@ test('CLI accepts only the explicit dry-run and force controls', () => {
   assert.throws(() => parseCliArgs(['--unknown']), /Unknown argument/);
 });
 
+test('live cleanup activation accepts only the exact value 1', () => {
+  assert.equal(CLEANUP_ENABLED_ENV, 'CLEANUP_VERCEL_ENABLED');
+  assert.equal(isLiveCleanupEnabled({ CLEANUP_VERCEL_ENABLED: '1' }), true);
+  for (const value of [undefined, '', '0', 'true', 'yes', '01', ' 1', '1 ']) {
+    assert.equal(isLiveCleanupEnabled({ CLEANUP_VERCEL_ENABLED: value }), false);
+  }
+});
+
 test('PM2 keeps the canonical one-shot 03:00 schedule without a force argument', () => {
   const ecosystem = require('../ecosystem.config');
   const app = ecosystem.apps.find((candidate) => candidate.name === 'cleanup-vercel-db');
@@ -93,12 +103,37 @@ test('PM2 keeps the canonical one-shot 03:00 schedule without a force argument',
   assert.equal(app.cron_restart, '0 3 * * *');
   assert.equal(app.autorestart, false);
   assert.equal(app.args, undefined, 'the scheduled run must pass through the normal time guard');
+  assert.equal(app.env.CLEANUP_VERCEL_ENABLED, '0', 'live cleanup must default off');
+});
+
+test('disabled live cleanup skips before opening SQLite even in-window or with --force', async () => {
+  for (const options of [
+    { now: WINDOW_START },
+    { now: OUTSIDE_WINDOW, force: true },
+    { now: WINDOW_START, env: { CLEANUP_VERCEL_ENABLED: 'true' } },
+  ]) {
+    let opened = false;
+    const result = await runCleanup({
+      ...options,
+      dbFilePath: path.join(os.tmpdir(), 'must-not-be-opened.db'),
+      env: options.env || {},
+      openDatabase() {
+        opened = true;
+        throw new Error('database must not be opened');
+      },
+      logger: silentLogger,
+    });
+
+    assert.equal(opened, false);
+    assert.deepEqual(result, { status: 'skipped', reason: 'disabled' });
+  }
 });
 
 test('an initial start outside the UTC window skips before opening or touching the database', async () => {
   let opened = false;
   const result = await runCleanup({
     now: OUTSIDE_WINDOW,
+    env: { CLEANUP_VERCEL_ENABLED: '1' },
     dbFilePath: path.join(os.tmpdir(), 'must-not-be-opened.db'),
     openDatabase() {
       opened = true;
@@ -202,6 +237,7 @@ test('--force explicitly permits an out-of-window live cleanup on a disposable d
     const result = await runCleanup({
       now: OUTSIDE_WINDOW,
       force: true,
+      env: { CLEANUP_VERCEL_ENABLED: '1' },
       dbFilePath: file,
       logger: silentLogger,
     });
@@ -224,6 +260,7 @@ test('the scheduled invocation still aggregates and prunes only expired rows', a
   try {
     const result = await runCleanup({
       now: WINDOW_START,
+      env: { CLEANUP_VERCEL_ENABLED: '1' },
       dbFilePath: file,
       logger: silentLogger,
     });

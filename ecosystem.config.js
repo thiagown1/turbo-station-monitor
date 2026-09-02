@@ -289,7 +289,11 @@ module.exports = {
       out_file: './logs/cleanup-vercel-db-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv }
+      env: {
+        ...dotenv,
+        // Destructive retention is opt-in even when PM2 launches the entry.
+        CLEANUP_VERCEL_ENABLED: dotenv.CLEANUP_VERCEL_ENABLED === '1' ? '1' : '0',
+      }
     }
   ]
 };

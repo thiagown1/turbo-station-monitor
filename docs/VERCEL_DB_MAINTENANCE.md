@@ -5,6 +5,12 @@
 for expired `vercel_logs`. Deletes remain chunked and the live path uses a
 passive WAL checkpoint; it never runs `VACUUM`.
 
+Live retention is disabled by default. The script will not open SQLite unless
+`CLEANUP_VERCEL_ENABLED` is exactly `1`; values such as `true`, `yes`, or `01`
+remain disabled. This kill switch is independent of the schedule and cannot be
+bypassed by `--force`. Setting it in production is a separate operational and
+destructive-action authorization, not part of a code deployment.
+
 ## Schedule and initial-start guard
 
 The canonical PM2 entry remains scheduled with:
@@ -28,7 +34,9 @@ job rather than pruning at an unintended time.
 
 An out-of-window invocation logs `outside-start-window`, exits successfully,
 and does not stat or open `db/vercel.db`. The next PM2 `cron_restart` at 03:00
-UTC continues to run normally.
+UTC continues to run normally only after the kill switch has been separately
+enabled. While disabled, every live invocation exits before inspecting the
+database, including invocations during the scheduled window.
 
 ## Zero-write preview
 
@@ -59,11 +67,16 @@ snapshot or diagnostic workflow; do not weaken this script's zero-write path.
 
 ## Manual mutation
 
-An out-of-window live run requires:
+An authorized out-of-window live run requires both the exact kill switch and
+the explicit time override:
 
 ```bash
-node scripts/cleanup-vercel.js --force
+CLEANUP_VERCEL_ENABLED=1 node scripts/cleanup-vercel.js --force
 ```
+
+For an approved scheduled run, put the exact value in the separately managed
+PM2 environment and omit `--force`; changing that environment is the activation
+step and requires its own authorization.
 
 This is a production database write. Do not run it merely to register or
 recover PM2. Before separately authorizing it, confirm the exact checkout and
@@ -72,8 +85,9 @@ database path, current disk headroom, a usable backup, and the state of the
 `--dry-run --force` first; obtain counts only through the separate snapshot or
 diagnostic boundary described above.
 
-`--force` does not alter the 14-day cutoff, chunk size, aggregation, or
-no-`VACUUM` policy. Unknown command-line arguments fail closed.
+`--force` changes only the time gate. It does not enable cleanup and does not
+alter the 14-day cutoff, chunk size, aggregation, or no-`VACUUM` policy.
+Unknown command-line arguments and non-exact kill-switch values fail closed.
 
 ## Physical disk boundary
 
@@ -105,8 +119,9 @@ node --test test/test-vercel-cleanup-locking.js
 ```
 
 It verifies the exact time-window boundaries, skip-before-open behavior,
-that the SQLite factory is never called by dry-run, unchanged WAL sidecars and
-database bytes/mtime/schema/rows, and the normal scheduled cleanup path.
+that the kill switch remains closed even with `--force`, that the SQLite
+factory is never called by dry-run, unchanged WAL sidecars and database
+bytes/mtime/schema/rows, and the explicitly enabled scheduled cleanup path.
 
 Rollback is a code rollback followed by the repository's separately approved
 deployment flow. Do not restart, re-register, save, or resurrect the shared PM2

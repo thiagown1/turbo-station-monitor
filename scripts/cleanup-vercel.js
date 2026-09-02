@@ -17,6 +17,7 @@ const MILLISECONDS_PER_DAY = 86400000;
 const CLEANUP_START_HOUR_UTC = 3;
 const CLEANUP_START_WINDOW_MINUTES = 15;
 const CHUNK_SIZE = 20000;
+const CLEANUP_ENABLED_ENV = 'CLEANUP_VERCEL_ENABLED';
 
 function log(message) {
   const timestamp = new Date().toISOString();
@@ -73,6 +74,10 @@ function parseCliArgs(argv) {
   return options;
 }
 
+function isLiveCleanupEnabled(env = process.env) {
+  return env?.[CLEANUP_ENABLED_ENV] === '1';
+}
+
 function openSqlite(dbFilePath) {
   return new Database(dbFilePath);
 }
@@ -95,9 +100,21 @@ async function runCleanup(options = {}) {
   const dbFilePath = options.dbFilePath || DEFAULT_DB_PATH;
   const openDatabase = options.openDatabase || openSqlite;
   const logger = options.logger || log;
+  const env = options.env === undefined ? process.env : options.env;
 
-  // This is deliberately the first operational gate. Outside the cron window
-  // we do not stat or open SQLite, so an initial PM2 registration is inert.
+  // Live retention is destructive and remains fail-closed independently of
+  // the scheduler window and --force. Dry-run is deliberately exempt because
+  // its contract below is no-open and zero-write.
+  if (!dryRun && !isLiveCleanupEnabled(env)) {
+    logger(
+      `Skipped (disabled): live cleanup requires ${CLEANUP_ENABLED_ENV}=1; ` +
+      '--force does not bypass this gate',
+    );
+    return { status: 'skipped', reason: 'disabled' };
+  }
+
+  // This remains before any database inspection. Outside the cron window we
+  // do not stat or open SQLite, so an initial PM2 registration is inert.
   if (!force && !isWithinScheduledStartWindow(startedAt)) {
     logger(
       `Skipped (outside-start-window): ${startedAt.toISOString()} is outside the ` +
@@ -250,8 +267,10 @@ if (require.main === module) {
 }
 
 module.exports = {
+  CLEANUP_ENABLED_ENV,
   CLEANUP_START_HOUR_UTC,
   CLEANUP_START_WINDOW_MINUTES,
+  isLiveCleanupEnabled,
   isWithinScheduledStartWindow,
   parseCliArgs,
   readCleanupPlan,
