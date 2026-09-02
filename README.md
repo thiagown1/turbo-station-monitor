@@ -121,3 +121,9 @@ production release; it does not publish this repository.
 npm run maintenance     # Daily cleanup, vacuum DBs
 npm run db:backup       # Backup databases
 ```
+
+The separate `cleanup-vercel-db` PM2 job retains 14 days in `db/vercel.db` and
+never vacuums it. Its initial-start guard, zero-write dry-run, explicit
+out-of-window override, default-off live-cleanup kill switch, and operator
+checks are documented in
+[`docs/VERCEL_DB_MAINTENANCE.md`](docs/VERCEL_DB_MAINTENANCE.md).
