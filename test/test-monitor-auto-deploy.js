@@ -13,6 +13,8 @@ const {
   deployMonitor,
   notifyDeploy,
   restartServices,
+  assertPm2PersistenceSafe,
+  REQUIRED_MONITOR_PROCESSES,
   SELF_SERVICE,
 } = require('../services/lib/monitor-auto-deploy');
 
@@ -43,7 +45,84 @@ async function expectReject(name, fn, pattern) {
     [...servicesForFiles(['services/lib/service-port.js'])].sort(),
     [...ALL_SERVICES].sort()
   );
+  assert.deepStrictEqual([...ALL_SERVICES].sort(), [...REQUIRED_MONITOR_PROCESSES].sort());
   console.log('  ✅ maps the real git diff to affected PM2 services');
+
+  const pm2FixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-pm2-persistence-'));
+  const dumpPath = path.join(pm2FixtureDir, 'dump.pm2');
+  const procNetUnixPath = path.join(pm2FixtureDir, 'proc-net-unix');
+  const socketPath = path.join(pm2FixtureDir, 'rpc.sock');
+  const requiredApps = REQUIRED_MONITOR_PROCESSES.map((name) => ({ name }));
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps));
+  fs.writeFileSync(
+    procNetUnixPath,
+    `Num RefCount Protocol Flags Type St Inode Path\n0001: 00000002 00000000 00010000 0001 01 42 ${socketPath}\n`
+  );
+  const safeTopology = await assertPm2PersistenceSafe({
+    dumpPath,
+    procNetUnixPath,
+    socketPath,
+    run: async (_command, args) => {
+      assert.deepStrictEqual(args, ['jlist']);
+      return { stdout: JSON.stringify(requiredApps) };
+    },
+  });
+  assert.strictEqual(safeTopology.live.size, REQUIRED_MONITOR_PROCESSES.length);
+
+  let deadDaemonCliCalls = 0;
+  fs.writeFileSync(procNetUnixPath, 'Num RefCount Protocol Flags Type St Inode Path\n');
+  await expectReject(
+    'dead PM2 daemon',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => { deadDaemonCliCalls += 1; return { stdout: '[]' }; },
+    }),
+    /no listening PM2 RPC socket/i
+  );
+  assert.strictEqual(deadDaemonCliCalls, 0, 'jlist must not spawn a replacement daemon');
+  fs.writeFileSync(
+    procNetUnixPath,
+    `0001: 00000002 00000000 00010000 0001 01 42 ${socketPath}\n`
+  );
+
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps.slice(0, -1)));
+  let invalidDumpCliCalls = 0;
+  await expectReject(
+    'incomplete persisted PM2 topology',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => { invalidDumpCliCalls += 1; return { stdout: '[]' }; },
+    }),
+    /persisted.*missing required.*whatsapp-gateway/i
+  );
+  assert.strictEqual(invalidDumpCliCalls, 0, 'invalid dump is rejected before jlist');
+  fs.writeFileSync(dumpPath, JSON.stringify(requiredApps));
+
+  await expectReject(
+    'incomplete live PM2 topology',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => ({ stdout: JSON.stringify(requiredApps.slice(0, -1)) }),
+    }),
+    /missing from live PM2.*whatsapp-gateway/i
+  );
+  await expectReject(
+    'unexpected live PM2 topology',
+    () => assertPm2PersistenceSafe({
+      dumpPath,
+      procNetUnixPath,
+      socketPath,
+      run: async () => ({ stdout: JSON.stringify([...requiredApps, { name: 'temporary-debug' }]) }),
+    }),
+    /live but not persisted.*temporary-debug/i
+  );
+  console.log('  ✅ refuses PM2 save when dump, daemon, or live topology is incomplete');
 
   await expectReject(
     'failed CI',
@@ -135,6 +214,40 @@ async function expectReject(name, fn, pattern) {
   assert.ok(!dirtyCalls.some((call) => call.includes('ci')));
   console.log('  ✅ refuses a dirty production checkout before changing it');
 
+  const incompletePm2Dir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-incomplete-pm2-'));
+  fs.mkdirSync(path.join(incompletePm2Dir, 'db'), { recursive: true });
+  const incompletePm2Calls = [];
+  let pm2Preflights = 0;
+  await expectReject(
+    'incomplete PM2 topology preflight',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: incompletePm2Dir,
+      run: async (command, args) => {
+        incompletePm2Calls.push([command, ...args]);
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'fetch') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+        if (args[0] === 'status') return { stdout: '' };
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+        if (args[0] === 'diff') return { stdout: 'services/alert-engine.js\n' };
+        return { stdout: '' };
+      },
+      checkPm2Persistence: async () => {
+        pm2Preflights += 1;
+        throw new Error('PM2 topology mismatch; refusing restart/save');
+      },
+      checkHealth: async () => { throw new Error('PM2 preflight must run before health checks'); },
+    }),
+    /PM2 topology mismatch/
+  );
+  assert.strictEqual(pm2Preflights, 1);
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'merge'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'ci'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'restart'));
+  assert.ok(!incompletePm2Calls.some((call) => call[1] === 'save'));
+  console.log('  ✅ checks PM2 topology before merge, install, restart or save');
+
   const cleanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-clean-'));
   fs.mkdirSync(path.join(cleanDir, 'services', 'support-copilot'), { recursive: true });
   fs.mkdirSync(path.join(cleanDir, 'db'), { recursive: true });
@@ -156,6 +269,7 @@ async function expectReject(name, fn, pattern) {
     repoDir: cleanDir,
     run,
     checkHealth: async (services) => assert.deepStrictEqual(services, ['support-copilot']),
+    checkPm2Persistence: async () => { pm2Preflights += 1; },
   });
   assert.deepStrictEqual(result.services, ['support-copilot']);
   assert.ok(calls.some((call) => call[1] === 'merge' && call.includes('--ff-only')));
@@ -168,6 +282,7 @@ async function expectReject(name, fn, pattern) {
   assert.ok(restartCall.includes('ecosystem.config.js'), 'restart relê o ecosystem.config.js');
   assert.ok(restartCall.includes('--only'), 'restart usa --only');
   assert.ok(restartCall.includes('--update-env'), 'restart atualiza o env');
+  assert.strictEqual(pm2Preflights, 3, 'checks once before mutation and again immediately before save');
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
@@ -190,6 +305,7 @@ async function expectReject(name, fn, pattern) {
       return { stdout: '' };
     },
     checkHealth: async () => {},
+    checkPm2Persistence: async () => {},
     lockSleepFn: async () => {
       lockSleeps += 1;
       fs.unlinkSync(waitingLockPath);
@@ -294,6 +410,7 @@ async function expectReject(name, fn, pattern) {
     repoDir: selfDir,
     run: selfRun,
     checkHealth: async (services) => { healthChecked = services; },
+    checkPm2Persistence: async () => {},
   });
 
   assert.ok(selfResult.services.includes(SELF_SERVICE), 'o webhook está entre os afetados');
@@ -335,9 +452,34 @@ async function expectReject(name, fn, pattern) {
       return { stdout: '' };
     },
     checkHealth: async () => {},
+    checkPm2Persistence: async () => {},
   });
   assert.deepStrictEqual(plainResult.deferredServices, [], 'sem webhook afetado, nada a adiar');
   console.log('  ✅ defers nothing when the webhook is not affected');
+
+  const docsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-docs-only-'));
+  fs.mkdirSync(path.join(docsDir, 'db'), { recursive: true });
+  const docsCalls = [];
+  const docsResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: docsDir,
+    run: async (command, args) => {
+      docsCalls.push([command, ...args]);
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'fetch') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: `${NEW_SHA}\n` };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: `${OLD_SHA}\n` };
+      if (args[0] === 'diff') return { stdout: 'docs/AUTO_DEPLOY.md\n' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => {},
+    checkPm2Persistence: async () => { throw new Error('docs-only deploy must not inspect PM2'); },
+  });
+  assert.deepStrictEqual(docsResult.services, []);
+  assert.ok(!docsCalls.some((call) => call[1] === 'restart'));
+  assert.ok(!docsCalls.some((call) => call[1] === 'save'));
+  console.log('  ✅ does not rewrite PM2 persistence for a docs-only deploy');
 
   // The deferred restart the caller runs uses the same ecosystem-aware command.
   const deferredCalls = [];

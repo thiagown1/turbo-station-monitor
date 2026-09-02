@@ -4,6 +4,12 @@ const fs = require('fs');
 const http = require('http');
 const path = require('path');
 const { execFile } = require('child_process');
+const {
+  REQUIRED_MONITOR_PROCESSES,
+  parsePm2Inventory,
+  assertRequiredInventory,
+  hasUnixSocketListener,
+} = require('./pm2-topology');
 
 const REPOSITORY = 'thiagown1/turbo-station-monitor';
 // The webhook that SPAWNS the deploy worker. pm2 kills a restarted app's whole
@@ -15,21 +21,13 @@ const REPOSITORY = 'thiagown1/turbo-station-monitor';
 // this way on 2026-08-18/19. It is therefore restarted LAST, by the caller, once
 // everything else is already durable.
 const SELF_SERVICE = 'github-webhook';
-const ALL_SERVICES = [
-  'ocpp-collector',
-  'ocpp-alerts',
-  'vercel-drain',
-  'github-webhook',
-  'mobile-telemetry',
-  'pagarme-status-webhook',
-  'alert-engine',
-  'support-copilot',
-  'whatsapp-gateway',
-];
+const ALL_SERVICES = REQUIRED_MONITOR_PROCESSES;
 
 const SERVICE_RULES = [
+  ['services/mosim-logtail/', ['mosim-logtail']],
   ['services/support-copilot/', ['support-copilot']],
   ['services/whatsapp-gateway/', ['whatsapp-gateway']],
+  ['services/ai-subscription-gateway/', ['ai-openclaw-agent']],
   ['services/smart-collector.js', ['ocpp-collector']],
   ['services/alert-processor.js', ['ocpp-alerts']],
   ['services/vercel-drain.js', ['vercel-drain']],
@@ -268,12 +266,72 @@ async function restartServices(services, { run = execFilePromise, pm2Bin, repoDi
   return [...services];
 }
 
+/**
+ * Refuse a global `pm2 save` unless the existing reboot inventory contains the
+ * complete monitor core and exactly matches the live daemon. The kernel socket
+ * check runs before `jlist`, because PM2 otherwise starts a fresh empty daemon
+ * as a side effect when the original daemon is gone.
+ */
+async function assertPm2PersistenceSafe({
+  run = execFilePromise,
+  pm2Bin = process.env.PM2_BIN || '/home/openclaw/.npm-global/bin/pm2',
+  repoDir,
+  fsImpl = fs,
+  pm2Home = process.env.PM2_HOME || '/home/openclaw/.pm2',
+  dumpPath = process.env.PM2_DUMP_PATH || path.join(pm2Home, 'dump.pm2'),
+  socketPath = path.join(pm2Home, 'rpc.sock'),
+  procNetUnixPath = '/proc/net/unix',
+} = {}) {
+  let persistedRaw;
+  try {
+    persistedRaw = fsImpl.readFileSync(dumpPath, 'utf8');
+  } catch (error) {
+    throw new Error(`persisted PM2 inventory is unavailable at ${dumpPath}: ${error.message}`);
+  }
+  const persisted = parsePm2Inventory(persistedRaw, 'persisted PM2 inventory');
+  assertRequiredInventory(persisted, { label: 'persisted PM2 inventory' });
+
+  let procNetUnix;
+  try {
+    procNetUnix = fsImpl.readFileSync(procNetUnixPath, 'utf8');
+  } catch (error) {
+    throw new Error(`cannot inspect PM2 daemon socket via ${procNetUnixPath}: ${error.message}`);
+  }
+  if (!hasUnixSocketListener(procNetUnix, socketPath)) {
+    throw new Error(`no listening PM2 RPC socket at ${socketPath}; refusing jlist/restart/save`);
+  }
+
+  const { stdout } = await run(pm2Bin, ['jlist'], { cwd: repoDir, timeout: 30000 });
+  const live = parsePm2Inventory(stdout, 'live PM2 inventory');
+
+  const missing = [];
+  for (const [name, expectedCount] of persisted) {
+    const liveCount = live.get(name) || 0;
+    if (liveCount < expectedCount) missing.push(`${name} (${liveCount}/${expectedCount})`);
+  }
+  const unexpected = [];
+  for (const [name, liveCount] of live) {
+    const expectedCount = persisted.get(name) || 0;
+    if (liveCount > expectedCount) unexpected.push(`${name} (${liveCount}/${expectedCount})`);
+  }
+  if (missing.length || unexpected.length) {
+    const details = [
+      missing.length ? `missing from live PM2: ${missing.join(', ')}` : null,
+      unexpected.length ? `live but not persisted: ${unexpected.join(', ')}` : null,
+    ].filter(Boolean).join('; ');
+    throw new Error(`PM2 topology mismatch (${details}); refusing restart/save until an operator reconciles it`);
+  }
+
+  return { dumpPath, persisted, live };
+}
+
 async function deployMonitor({
   sha,
   repoDir,
   run = execFilePromise,
   waitForCi = waitForSuccessfulCi,
   checkHealth = verifyHealth,
+  checkPm2Persistence = assertPm2PersistenceSafe,
   fsImpl = fs,
   gitBin = process.env.GIT_BIN || '/usr/bin/git',
   npmBin = process.env.NPM_BIN || '/usr/bin/npm',
@@ -323,6 +381,11 @@ async function deployMonitor({
     const { stdout: diffOut } = await run(gitBin, ['diff', '--name-only', deployedSha, targetSha], { cwd: repoDir });
     const changedFiles = diffOut.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const services = servicesForFiles(changedFiles);
+    const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
+    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
+    if (services.size) {
+      await checkPm2Persistence({ run, pm2Bin, repoDir, fsImpl });
+    }
 
     if (headSha !== targetSha) {
       await run(gitBin, ['merge', '--ff-only', targetSha], { cwd: repoDir });
@@ -333,12 +396,12 @@ async function deployMonitor({
       await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
     }
 
-    const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
-    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
-
     await restartServices(immediateServices, { run, pm2Bin, repoDir });
     await checkHealth(immediateServices);
-    await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
+    if (immediateServices.length) {
+      await checkPm2Persistence({ run, pm2Bin, repoDir, fsImpl });
+      await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
+    }
 
     fsImpl.writeFileSync(statePath, `${targetSha}\n`, 'utf8');
     log(`[auto-deploy] deployed ${targetSha.slice(0, 8)}; restarted: ${immediateServices.join(', ') || 'none'}`);
@@ -429,5 +492,7 @@ module.exports = {
   execFilePromise,
   notifyDeploy,
   restartServices,
+  assertPm2PersistenceSafe,
+  REQUIRED_MONITOR_PROCESSES,
   SELF_SERVICE,
 };
