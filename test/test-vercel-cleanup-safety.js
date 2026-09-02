@@ -196,6 +196,29 @@ test('--force explicitly permits an out-of-window dry-run without enabling write
   }
 });
 
+test('--force explicitly permits an out-of-window live cleanup on a disposable database', async () => {
+  const { dir, file } = makeDb();
+  try {
+    const result = await runCleanup({
+      now: OUTSIDE_WINDOW,
+      force: true,
+      dbFilePath: file,
+      logger: silentLogger,
+    });
+
+    assert.equal(result.status, 'completed');
+    assert.equal(result.deletedVercelLogs, 1);
+    assert.equal(result.deletedVercelRequests, 1);
+
+    const db = new Database(file, { readonly: true });
+    assert.deepEqual(db.prepare('SELECT endpoint FROM vercel_logs ORDER BY endpoint').all(), [{ endpoint: '/fresh' }]);
+    assert.deepEqual(db.prepare('SELECT request_id FROM vercel_requests ORDER BY request_id').all(), [{ request_id: 'fresh-request' }]);
+    db.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('the scheduled invocation still aggregates and prunes only expired rows', async () => {
   const { dir, file } = makeDb();
   try {
