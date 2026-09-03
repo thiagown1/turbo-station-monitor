@@ -15,6 +15,13 @@ let delivering = false;
 let deliveringMediaJobs = false;
 let mediaJobsRecovered = false;
 const MEDIA_JOB_MAX_ATTEMPTS = 5;
+/**
+ * Teto de tentativas de entrega de um evento ao backend. O backoff satura em 6h,
+ * então 12 tentativas cobrem ~2 dias — folga suficiente para atravessar um deploy
+ * fora de ordem, uma rotação de segredo ou um fim de semana antes de alguém
+ * olhar. Passado isso o evento para em `needs_attention`, nunca em "entregue".
+ */
+const MAX_DELIVERY_ATTEMPTS = 12;
 const MODEL_WAIT_RETRY_MS = 15 * 60_000;
 let mediaModelUnavailableUntil = 0;
 
@@ -534,13 +541,31 @@ async function deliverDueEvents() {
           method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` }, body: row.payload_json, signal: AbortSignal.timeout(20_000),
         });
         status = res.status; responseBody = (await res.text()).slice(0, 2000);
-        if (res.ok || (res.status >= 400 && res.status < 500 && res.status !== 429)) {
-          db.prepare("UPDATE agent_event_outbox SET status = ?, attempts = attempts + 1, response_status = ?, response_json = ?, last_error = NULL, updated_at = ? WHERE id = ?")
-            .run(res.ok ? 'delivered' : 'business_rejected', status, responseBody, nowIso(), row.id);
+        if (res.ok) {
+          db.prepare("UPDATE agent_event_outbox SET status = 'delivered', attempts = attempts + 1, response_status = ?, response_json = ?, last_error = NULL, updated_at = ? WHERE id = ?")
+            .run(status, responseBody, nowIso(), row.id);
           continue;
         }
+        // Um 4xx NÃO é rejeição de negócio, e tratá-lo como tal (o antigo
+        // `business_rejected`) desligava a entrega para sempre, em silêncio, no
+        // caso errado. Todo desfecho de negócio do backend volta 202 —
+        // sender_not_allowed, agent_disabled, partner_not_identified, tudo. Os
+        // não-2xx que existem de verdade são erro NOSSO e se curam sozinhos:
+        // 400 = schema fora de sincronia entre este serviço e o deploy do Next
+        // (janela entre um merge aqui e o deploy de lá), 401 = segredo errado,
+        // 503 = backend desconfigurado. Comprovante de repasse não pode evaporar
+        // por causa disso, então tudo retenta com backoff.
       } catch (error) { responseBody = error.message; }
       const attempts = row.attempts + 1;
+      // Esgotado o teto, o evento NÃO vira "entregue" nem some: para em
+      // `needs_attention` com payload e última resposta intactos, para alguém
+      // olhar e redirigir (basta voltar o status para 'pending').
+      if (attempts >= MAX_DELIVERY_ATTEMPTS) {
+        db.prepare("UPDATE agent_event_outbox SET status = 'needs_attention', attempts = ?, response_status = ?, last_error = ?, updated_at = ? WHERE id = ?")
+          .run(attempts, status || null, responseBody.slice(0, 500), nowIso(), row.id);
+        console.error(`[support-copilot] evento ${row.id} parado em needs_attention apos ${attempts} tentativas (ultimo status ${status || 'sem resposta'})`);
+        continue;
+      }
       const delayMs = Math.min(6 * 60 * 60 * 1000, 30_000 * (2 ** Math.min(attempts, 8)));
       db.prepare("UPDATE agent_event_outbox SET status = 'retry', attempts = ?, next_attempt_at = ?, response_status = ?, last_error = ?, updated_at = ? WHERE id = ?")
         .run(attempts, new Date(Date.now() + delayMs).toISOString(), status || null, responseBody.slice(0, 500), nowIso(), row.id);
