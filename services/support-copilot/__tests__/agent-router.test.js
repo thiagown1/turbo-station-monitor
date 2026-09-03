@@ -575,9 +575,9 @@ test('routes receipts from a multi-partner group only when the extracted payee i
         process.env.AGENT_EVENT_SECRET = 'test-secret';
         process.env.OPENROUTER_API_KEY = 'test-openrouter';
         const modelReplies = [
-          { amount: 'R$ 7.686,85', transaction_id: 'E2E-ARENA', payee: 'ARENA ENERGIA E CORRETORA' },
-          { amount: 'R$ 5.326,47', transaction_id: 'E2E-DAMIAO', payee: 'Damiao de Jesus Ramos' },
-          { amount: 'R$ 9.999,99', transaction_id: 'E2E-UNKNOWN', payee: 'Outro favorecido' },
+          { amount: 'R$ 7.686,85', transaction_id: 'E2E-ARENA', payee: 'ARENA ENERGIA E CORRETORA', payee_document: '50.643.268/0001-10' },
+          { amount: 'R$ 5.326,47', transaction_id: 'E2E-DAMIAO', payee: 'Damiao de Jesus Ramos', payee_document: '497.176.185-34' },
+          { amount: 'R$ 9.999,99', transaction_id: 'E2E-UNKNOWN', payee: 'Outro favorecido', payee_document: '6541160' },
         ];
         const events = [];
         let modelCalls = 0;
@@ -628,6 +628,22 @@ test('routes receipts from a multi-partner group only when the extracted payee i
         if (events[0].partnerId !== 'partner-arena') throw new Error('Arena receipt resolved to wrong partner');
         if (events[1].partnerId !== 'partner-damiao') throw new Error('accent-insensitive Damião match failed');
         if (Object.hasOwn(events[2], 'partnerId')) throw new Error('unknown payee must remain unbound');
+        // A payee the group cannot name (the usual case — a PIX comprovante prints
+        // the account holder, not the partner's registered name) must still reach
+        // the backend with the group's partners, which then decides by amount.
+        if (JSON.stringify(events[2].candidatePartnerIds) !== JSON.stringify(['partner-arena', 'partner-damiao'])) {
+          throw new Error('unresolved payee must carry the group candidates, got ' + JSON.stringify(events[2].candidatePartnerIds));
+        }
+        // A receipt already tied to one partner must NOT widen the search.
+        if (Object.hasOwn(events[0], 'candidatePartnerIds') || Object.hasOwn(events[1], 'candidatePartnerIds')) {
+          throw new Error('a resolved receipt must not send candidates');
+        }
+        // The payee document travels as digits only — it is what identifies the
+        // partner when the comprovante is re-sent in the accounting group.
+        if (events[0].payeeDocument !== '50643268000110') throw new Error('CNPJ do favorecido nao normalizado: ' + events[0].payeeDocument);
+        if (events[1].payeeDocument !== '49717618534') throw new Error('CPF do favorecido nao normalizado: ' + events[1].payeeDocument);
+        // A half-read number must be dropped, never sent as a guess.
+        if (Object.hasOwn(events[2], 'payeeDocument')) throw new Error('documento incompleto nao pode ser enviado');
         console.log('agent-multi-partner-receipts-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
@@ -673,6 +689,73 @@ test('station requests use the tool-backed support suggestion and still require 
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     assert.ok(output.includes('agent-station-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
+test('a 400 do backend nunca descarta o evento: retenta e para em needs_attention com o payload intacto', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-400-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        // Cenario real: a VPS subiu com um campo novo antes do deploy do Next, e
+        // o schema strict de la responde 400. Um comprovante de repasse nao pode
+        // evaporar por causa dessa janela.
+        let posts = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/events')) {
+            posts++;
+            return { ok: false, status: 400, text: async () => '{"error":"Invalid request body"}' };
+          }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const now = nowIso();
+        const payload = JSON.stringify({ brandId: 'turbo_station', kind: 'partner_payment_receipt', amountCents: 1640452, payeeDocument: '65411604000176' });
+        db.prepare("INSERT INTO agent_event_outbox (id, message_id, brand_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at) VALUES ('evt-400','msg-400','turbo_station',?,'pending',0,?,?,?)")
+          .run(payload, now, now, now);
+
+        await router.deliverDueEvents();
+        let row = db.prepare("SELECT * FROM agent_event_outbox WHERE id = 'evt-400'").get();
+        if (row.status !== 'retry') throw new Error('400 deveria retentar, veio: ' + row.status);
+        if (row.response_status !== 400) throw new Error('status da resposta nao registrado');
+
+        // Esgota o teto: cada rodada precisa estar vencida para ser elegivel.
+        for (let i = 0; i < 15; i++) {
+          db.prepare("UPDATE agent_event_outbox SET next_attempt_at = ? WHERE id = 'evt-400'").run(nowIso());
+          await router.deliverDueEvents();
+          row = db.prepare("SELECT * FROM agent_event_outbox WHERE id = 'evt-400'").get();
+          if (row.status === 'needs_attention') break;
+        }
+        if (row.status !== 'needs_attention') throw new Error('deveria parar em needs_attention, veio: ' + row.status);
+        if (row.status === 'delivered') throw new Error('nunca pode virar entregue');
+        if (JSON.parse(row.payload_json).amountCents !== 1640452) throw new Error('payload perdido');
+        if (row.last_error.indexOf('Invalid request body') === -1) throw new Error('resposta do backend nao preservada');
+
+        // Parado significa parado: nao continua consumindo tentativa.
+        const before = posts;
+        db.prepare("UPDATE agent_event_outbox SET next_attempt_at = ? WHERE id = 'evt-400'").run(nowIso());
+        await router.deliverDueEvents();
+        if (posts !== before) throw new Error('needs_attention nao pode continuar sendo entregue');
+
+        // E redirigivel: basta voltar para pending que a proxima janela entrega.
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/events')) { posts++; return { ok: true, status: 202, text: async () => '{"ok":true}' }; }
+          throw new Error('unexpected URL ' + url);
+        };
+        db.prepare("UPDATE agent_event_outbox SET status = 'pending', next_attempt_at = ? WHERE id = 'evt-400'").run(nowIso());
+        await router.deliverDueEvents();
+        row = db.prepare("SELECT * FROM agent_event_outbox WHERE id = 'evt-400'").get();
+        if (row.status !== 'delivered') throw new Error('redirigir depois do deploy deveria entregar, veio: ' + row.status);
+        console.log('agent-outbox-400-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('agent-outbox-400-ok'));
   } finally {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
   }
