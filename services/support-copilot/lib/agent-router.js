@@ -245,6 +245,7 @@ async function routeInboundMessage(input) {
     amountCents: result.amountCents,
     receiptRef: result.receiptRef,
     payee: result.payee,
+    payeeDocument: result.payeeDocument,
     transactionDate: result.transactionDate,
     suggestedPeriod: result.suggestedPeriod,
     currency: result.currency,

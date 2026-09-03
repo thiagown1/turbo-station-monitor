@@ -575,9 +575,9 @@ test('routes receipts from a multi-partner group only when the extracted payee i
         process.env.AGENT_EVENT_SECRET = 'test-secret';
         process.env.OPENROUTER_API_KEY = 'test-openrouter';
         const modelReplies = [
-          { amount: 'R$ 7.686,85', transaction_id: 'E2E-ARENA', payee: 'ARENA ENERGIA E CORRETORA' },
-          { amount: 'R$ 5.326,47', transaction_id: 'E2E-DAMIAO', payee: 'Damiao de Jesus Ramos' },
-          { amount: 'R$ 9.999,99', transaction_id: 'E2E-UNKNOWN', payee: 'Outro favorecido' },
+          { amount: 'R$ 7.686,85', transaction_id: 'E2E-ARENA', payee: 'ARENA ENERGIA E CORRETORA', payee_document: '50.643.268/0001-10' },
+          { amount: 'R$ 5.326,47', transaction_id: 'E2E-DAMIAO', payee: 'Damiao de Jesus Ramos', payee_document: '497.176.185-34' },
+          { amount: 'R$ 9.999,99', transaction_id: 'E2E-UNKNOWN', payee: 'Outro favorecido', payee_document: '6541160' },
         ];
         const events = [];
         let modelCalls = 0;
@@ -638,6 +638,12 @@ test('routes receipts from a multi-partner group only when the extracted payee i
         if (Object.hasOwn(events[0], 'candidatePartnerIds') || Object.hasOwn(events[1], 'candidatePartnerIds')) {
           throw new Error('a resolved receipt must not send candidates');
         }
+        // The payee document travels as digits only — it is what identifies the
+        // partner when the comprovante is re-sent in the accounting group.
+        if (events[0].payeeDocument !== '50643268000110') throw new Error('CNPJ do favorecido nao normalizado: ' + events[0].payeeDocument);
+        if (events[1].payeeDocument !== '49717618534') throw new Error('CPF do favorecido nao normalizado: ' + events[1].payeeDocument);
+        // A half-read number must be dropped, never sent as a guess.
+        if (Object.hasOwn(events[2], 'payeeDocument')) throw new Error('documento incompleto nao pode ser enviado');
         console.log('agent-multi-partner-receipts-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
