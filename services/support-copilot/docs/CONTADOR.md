@@ -155,8 +155,14 @@ monthly values into the workspace.
   its group has at least one active partner link. A group with one partner is
   bound directly; a group with multiple partners is bound only when the
   normalized payee extracted from the receipt exactly identifies one linked
-  `partner_name`. A missing or ambiguous match omits `partnerId`, remains in
-  human review and never settles a partner payment automatically;
+  `partner_name`. A missing or ambiguous match omits `partnerId` and instead
+  sends `candidatePartnerIds` with every partner in that group — the payee on a
+  PIX comprovante is the account holder, so it rarely equals the registered
+  partner name, and dropping those receipts is what left real settlements
+  unconfirmed. The backend picks by amount among the candidates and refuses when
+  two of them are owed the same value; the group↔payment binding it enforces
+  (the report for that settlement was delivered to that conversation) is what
+  keeps the widened search safe. Nothing is settled here either way;
 - deterministic gate for PDF, accounting questions, explicit mentions and
   replies to a prior Contador message;
 - ordinary group chatter is ignored without invoking Opus;

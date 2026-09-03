@@ -89,6 +89,25 @@ function resolvePartnerId(partnerLinks, result) {
   return matches.length === 1 ? matches[0].partner_id : undefined;
 }
 
+/**
+ * Partners this receipt could belong to, when the group has several linked and
+ * the payee name resolved none of them. That is the normal case, not an edge:
+ * the favorecido printed on a PIX comprovante is the account holder ("49.475.354
+ * PATRICIA CLAIR DOS"), which rarely equals the partner's registered name.
+ *
+ * Sending the whole group lets the backend decide by amount — it holds the
+ * settlements and, more importantly, the gate that keeps this safe: it only
+ * confirms a payment whose report was delivered to THIS conversation, and refuses
+ * when two partners in the group are owed the same amount. Resolving here instead
+ * would mean shipping payment data to the VPS for no gain.
+ */
+function partnerCandidateIds(partnerLinks, result, partnerId) {
+  if (partnerId) return undefined;
+  if (result?.kind !== 'partner_payment_receipt') return undefined;
+  if (partnerLinks.length < 2) return undefined;
+  return partnerLinks.map(link => link.partner_id);
+}
+
 function generalLimitReached(brandId, limit) {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - 86_400_000).toISOString();
@@ -234,6 +253,7 @@ async function routeInboundMessage(input) {
     suggestedCategory: result.suggestedCategory,
     suggestedReply: result.suggestedReply,
     partnerId,
+    candidatePartnerIds: partnerCandidateIds(partnerLinks, result, partnerId),
     cost: result.cost,
   } : null;
   let financialApproval = { handled: false };

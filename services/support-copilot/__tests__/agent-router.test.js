@@ -628,6 +628,16 @@ test('routes receipts from a multi-partner group only when the extracted payee i
         if (events[0].partnerId !== 'partner-arena') throw new Error('Arena receipt resolved to wrong partner');
         if (events[1].partnerId !== 'partner-damiao') throw new Error('accent-insensitive Damião match failed');
         if (Object.hasOwn(events[2], 'partnerId')) throw new Error('unknown payee must remain unbound');
+        // A payee the group cannot name (the usual case — a PIX comprovante prints
+        // the account holder, not the partner's registered name) must still reach
+        // the backend with the group's partners, which then decides by amount.
+        if (JSON.stringify(events[2].candidatePartnerIds) !== JSON.stringify(['partner-arena', 'partner-damiao'])) {
+          throw new Error('unresolved payee must carry the group candidates, got ' + JSON.stringify(events[2].candidatePartnerIds));
+        }
+        // A receipt already tied to one partner must NOT widen the search.
+        if (Object.hasOwn(events[0], 'candidatePartnerIds') || Object.hasOwn(events[1], 'candidatePartnerIds')) {
+          throw new Error('a resolved receipt must not send candidates');
+        }
         console.log('agent-multi-partner-receipts-ok');
       })().catch(e => { console.error(e); process.exit(1); });
     `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
