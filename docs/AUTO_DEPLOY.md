@@ -39,6 +39,30 @@ Changes to `ecosystem.config.js`, root dependency manifests, or shared
 `services/lib/` code restart every managed monitor service. Service-specific
 changes restart only the corresponding PM2 process.
 
+## Dependency installation
+
+`npm ci` runs only when the release diff touches `package.json` or
+`package-lock.json` (root, or `services/support-copilot/`), or when the matching
+`node_modules/` is absent. A code-only release installs nothing.
+
+This is a safety gate, not an optimisation. `npm ci` deletes `node_modules`
+before reinstalling, and on the monitor box, with the CI runners loaded, the
+support-copilot install (native `better-sqlite3`) measured about five minutes.
+Running it unconditionally on every deploy put that window in front of every
+release: on 2026-09-03 it exceeded the former 180-second ceiling and killed the
+deploy of PR #78 *after* the fast-forward had landed, leaving the new code on
+disk and the old process still serving, with the alert showing only npm's
+`prebuild-install` deprecation warning as the apparent cause.
+
+When an install does run, the ceiling is 900 seconds and a timeout is reported
+as `npm ci (<scope>) timed out after <n>s`, so the notification names the real
+failure instead of the last line npm happened to print.
+
+Because the diff is taken from the deployed marker rather than from `HEAD`, a
+release that dies before the install is retried correctly: the marker still
+points at the previously installed SHA, so the manifest change stays inside the
+next diff.
+
 ## Failure behavior
 
 The worker fails closed. It does not reset, stash, discard, or overwrite local

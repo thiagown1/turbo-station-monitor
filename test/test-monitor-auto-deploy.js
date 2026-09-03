@@ -9,6 +9,7 @@ const {
   ALL_SERVICES,
   assertCommitSha,
   servicesForFiles,
+  needsInstall,
   waitForSuccessfulCi,
   deployMonitor,
   notifyDeploy,
@@ -171,6 +172,105 @@ async function expectReject(name, fn, pattern) {
   assert.strictEqual(fs.readFileSync(path.join(cleanDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
   assert.ok(!fs.existsSync(path.join(cleanDir, 'db', '.monitor-deploy.lock')));
   console.log('  ✅ clears stale lock, fast-forwards, installs, restarts, health-checks and records SHA');
+
+  // A `npm ci` on the monitor box takes ~5 minutes under CI-runner load and
+  // wipes node_modules first. It must not run when no manifest moved: on
+  // 2026-09-03 the unconditional install blew the 180s ceiling and killed the
+  // deploy of #78 *after* the fast-forward, leaving new code on disk and the
+  // old process still serving.
+  assert.strictEqual(
+    needsInstall({
+      packageDir: 'services/support-copilot',
+      changedFiles: ['services/support-copilot/lib/agent-router.js'],
+      repoDir: cleanDir,
+      fsImpl: { existsSync: () => true },
+    }),
+    null
+  );
+  assert.strictEqual(
+    needsInstall({
+      packageDir: 'services/support-copilot',
+      changedFiles: ['services/support-copilot/package-lock.json'],
+      repoDir: cleanDir,
+      fsImpl: { existsSync: () => true },
+    }),
+    'manifest changed'
+  );
+  assert.strictEqual(
+    needsInstall({
+      packageDir: '',
+      changedFiles: ['package-lock.json'],
+      repoDir: cleanDir,
+      fsImpl: { existsSync: () => true },
+    }),
+    'manifest changed'
+  );
+  assert.strictEqual(
+    needsInstall({
+      packageDir: '',
+      changedFiles: ['services/alert-engine.js'],
+      repoDir: cleanDir,
+      fsImpl: { existsSync: () => false },
+    }),
+    'node_modules missing'
+  );
+  console.log('  ✅ only installs when a manifest moved or node_modules is absent');
+
+  const installedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-installed-'));
+  fs.mkdirSync(path.join(installedDir, 'services', 'support-copilot', 'node_modules'), { recursive: true });
+  fs.mkdirSync(path.join(installedDir, 'node_modules'), { recursive: true });
+  fs.mkdirSync(path.join(installedDir, 'db'), { recursive: true });
+  fs.writeFileSync(path.join(installedDir, 'services', 'support-copilot', 'package-lock.json'), '{}');
+  const installedCalls = [];
+  const installedResult = await deployMonitor({
+    sha: NEW_SHA,
+    repoDir: installedDir,
+    run: async (command, args) => {
+      installedCalls.push([command, ...args]);
+      if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+      if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: NEW_SHA };
+      if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: OLD_SHA };
+      if (args[0] === 'status') return { stdout: '' };
+      if (args[0] === 'diff') return { stdout: 'services/support-copilot/lib/agent-router.js' };
+      return { stdout: '' };
+    },
+    checkHealth: async () => {},
+  });
+  assert.strictEqual(installedResult.status, 'deployed');
+  assert.ok(!installedCalls.some((call) => call[1] === 'ci'), 'nao roda npm ci sem mudanca de manifesto');
+  assert.ok(installedCalls.some((call) => call[1] === 'restart' && call.includes('support-copilot')));
+  assert.strictEqual(fs.readFileSync(path.join(installedDir, 'db', '.monitor-deployed-sha'), 'utf8').trim(), NEW_SHA);
+  console.log('  ✅ skips the 5-minute npm ci for a code-only deploy and still restarts');
+
+  const timeoutDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-install-timeout-'));
+  fs.mkdirSync(path.join(timeoutDir, 'services', 'support-copilot'), { recursive: true });
+  fs.mkdirSync(path.join(timeoutDir, 'db'), { recursive: true });
+  fs.writeFileSync(path.join(timeoutDir, 'services', 'support-copilot', 'package-lock.json'), '{}');
+  await expectReject(
+    'install timeout',
+    () => deployMonitor({
+      sha: NEW_SHA,
+      repoDir: timeoutDir,
+      run: async (command, args) => {
+        if (args[0] === 'run') return { stdout: JSON.stringify([{ status: 'completed', conclusion: 'success' }]) };
+        if (args[0] === 'rev-parse' && args[1] === 'origin/main') return { stdout: NEW_SHA };
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') return { stdout: OLD_SHA };
+        if (args[0] === 'status') return { stdout: '' };
+        if (args[0] === 'diff') return { stdout: 'package-lock.json' };
+        if (args[0] === 'ci') {
+          // What execFile's timeout kill actually looks like: killed, and the
+          // only stderr is npm's deprecation noise.
+          const error = new Error(['Command failed: /usr/bin/npm ci --omit=dev', 'npm warn deprecated prebuild-install@7.1.3'].join(String.fromCharCode(10)));
+          error.killed = true;
+          throw error;
+        }
+        return { stdout: '' };
+      },
+      checkHealth: async () => {},
+    }),
+    /npm ci \(root\) timed out after \d+s \(limit 900s\)/
+  );
+  console.log('  ✅ names the install timeout instead of alerting a deprecation warning');
 
   const waitingDir = fs.mkdtempSync(path.join(os.tmpdir(), 'monitor-deploy-waiting-lock-'));
   fs.mkdirSync(path.join(waitingDir, 'db'), { recursive: true });

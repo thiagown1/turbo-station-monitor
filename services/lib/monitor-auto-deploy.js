@@ -52,6 +52,28 @@ function assertCommitSha(value) {
   return sha;
 }
 
+// A `npm ci` on this box takes ~5 minutes when the CI runners are loading it,
+// and it wipes node_modules before reinstalling. Running it on every deploy -
+// even when no lockfile moved, is pure risk: on 2026-09-03 it blew the old
+// 180s ceiling and killed the deploy of #78 after the fast-forward had already
+// landed, leaving new code on disk and old code in memory. Install only when
+// the manifests actually changed (or nothing is installed yet), and give it
+// room when it does run.
+const INSTALL_TIMEOUT_MS = 900000;
+
+function needsInstall({ packageDir, changedFiles, repoDir, fsImpl = fs }) {
+  const prefix = packageDir ? `${packageDir}/` : '';
+  const manifests = [`${prefix}package.json`, `${prefix}package-lock.json`];
+  // `git diff --name-only` always emits forward slashes, on every platform.
+  if (changedFiles.some((file) => manifests.includes(String(file || '').trim()))) {
+    return 'manifest changed';
+  }
+  if (!fsImpl.existsSync(path.join(repoDir, packageDir, 'node_modules'))) {
+    return 'node_modules missing';
+  }
+  return null;
+}
+
 function servicesForFiles(files) {
   const normalized = files.map((file) => String(file || '').replace(/\\/g, '/')).filter(Boolean);
   if (normalized.some((file) =>
@@ -268,6 +290,22 @@ async function restartServices(services, { run = execFilePromise, pm2Bin, repoDi
   return [...services];
 }
 
+// execFile's timeout kill surfaces as a bare "Command failed: <cmd>" with only
+// whatever npm had already written to stderr, which for npm is a deprecation
+// warning, not the cause. Name the timeout so the Telegram alert is actionable.
+async function runInstall(run, npmBin, args, repoDir, label) {
+  const startedAt = Date.now();
+  try {
+    return await run(npmBin, args, { cwd: repoDir, timeout: INSTALL_TIMEOUT_MS });
+  } catch (error) {
+    const elapsed = Date.now() - startedAt;
+    if (error.killed || elapsed >= INSTALL_TIMEOUT_MS) {
+      throw new Error(`npm ci (${label}) timed out after ${Math.round(elapsed / 1000)}s (limit ${INSTALL_TIMEOUT_MS / 1000}s)`);
+    }
+    throw error;
+  }
+}
+
 async function deployMonitor({
   sha,
   repoDir,
@@ -328,9 +366,18 @@ async function deployMonitor({
       await run(gitBin, ['merge', '--ff-only', targetSha], { cwd: repoDir });
     }
 
-    await run(npmBin, ['ci', '--omit=dev'], { cwd: repoDir, timeout: 180000 });
-    if (fsImpl.existsSync(path.join(repoDir, 'services', 'support-copilot', 'package-lock.json'))) {
-      await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
+    const rootReason = needsInstall({ packageDir: '', changedFiles, repoDir, fsImpl });
+    if (rootReason) {
+      log(`[auto-deploy] npm ci (root): ${rootReason}`);
+      await runInstall(run, npmBin, ['ci', '--omit=dev'], repoDir, 'root');
+    }
+    const copilotDir = path.join('services', 'support-copilot');
+    if (fsImpl.existsSync(path.join(repoDir, copilotDir, 'package-lock.json'))) {
+      const copilotReason = needsInstall({ packageDir: 'services/support-copilot', changedFiles, repoDir, fsImpl });
+      if (copilotReason) {
+        log(`[auto-deploy] npm ci (support-copilot): ${copilotReason}`);
+        await runInstall(run, npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], repoDir, 'support-copilot');
+      }
     }
 
     const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
@@ -422,6 +469,7 @@ module.exports = {
   HEALTH_ENDPOINTS,
   assertCommitSha,
   servicesForFiles,
+  needsInstall,
   waitForSuccessfulCi,
   verifyHealth,
   deployMonitor,
