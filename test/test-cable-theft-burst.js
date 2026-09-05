@@ -169,22 +169,59 @@ check('legacy record without connectorId/chargerId is still GC-safe', () => {
     assert.ok(e.cableTheftState['CH2::x'], 'legacy null-connector record kept');
 });
 
-check('formatUrgentCableTheftMessage numbers the burst and announces the silence', () => {
-    const alert = {
-        charger_id: '314030001957',
-        event_ts: Date.now(),
-        parsed_fault: { connectorId: 2, error: 'HighTemperature', info: 'DC OverTemp Connector' },
-    };
-    const m1 = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, alert, 1, 5);
+const theftAlert = {
+    charger_id: '314030001957',
+    event_ts: Date.now(),
+    parsed_fault: { connectorId: 2, error: 'HighTemperature', info: 'DC OverTemp Connector' },
+};
+
+check('single alert (default): no "Aviso N/M" counter, but the silence notice', () => {
+    const m = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, theftAlert, 1, 1);
+    assert.ok(!/Aviso \d+\//.test(m), 'a lone message must not be numbered');
+    assert.ok(/não haverá novos avisos/i.test(m), 'announces the silence');
+    assert.ok(/dispon[íi]vel/i.test(m), 'states the condition that reopens alerting');
+});
+
+check('env-configured burst still numbers each message and closes on the last', () => {
+    const m1 = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, theftAlert, 1, 5);
     assert.ok(/Aviso 1\/5/.test(m1), 'first message numbered 1/5');
     assert.ok(!/não haverá novos avisos/.test(m1), 'silence notice only on the last');
-    const m5 = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, alert, 5, 5);
+    const m5 = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, theftAlert, 5, 5);
     assert.ok(/Aviso 5\/5/.test(m5), 'last message numbered 5/5');
     assert.ok(/não haverá novos avisos/i.test(m5), 'last announces the silence');
     // Backwards compatible: no burst args → no footer.
-    const plain = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, alert);
+    const plain = AlertEngine.prototype.formatUrgentCableTheftMessage.call({}, theftAlert);
     assert.ok(!/Aviso \d+\//.test(plain), 'no footer without burst args');
 });
 
-console.log(`\n${failures === 0 ? '✅ All checks passed' : `❌ ${failures} check(s) failed`}`);
-process.exit(failures === 0 ? 0 : 1);
+// REGRESSION (2026-09-05): Metrópole 3 got FIVE identical URGENTE cards at
+// 08:20/08:21 for one fault the team already knew about, and the group read the
+// repeats as a second bug. One incident = one message.
+async function checkAsync(name, fn) {
+    try {
+        await fn();
+        console.log(`  ✅ ${name}`);
+    } catch (e) {
+        failures++;
+        console.error(`  ❌ ${name}: ${e.message}`);
+    }
+}
+
+(async () => {
+    await checkAsync('a fresh incident sends exactly ONE WhatsApp message', async () => {
+        const sent = [];
+        const engine = {
+            sendUrgentWhatsappAlert: async (m) => { sent.push(m); return true; },
+            formatUrgentCableTheftMessage: AlertEngine.prototype.formatUrgentCableTheftMessage,
+        };
+        AlertEngine.prototype.sendUrgentCableTheftBurst.call(engine, theftAlert);
+        // The sender is fire-and-forget; with the default count of 1 there is no
+        // inter-message delay, so one macrotask turn is enough to drain it.
+        await new Promise((r) => setImmediate(r));
+        assert.strictEqual(sent.length, 1, `expected 1 message, got ${sent.length}`);
+        assert.ok(/não haverá novos avisos/i.test(sent[0]), 'the lone message announces the silence');
+    });
+
+    console.log(`\n${failures === 0 ? '✅ All checks passed' : `❌ ${failures} check(s) failed`}`);
+    process.exit(failures === 0 ? 0 : 1);
+})();
