@@ -195,17 +195,24 @@ const CHARGER_FAULT_BACKOFF_TIERS = [
 ];
 const CHARGER_FAULT_BACKOFF_FILE = path.join(__dirname, '..', 'history', 'charger_fault_backoff.json');
 
-// --- Cable-theft (HighTemperature) burst-then-silence (added 2026-07-18) ------
+// --- Cable-theft (HighTemperature) alert-once-then-silence (2026-07-18) ------
 // A cut DC cable severs the connector's temperature sensor → HighTemperature
 // fault, which the charger re-reports every ~5 min for as long as it stays
 // broken (Metrópole 3: 03:53 → 18:51 BRT, 15h straight). The escalating backoff
 // above kept re-paging the URGENTE group across that whole span — but once the
 // team knows the cable is stolen, further pings are pure noise ("we already
-// know"). Instead: on a FRESH incident fire a short BURST (grab attention
-// immediately), then stay SILENT for that charger+connector until it actually
-// RECOVERS (reports an operational status again). A later theft on the same
-// connector, after a recovery, is a fresh incident and bursts again.
-const CABLE_THEFT_BURST_COUNT = Number(process.env.ALERT_CABLE_THEFT_BURST_COUNT) || 5;
+// know"). Instead: on a FRESH incident alert ONCE, then stay SILENT for that
+// charger+connector until it actually RECOVERS (reports an operational status
+// again). A later theft on the same connector, after a recovery, is a fresh
+// incident and alerts again.
+//
+// 2026-09-05: the original design fired a 5x burst 10s apart to grab attention.
+// In practice the group read the repeats as a bug ("deu algum outro problema"),
+// not as urgency — Metrópole 3 got 5 identical URGENTE cards at 08:20/08:21 for
+// one fault everyone already knew about. One message per incident is the rule
+// now; the count stays env-overridable for the rare case someone wants a burst
+// back without a deploy.
+const CABLE_THEFT_BURST_COUNT = Number(process.env.ALERT_CABLE_THEFT_BURST_COUNT) || 1;
 const CABLE_THEFT_BURST_INTERVAL_MS = Number(process.env.ALERT_CABLE_THEFT_BURST_INTERVAL_MS) || 10 * 1000;
 const CABLE_THEFT_STATE_FILE = path.join(__dirname, '..', 'history', 'cable_theft_incidents.json');
 // OCPP statuses that mean the connector is genuinely usable again (mirrors the
@@ -958,8 +965,8 @@ class AlertEngine {
             if (seen.has(dedupeKey)) continue;
             seen.add(dedupeKey);
 
-            // Cable-theft (HighTemperature) faults follow BURST-THEN-SILENCE
-            // (shouldAlertCableTheft): one burst per incident, then silence until
+            // Cable-theft (HighTemperature) faults follow ALERT-ONCE-THEN-SILENCE
+            // (shouldAlertCableTheft): one alert per incident, then silence until
             // the connector recovers — instead of the escalating backoff that
             // re-pinged the URGENTE group for 15h straight. Every other fault
             // keeps the escalating backoff.
@@ -1000,8 +1007,9 @@ class AlertEngine {
                 type: 'charger_fault',
                 severity: cableTheftSuspect ? 'critical' : 'warning',
                 urgent: cableTheftSuspect,
-                // Signals the dispatch loop to send the URGENTE burst (5x/10s)
-                // instead of a single urgent message.
+                // Signals the dispatch loop to send the URGENTE cable-theft
+                // message (one, with the silence notice) via
+                // sendUrgentCableTheftBurst.
                 cableTheftBurst: cableTheftSuspect,
                 title: cableTheftSuspect
                     ? `Falha de temperatura — possível roubo de cabo`
@@ -1388,12 +1396,12 @@ class AlertEngine {
     }
 
     /**
-     * Fire the URGENTE cable-theft BURST: CABLE_THEFT_BURST_COUNT messages,
-     * CABLE_THEFT_BURST_INTERVAL_MS apart, best-effort. Fire-and-forget — the
-     * spacing must NOT block the detection tick. Each message is numbered and
-     * the last one states no further alerts fire until the station normalizes,
-     * so the team reads the burst as intentional (not a loop bug) and knows the
-     * silence that follows is by design.
+     * Fire the URGENTE cable-theft alert: CABLE_THEFT_BURST_COUNT messages
+     * (ONE by default), CABLE_THEFT_BURST_INTERVAL_MS apart, best-effort.
+     * Fire-and-forget — the spacing must NOT block the detection tick. The last
+     * message (the only one, normally) states that no further alerts fire until
+     * the station normalizes, so the silence that follows reads as by design.
+     * Numbering only appears when someone re-enables a burst via the env var.
      */
     sendUrgentCableTheftBurst(alert) {
         const total = CABLE_THEFT_BURST_COUNT;
@@ -1408,15 +1416,18 @@ class AlertEngine {
                     await new Promise((r) => setTimeout(r, CABLE_THEFT_BURST_INTERVAL_MS));
                 }
             }
-            console.log(`🚨 Cable-theft burst sent (${total}x) for ${alert.charger_id}`);
+            console.log(`🚨 Cable-theft alert sent (${total}x) for ${alert.charger_id}`);
         })();
     }
 
     /**
      * Message for the urgent group: short, explicit about the suspicion, and
      * self-contained (that group doesn't follow the technical alert stream).
-     * When `burstIndex`/`burstTotal` are given, appends a "N/M" footer so the
-     * burst reads as intentional and the final message announces the silence.
+     * When `burstIndex`/`burstTotal` are given, the LAST message announces the
+     * silence that follows. The "Aviso N/M" counter only appears when a burst is
+     * actually configured (burstTotal > 1): with the default single alert a
+     * "Aviso 1/1" line just invites the "why is it counting?" question the
+     * repeats already caused.
      */
     formatUrgentCableTheftMessage(alert, burstIndex, burstTotal) {
         const parsed = alert.parsed_fault || {};
@@ -1445,9 +1456,10 @@ class AlertEngine {
         msg += `🕐 ${timeBrt} (horário de Brasília)\\n`;
         msg += `\\n⚡ Verificar câmeras e acionar alguém no local AGORA.`;
         if (burstIndex && burstTotal) {
-            msg += `\\n\\n🔁 Aviso ${burstIndex}/${burstTotal}`;
+            if (burstTotal > 1) msg += `\\n\\n🔁 Aviso ${burstIndex}/${burstTotal}`;
             if (burstIndex === burstTotal) {
-                msg += ` — não haverá novos avisos para esta estação até ela normalizar.`;
+                msg += burstTotal > 1 ? ` — ` : `\\n\\n🔕 `;
+                msg += `não haverá novos avisos para este conector até ele voltar a ficar disponível.`;
             }
         }
         return msg;
@@ -1751,11 +1763,12 @@ class AlertEngine {
                     console.log(`🔁 Alert ${alertId} not confirmed on any channel; will retry next tick`);
                 }
 
-                // Cable-theft suspects: BURST to the URGENTE group (5x, 10s
-                // apart) on a fresh incident, then this charger+connector stays
-                // silent until it recovers (gated in detectChargerFaults via
-                // shouldAlertCableTheft). Fire-and-forget so the 10s spacing
-                // never blocks the detection tick.
+                // Cable-theft suspects: ONE message to the URGENTE group on a
+                // fresh incident, then this charger+connector stays silent until
+                // it recovers (gated in detectChargerFaults via
+                // shouldAlertCableTheft). Fire-and-forget because the sender
+                // still supports an env-configured burst whose spacing must
+                // never block the detection tick.
                 if (alert.cableTheftBurst) {
                     this.sendUrgentCableTheftBurst(alert);
                 } else if (alert.urgent) {
