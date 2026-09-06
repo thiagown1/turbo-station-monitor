@@ -26,11 +26,50 @@ const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0
 const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '';
 const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
 
-const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
+const QUEUE_PATH = process.env.GITHUB_WEBHOOK_QUEUE_PATH || path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
 const ACK_DEBOUNCE_PATH = path.join(__dirname, '..', 'github-ack-debounce.json');
+const PRIVATE_QUEUE_MODE = 0o600;
 
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads are small)
+
+function formatMode(mode) {
+  return (mode & 0o7777).toString(8).padStart(4, '0');
+}
+
+function openPrivateQueueFile(reason) {
+  const flags = fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT;
+  const fd = fs.openSync(QUEUE_PATH, flags, PRIVATE_QUEUE_MODE);
+
+  try {
+    const currentMode = fs.fstatSync(fd).mode & 0o7777;
+    if (currentMode !== PRIVATE_QUEUE_MODE) {
+      fs.fchmodSync(fd, PRIVATE_QUEUE_MODE);
+      console.warn(
+        `[github-webhook] Corrected queue permissions from ${formatMode(currentMode)} ` +
+        `to ${formatMode(PRIVATE_QUEUE_MODE)} during ${reason}: ${QUEUE_PATH}`
+      );
+    }
+    return fd;
+  } catch (error) {
+    fs.closeSync(fd);
+    throw error;
+  }
+}
+
+function ensurePrivateQueueFile() {
+  const fd = openPrivateQueueFile('startup');
+  fs.closeSync(fd);
+}
+
+function appendQueueEvent(webhookEvent) {
+  const fd = openPrivateQueueFile('append');
+  try {
+    fs.writeSync(fd, JSON.stringify(webhookEvent) + '\n', null, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+}
 
 function sendTelegramNotification(text, target = 'telegram:-5103508388') {
   execFile(
@@ -468,8 +507,8 @@ function handleWebhook(req, res) {
 
       webhookEvent.needs_attention = needsAttention || ciNeedsAttention;
 
-      // Append queue
-      fs.appendFileSync(QUEUE_PATH, JSON.stringify(webhookEvent) + '\n');
+      // Append queue only after enforcing owner-only permissions on the open inode.
+      appendQueueEvent(webhookEvent);
 
       const sender = author || webhookEvent.sender || '';
       console.log(`[github-webhook] ${event}/${webhookEvent.action}: PR #${webhookEvent.pr_number} by ${sender}`);
@@ -657,6 +696,10 @@ function requestHandler(req, res) {
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: 'Not found' }));
 }
+
+// Create the queue as 0600, or repair an existing insecure mode in-place,
+// before accepting any webhook traffic.
+ensurePrivateQueueFile();
 
 http.createServer(requestHandler).listen(PORT, BIND_HOST, () => {
   console.log(`[github-webhook] Server listening on ${BIND_HOST}:${PORT}`);
