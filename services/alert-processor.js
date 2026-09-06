@@ -1,13 +1,20 @@
-const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const { lookupStation } = require('./station-lookup');
+const { applyQueueDecisions, atomicWriteJson, queueId, readAlertQueue } = require('./lib/alert-queue');
+const {
+    advanceDelivery,
+    createSupportApiTransport,
+    parsePollSchedule,
+    resolveActivation,
+} = require('./lib/alert-delivery-guard');
 
 const ALERTS_FILE = path.join(__dirname, '..', 'history/pending_alerts.json');
+const EXPIRED_ALERTS_FILE = path.join(__dirname, '..', 'history/expired_alerts.jsonl');
 const SENT_CACHE = path.join(__dirname, '..', 'history/sent_alerts.json');
-const WHATSAPP_GROUP = '120363426100393587@g.us';
 const DB_PATH = path.join(__dirname, '..', 'db/logs.db');
+const ACTIVATION = resolveActivation();
 
 // WhatsApp anti-spam / freshness guards
 const MAX_ALERT_AGE_MS = 10 * 60 * 1000; // never send per-event alerts older than 10 minutes
@@ -18,25 +25,17 @@ const RATE_LIMIT_MAX_MSGS_PER_WINDOW = 4;     // max 4 messages / 10 min
 const RATE_LIMIT_MAX_MSGS_PER_HOUR = 12;      // max 12 messages / hour
 
 function loadRateLimit() {
-    try {
-        if (fs.existsSync(RATE_LIMIT_FILE)) {
-            return JSON.parse(fs.readFileSync(RATE_LIMIT_FILE, 'utf8'));
-        }
-    } catch (e) {}
+    if (fs.existsSync(RATE_LIMIT_FILE)) {
+        return JSON.parse(fs.readFileSync(RATE_LIMIT_FILE, 'utf8'));
+    }
     return { sentAt: [] };
 }
 
 function saveRateLimit(state) {
-    try {
-        fs.writeFileSync(RATE_LIMIT_FILE, JSON.stringify(state, null, 2));
-    } catch (e) {}
+    atomicWriteJson(RATE_LIMIT_FILE, state);
 }
 
 function canSendWhatsAppNow() {
-    // Rate limit should apply ONLY for automatic messages to WhatsApp GROUPS
-    // (DMs in our conversation are fine; they are not sent by these scripts anyway.)
-    if (!WHATSAPP_GROUP || !WHATSAPP_GROUP.endsWith('@g.us')) return true;
-
     const now = Date.now();
     const state = loadRateLimit();
     const arr = Array.isArray(state.sentAt) ? state.sentAt : [];
@@ -64,36 +63,36 @@ function markWhatsAppSent() {
     saveRateLimit(state);
 }
 
-// SQLite (read-only usage here)
-const db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+// SQLite is opened lazily so delivery/queue helpers can be unit-tested without
+// touching production-shaped files. Runtime usage remains strictly read-only.
+let db;
+function getDb() {
+    if (!db) db = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+    return db;
+}
 
 // Debounce cache
 let sentAlerts = loadSentCache();
 
 function loadSentCache() {
-    try {
-        if (fs.existsSync(SENT_CACHE)) {
-            return JSON.parse(fs.readFileSync(SENT_CACHE));
-        }
-    } catch (e) {}
+    if (fs.existsSync(SENT_CACHE)) {
+        return JSON.parse(fs.readFileSync(SENT_CACHE, 'utf8'));
+    }
     return {};
 }
 
 function saveSentCache() {
-    fs.writeFileSync(SENT_CACHE, JSON.stringify(sentAlerts, null, 2));
+    atomicWriteJson(SENT_CACHE, sentAlerts);
 }
 
 function loadPendingAlerts() {
-    try {
-        if (fs.existsSync(ALERTS_FILE)) {
-            return JSON.parse(fs.readFileSync(ALERTS_FILE));
-        }
-    } catch (e) {}
-    return [];
+    return readAlertQueue(ALERTS_FILE);
 }
 
-function clearPendingAlerts() {
-    fs.writeFileSync(ALERTS_FILE, JSON.stringify([], null, 2));
+function archiveExpiredAlert(alert, reason) {
+    const record = { archivedAt: new Date().toISOString(), reason, alert };
+    fs.mkdirSync(path.dirname(EXPIRED_ALERTS_FILE), { recursive: true });
+    fs.appendFileSync(EXPIRED_ALERTS_FILE, `${JSON.stringify(record)}\n`, { mode: 0o600 });
 }
 
 function analyzeAlert(alert) {
@@ -306,7 +305,7 @@ function wasChargingWithinWindow(chargerId, startTsMs, windowMs) {
     const endTsMs = startTsMs + windowMs;
 
     // Look for any StatusNotification → Charging shortly after the incident.
-    const row = db.prepare(
+    const row = getDb().prepare(
         `SELECT id, timestamp, message
          FROM logs
          WHERE source='ocpp'
@@ -325,7 +324,7 @@ function hadPositiveActivePowerWithinWindow(chargerId, startTsMs, windowMs) {
     if (!chargerId) return false;
     const endTsMs = startTsMs + windowMs;
 
-    const rows = db.prepare(
+    const rows = getDb().prepare(
         `SELECT timestamp, message
          FROM logs
          WHERE source='ocpp'
@@ -379,8 +378,6 @@ function shouldSendAlert(alert) {
                 return false;
             }
         }
-        sentAlerts[key] = now;
-        saveSentCache();
         console.log(`✅ Recovery alert approved: ${alert.chargerId}`);
         return true;
     }
@@ -394,39 +391,24 @@ function shouldSendAlert(alert) {
         }
     }
 
-    // Mark as sent
-    sentAlerts[key] = now;
-    saveSentCache();
-    
     console.log(`✅ Alert approved: ${alert.type} for ${alert.chargerId || 'unknown'}`);
     return true;
 }
 
-function sendWhatsAppAlert(message) {
-    return new Promise((resolve, reject) => {
-        if (!canSendWhatsAppNow()) {
-            console.log('🛑 WhatsApp rate limit hit — skipping send to avoid ban');
-            resolve(false);
-            return;
-        }
+function rememberAlertDelivered(alert) {
+    const key = `${alert.chargerId || 'global'}_${alert.type}`;
+    sentAlerts[key] = Date.now();
+}
 
-        // Escape message for shell (use single quotes to avoid most escaping issues)
-        const escapedMsg = message.replace(/'/g, "'\\\\''");
-
-        const cmd = `openclaw message send --channel whatsapp --target '${WHATSAPP_GROUP}' --message '${escapedMsg}'`;
-
-        exec(cmd, (error, stdout, stderr) => {
-            if (error) {
-                console.error(`❌ Erro ao enviar WhatsApp: ${error.message}`);
-                console.error(`stderr: ${stderr}`);
-                reject(error);
-                return;
-            }
-            markWhatsAppSent();
-            console.log('✅ Alerta enviado para WhatsApp');
-            resolve(true);
+let deliveryTransport;
+function getDeliveryTransport() {
+    if (!deliveryTransport) {
+        deliveryTransport = createSupportApiTransport({
+            activation: ACTIVATION,
+            pollScheduleMs: parsePollSchedule(process.env.WHATSAPP_DELIVERY_POLL_MS),
         });
-    });
+    }
+    return deliveryTransport;
 }
 
 async function processPendingAlerts() {
@@ -437,45 +419,61 @@ async function processPendingAlerts() {
         return;
     }
 
-    // Never send old/backlog alerts (ban-risk + low value)
-    const fresh = pending.filter(a => {
-        const ts = new Date(a.timestamp).getTime();
-        if (!Number.isFinite(ts)) return false;
-        return (Date.now() - ts) <= MAX_ALERT_AGE_MS;
-    });
+    console.log(`📬 ${pending.length} alerta(s) pendente(s)`);
+    const baseTransport = getDeliveryTransport();
+    const transport = {
+        status: baseTransport.status,
+        send: async (message) => {
+            if (!canSendWhatsAppNow()) {
+                console.log('🛑 WhatsApp rate limit hit — retaining alert for a later cycle');
+                return { outcome: 'rate_limited', messageId: null, status: 'local_rate_limit' };
+            }
+            return baseTransport.send(message);
+        },
+    };
 
-    if (fresh.length !== pending.length) {
-        console.log(`🧹 Dropped ${pending.length - fresh.length} old alerts (> ${Math.round(MAX_ALERT_AGE_MS/60000)}m)`);
-    }
-
-    if (fresh.length === 0) {
-        clearPendingAlerts();
-        return;
-    }
-
-    console.log(`📬 ${fresh.length} alertas pendentes (fresh)`);
-
-    const toSend = fresh.filter(shouldSendAlert);
-
-    if (toSend.length === 0) {
-        console.log('🔇 Todos os alertas foram debounced');
-        clearPendingAlerts();
-        return;
-    }
-
-    // Send alerts
-    for (const alert of toSend) {
+    for (const alert of pending) {
+        const id = queueId(alert);
         try {
-            const message = formatAlertMessage(alert);
-            await sendWhatsAppAlert(message);
-            await new Promise(resolve => setTimeout(resolve, 2000)); // Rate limit
+            const ts = new Date(alert.timestamp).getTime();
+            const expiryReason = !Number.isFinite(ts)
+                ? 'invalid_timestamp'
+                : (Date.now() - ts) > MAX_ALERT_AGE_MS
+                    ? `older_than_${Math.round(MAX_ALERT_AGE_MS / 60000)}m`
+                    : null;
+            if (expiryReason) {
+                archiveExpiredAlert(alert, expiryReason);
+                applyQueueDecisions(ALERTS_FILE, new Map([[id, { remove: true }]]));
+                console.log(`📦 Archived expired alert ${id} (${expiryReason})`);
+                continue;
+            }
+
+            if (!shouldSendAlert(alert)) {
+                applyQueueDecisions(ALERTS_FILE, new Map([[id, { remove: true }]]));
+                continue;
+            }
+
+            const message = formatAlertMessage(alert).replace(/\\n/g, '\n');
+            const result = await advanceDelivery(alert, message, transport);
+            if (result.delivered) {
+                // Remember in memory before the durable queue ACK. If a cache
+                // write then fails, this live process still cannot re-send it.
+                rememberAlertDelivered(alert);
+                applyQueueDecisions(ALERTS_FILE, new Map([[id, { remove: true }]]));
+                saveSentCache();
+                markWhatsAppSent();
+                console.log(`✅ Alert ${id} delivered and acknowledged`);
+            } else {
+                applyQueueDecisions(ALERTS_FILE, new Map([[id, { patch: result.patch }]]));
+                console.log(`⏳ Alert ${id} retained (${result.reason})`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 2000));
         } catch (e) {
-            console.error('Erro ao processar alerta:', e.message);
+            // No decision means this alert remains in the durable queue.
+            console.error(`Erro ao processar alerta ${id}; mantendo pendente:`, e.message);
         }
     }
 
-    // Clear pending
-    clearPendingAlerts();
 }
 
 // Clean old cache entries (older than 24h)
@@ -503,13 +501,11 @@ function isValidChargerIdLocal(id) {
 
 const PENDING_CACHE = path.join(__dirname, '..', 'history/manual_pending_cache.json');
 function loadPendingCache() {
-    try {
-        if (fs.existsSync(PENDING_CACHE)) return JSON.parse(fs.readFileSync(PENDING_CACHE));
-    } catch (e) {}
+    if (fs.existsSync(PENDING_CACHE)) return JSON.parse(fs.readFileSync(PENDING_CACHE, 'utf8'));
     return { lastHash: null, lastSentAt: 0 };
 }
 function savePendingCache(cache) {
-    try { fs.writeFileSync(PENDING_CACHE, JSON.stringify(cache, null, 2)); } catch (e) {}
+    atomicWriteJson(PENDING_CACHE, cache);
 }
 function hashString(s) {
     // tiny non-crypto hash (avoid deps)
@@ -606,7 +602,7 @@ function buildManualPendencies(tracker) {
     return { manual, needsRestart };
 }
 
-function sendManualPendenciesIfNeeded(tracker) {
+async function sendManualPendenciesIfNeeded(tracker) {
     const { manual } = buildManualPendencies(tracker);
 
     const lines = manual.map(c => `- ${c.id}: ${c.reason}${c.detail ? ` (${c.detail})` : ''}`);
@@ -625,39 +621,103 @@ function sendManualPendenciesIfNeeded(tracker) {
     const withinCooldown = (now - (cache.lastSentAt || 0)) < 60 * 60 * 1000;
     const withinHardMinGap = (now - (cache.lastSentAt || 0)) < 10 * 60 * 1000;
 
-    if (withinHardMinGap) return;
-    if (unchanged && withinCooldown) return;
+    const hasPendingDelivery = Boolean(
+        cache.pendingHash || cache._deliveryMessageId || cache._deliveryAmbiguous
+    );
+    if (!hasPendingDelivery && withinHardMinGap) return;
+    if (!hasPendingDelivery && unchanged && withinCooldown) return;
 
-    cache.lastHash = newHash;
-    cache.lastSentAt = now;
+    // Do not emit an empty startup summary. Record the baseline locally and
+    // notify only after an actual pendency list has existed or changed.
+    if (!hasPendingDelivery && !cache.lastHash && manual.length === 0) {
+        cache.lastHash = newHash;
+        savePendingCache(cache);
+        return;
+    }
+
+    const item = hasPendingDelivery ? cache : {};
+    const deliveryPayload = cache.pendingPayload || payload;
+    const baseTransport = getDeliveryTransport();
+    const transport = {
+        status: baseTransport.status,
+        send: async (message) => {
+            if (!canSendWhatsAppNow()) {
+                return { outcome: 'rate_limited', messageId: null, status: 'local_rate_limit' };
+            }
+            return baseTransport.send(message);
+        },
+    };
+    const result = await advanceDelivery(item, deliveryPayload, transport, { now });
+    if (result.delivered) {
+        cache.lastHash = cache.pendingHash || newHash;
+        cache.lastSentAt = now;
+        delete cache.pendingHash;
+        delete cache.pendingPayload;
+        delete cache._deliveryMessageId;
+        delete cache._deliveryAmbiguous;
+        delete cache._deliveryAttemptAt;
+        delete cache._deliveryLastStatus;
+        delete cache._lastFailedMessageId;
+        savePendingCache(cache);
+        markWhatsAppSent();
+        console.log('✅ Manual pendency summary delivered and acknowledged');
+        return;
+    }
+
+    cache.pendingHash = cache.pendingHash || newHash;
+    cache.pendingPayload = deliveryPayload;
+    Object.assign(cache, result.patch);
     savePendingCache(cache);
-
-    // Send to WhatsApp group directly (not as per-charger alert)
-    sendWhatsAppAlert(payload);
+    console.log(`⏳ Manual pendency summary retained (${result.reason})`);
 }
 
-function checkChargerHealth() {
+async function checkChargerHealth() {
     const StateTracker = require('./state-tracker');
     const tracker = new StateTracker();
 
     // Instead of spamming "precisa de restart" per charger, we keep a single
     // concise pending list for manual attention.
-    sendManualPendenciesIfNeeded(tracker);
+    await sendManualPendenciesIfNeeded(tracker);
 }
 
-// Run check every 15 seconds
-setInterval(() => {
-    processPendingAlerts();
-    checkChargerHealth();
-}, 15000);
+let cycleRunning = false;
+async function runCycle() {
+    if (cycleRunning) {
+        console.log('⏳ Previous alert cycle is still running; skipping overlap');
+        return;
+    }
+    cycleRunning = true;
+    try {
+        await processPendingAlerts();
+        await checkChargerHealth();
+    } finally {
+        cycleRunning = false;
+    }
+}
 
-// Clean cache every hour
-setInterval(cleanCache, 60 * 60 * 1000);
+function start() {
+    if (!ACTIVATION.enabled) {
+        throw new Error('OCPP alerts are disabled; set OCPP_ALERTS_ENABLED=1 after an authorized readiness check');
+    }
+    if (!ACTIVATION.ready) {
+        throw new Error(`OCPP alert transport is not ready: ${ACTIVATION.reason}`);
+    }
 
-console.log('🚨 Alert Processor Started');
-console.log(`📱 Target: WhatsApp Group ${WHATSAPP_GROUP}`);
-console.log('⏱️  Checking every 15s');
+    setInterval(() => void runCycle().catch((error) => console.error('Alert cycle failed:', error.message)), 15000);
+    setInterval(cleanCache, 60 * 60 * 1000);
 
-// Initial run
-processPendingAlerts();
-checkChargerHealth();
+    console.log('🚨 Alert Processor Started (support API transport ready)');
+    console.log('⏱️  Checking every 15s');
+    void runCycle().catch((error) => console.error('Initial alert cycle failed:', error.message));
+}
+
+if (require.main === module) start();
+
+module.exports = {
+    buildManualPendencies,
+    processPendingAlerts,
+    runCycle,
+    sendManualPendenciesIfNeeded,
+    shouldSendAlert,
+    start,
+};

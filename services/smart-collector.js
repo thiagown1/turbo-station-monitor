@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const StateTracker = require('./state-tracker');
+const { enqueueAlert, readAlertQueue } = require('./lib/alert-queue');
 
 // Config
 const WS_URL = 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
@@ -108,7 +109,10 @@ console.log(`💾 SQLite connected (OCPP): ${DB_PATH}`);
 
 const tracker = new StateTracker();
 let eventBuffer = [];
-let pendingAlerts = [];
+// Keep undelivered alerts across collector restarts. The processor and collector
+// serialize changes through alert-queue's lock, so an ACK cannot overwrite an
+// alert appended at the same time.
+let pendingAlerts = readAlertQueue(ALERTS_FILE);
 
 // Track Transaction -1 errors per charger (for smart filtering)
 const transaction1ErrorCount = new Map(); // key: chargerId, value: count
@@ -835,16 +839,9 @@ function updateTrackerState(chargerId, log, analysis) {
 }
 
 function queueAlert(alert) {
-    // Check for duplicates in pending
-    const duplicate = pendingAlerts.find(a => 
-        a.chargerId === alert.chargerId && 
-        a.type === alert.type &&
-        (Date.now() - new Date(a.timestamp).getTime()) < 60 * 60 * 1000 // 1 hour
-    );
-
-    if (!duplicate) {
-        pendingAlerts.push(alert);
-        savePendingAlerts();
+    const result = enqueueAlert(ALERTS_FILE, alert);
+    pendingAlerts = result.queue;
+    if (result.added) {
         console.log(`🔔 Alert queued: ${alert.type} (${alert.chargerId})`);
     }
 }
@@ -905,10 +902,6 @@ function flushBuffer() {
     
     fs.writeFileSync(EVENTS_FILE, JSON.stringify(newData, null, 2));
     eventBuffer = [];
-}
-
-function savePendingAlerts() {
-    fs.writeFileSync(ALERTS_FILE, JSON.stringify(pendingAlerts, null, 2));
 }
 
 function startPeriodicTasks() {
