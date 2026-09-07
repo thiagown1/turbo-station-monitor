@@ -15,6 +15,7 @@ const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
 const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
+const { writeJsonAtomic } = require('./atomic-json');
 
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -208,6 +209,18 @@ const CHARGER_FAULT_BACKOFF_FILE = path.join(__dirname, '..', 'history', 'charge
 const CABLE_THEFT_BURST_COUNT = Number(process.env.ALERT_CABLE_THEFT_BURST_COUNT) || 5;
 const CABLE_THEFT_BURST_INTERVAL_MS = Number(process.env.ALERT_CABLE_THEFT_BURST_INTERVAL_MS) || 10 * 1000;
 const CABLE_THEFT_STATE_FILE = path.join(__dirname, '..', 'history', 'cable_theft_incidents.json');
+// When the state file is unreadable (see atomic-json.js for how a full disk
+// produced exactly that on 2026-09-06), the open incidents are rebuilt from
+// ocpp.db instead of restarting from an empty state. Look at the last hour of
+// StatusNotifications to find which connectors are CURRENTLY in a
+// theft-signature fault, then walk back to the start of that fault streak.
+const CABLE_THEFT_RECONSTRUCT_WINDOW_MS =
+    Number(process.env.ALERT_CABLE_THEFT_RECONSTRUCT_WINDOW_MS) || 60 * 60 * 1000;
+// A streak younger than this may never have been alerted at all (the crash can
+// beat the burst), so it is left out of the rebuild and bursts normally. Only
+// incidents that were clearly already running get adopted as "already paged".
+const CABLE_THEFT_RECONSTRUCT_MIN_AGE_MS =
+    Number(process.env.ALERT_CABLE_THEFT_RECONSTRUCT_MIN_AGE_MS) || 30 * 60 * 1000;
 // OCPP statuses that mean the connector is genuinely usable again (mirrors the
 // Next.js OPERATIONAL_STATUSES set). Anything else (Faulted/Unavailable) keeps
 // the incident OPEN, so a stuck or self-disabled connector never reads as
@@ -248,6 +261,8 @@ class AlertEngine {
 
         this.debounceCache = this.loadDebounceCache();
         this.chargerFaultBackoff = this.loadChargerFaultBackoff();
+        // Instance field so tests can point the state at a temp file.
+        this.cableTheftStateFile = CABLE_THEFT_STATE_FILE;
         this.cableTheftState = this.loadCableTheftState();
 
         // NOTE: Startup replay disabled.
@@ -305,7 +320,7 @@ class AlertEngine {
 
     saveDebounceCache() {
         try {
-            fs.writeFileSync(DEBOUNCE_FILE, JSON.stringify(this.debounceCache, null, 2));
+            writeJsonAtomic(DEBOUNCE_FILE, this.debounceCache);
         } catch (e) {
             console.error('⚠️ Error saving debounce cache:', e.message);
         }
@@ -344,7 +359,7 @@ class AlertEngine {
 
     saveChargerFaultBackoff() {
         try {
-            fs.writeFileSync(CHARGER_FAULT_BACKOFF_FILE, JSON.stringify(this.chargerFaultBackoff, null, 2));
+            writeJsonAtomic(CHARGER_FAULT_BACKOFF_FILE, this.chargerFaultBackoff);
         } catch (e) {
             console.error('⚠️ Error saving charger fault backoff cache:', e.message);
         }
@@ -403,20 +418,141 @@ class AlertEngine {
         }
     }
 
+    /**
+     * Load the open-incident records that keep the burst silent.
+     *
+     * A MISSING file is a genuine first run → empty state. A file that exists
+     * but cannot be read or parsed is NOT: it means state was lost, and
+     * returning `{}` there re-pages the URGENTE group for every theft still in
+     * progress. That is the 2026-09-06 regression — the disk filled at 10:46
+     * UTC, the truncating write left a 0-byte file, and the 18:28 restart read
+     * `Unexpected end of JSON input` and burst 5x for Metrópole 3 and UP CAR 01,
+     * two faults the team had already been paged about (04/09 and 05/09). So on
+     * corruption, rebuild the open incidents from ocpp.db instead.
+     */
     loadCableTheftState() {
+        const file = this.cableTheftStateFile || CABLE_THEFT_STATE_FILE;
+        let raw;
         try {
-            if (fs.existsSync(CABLE_THEFT_STATE_FILE)) {
-                return JSON.parse(fs.readFileSync(CABLE_THEFT_STATE_FILE, 'utf8'));
+            if (!fs.existsSync(file)) return {};
+            raw = fs.readFileSync(file, 'utf8');
+        } catch (e) {
+            console.error('⚠️ Error reading cable-theft incident state:', e.message);
+            return this.recoverCableTheftState(`unreadable state file (${e.message})`);
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+                throw new Error('state file is not a JSON object');
             }
+            return parsed;
         } catch (e) {
             console.error('⚠️ Error loading cable-theft incident state:', e.message);
+            return this.recoverCableTheftState(`corrupt state file (${e.message})`);
         }
-        return {};
+    }
+
+    /**
+     * Rebuild the incident state from ocpp.db and persist it, so the file is
+     * valid again on the next boot. Returns the rebuilt state.
+     */
+    recoverCableTheftState(reason) {
+        const rebuilt = this.reconstructOpenCableTheftIncidents();
+        const keys = Object.keys(rebuilt);
+        console.error(
+            `🛟 Rebuilding cable-theft incident state from ocpp.db (${reason}): ` +
+            `${keys.length} open incident(s)${keys.length ? ` — ${keys.join(', ')}` : ''}`,
+        );
+        this.cableTheftState = rebuilt;
+        this.saveCableTheftState();
+        return rebuilt;
+    }
+
+    /**
+     * Which charger+connector pairs are CURRENTLY inside a theft-signature
+     * fault, keyed like `shouldAlertCableTheft` does. Reuses the same parser and
+     * fault predicate as the live path so the rebuilt state cannot disagree with
+     * what detection would have recorded.
+     */
+    reconstructOpenCableTheftIncidents(now = Date.now()) {
+        const state = {};
+        if (!this.ocppDb) return state;
+
+        let rows;
+        try {
+            rows = this.ocppDb.prepare(`
+                SELECT charger_id, timestamp, message FROM ocpp_events
+                WHERE timestamp > ? AND message LIKE '%status=%'
+                ORDER BY timestamp DESC LIMIT 5000
+            `).all(now - CABLE_THEFT_RECONSTRUCT_WINDOW_MS);
+        } catch (e) {
+            console.error('⚠️ cable-theft state rebuild query failed:', e.message);
+            return state;
+        }
+
+        // Rows are newest-first, so the first parsable status per key is the
+        // connector's current one.
+        const latestByKey = new Map();
+        for (const r of rows) {
+            const parsed = parseStatusNotif(r.message);
+            if (!parsed.status) continue;
+            const key = `${r.charger_id}::${parsed.connectorId != null ? parsed.connectorId : 'x'}`;
+            if (latestByKey.has(key)) continue;
+            latestByKey.set(key, { chargerId: r.charger_id, parsed, message: r.message, timestamp: r.timestamp });
+        }
+
+        for (const [key, latest] of latestByKey) {
+            if (this.isOperationalOcppStatus(latest.parsed.status)) continue;
+            if (!isCableTheftSuspectFault(latest.parsed, latest.message)) continue;
+            const startedAt = this.findCableTheftStreakStart(
+                latest.chargerId, latest.parsed.connectorId, latest.timestamp,
+            );
+            if (now - startedAt < CABLE_THEFT_RECONSTRUCT_MIN_AGE_MS) continue;
+            state[key] = {
+                alertedAt: startedAt,
+                lastSeenAt: now,
+                chargerId: latest.chargerId,
+                connectorId: latest.parsed.connectorId != null ? latest.parsed.connectorId : null,
+                reconstructed: true,
+            };
+        }
+        return state;
+    }
+
+    /**
+     * Timestamp of the OLDEST theft-signature fault in the streak the connector
+     * is in right now — i.e. the first one after its last operational status.
+     * Used as `alertedAt` so `hasConnectorRecoveredSince` still fires on the
+     * next genuine recovery. Falls back to the caller's timestamp on error.
+     */
+    findCableTheftStreakStart(chargerId, connectorId, fallbackTs) {
+        try {
+            const rows = this.ocppDb.prepare(`
+                SELECT timestamp, message FROM ocpp_events
+                WHERE charger_id = ? AND message LIKE '%status=%'
+                ORDER BY timestamp DESC LIMIT 2000
+            `).all(chargerId);
+            let start = fallbackTs;
+            for (const r of rows) {
+                const p = parseStatusNotif(r.message);
+                if (!p.status) continue;
+                if (connectorId != null && p.connectorId != null && p.connectorId !== connectorId) continue;
+                if (this.isOperationalOcppStatus(p.status)) break; // streak starts after the last recovery
+                if (isCableTheftSuspectFault(p, r.message)) start = r.timestamp;
+            }
+            return start;
+        } catch (e) {
+            console.error('⚠️ cable-theft streak-start lookup failed:', e.message);
+            return fallbackTs;
+        }
     }
 
     saveCableTheftState() {
         try {
-            fs.writeFileSync(CABLE_THEFT_STATE_FILE, JSON.stringify(this.cableTheftState, null, 2));
+            // Atomic (tmp + rename): a failed write must never truncate the
+            // previous state — that is what turned a full disk into two false
+            // "possível roubo de cabo" bursts on 2026-09-06.
+            writeJsonAtomic(this.cableTheftStateFile || CABLE_THEFT_STATE_FILE, this.cableTheftState);
         } catch (e) {
             console.error('⚠️ Error saving cable-theft incident state:', e.message);
         }
