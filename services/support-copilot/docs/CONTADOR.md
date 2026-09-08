@@ -165,6 +165,17 @@ monthly values into the workspace.
   keeps the widened search safe. Nothing is settled here either way;
 - deterministic gate for PDF, accounting questions, explicit mentions and
   replies to a prior Contador message;
+- every outbound text (heartbeat, monthly closing, regularização, tool-loop
+  reply) passes through `redactForModel` before delivery, but with the station
+  ids that came out of our own tools as an allowlist. Those ids are not PII and
+  must survive intact: without the allowlist the daily notice of 2026-09-08 sent
+  `[telefone oculto]57` and `GO[telefone oculto]` instead of the stations
+  `414030001957` and `GO2508130004`. The phone mask now requires a phone-shaped
+  token (parenthesised DDD, a separator, or `+55`) and a full digit token, so it
+  can no longer bite into an identifier. Nothing is relaxed for inbound text:
+  message bodies and history still go through the strict redaction with no
+  allowlist, and an id whose length matches an unpunctuated CPF (11) or CNPJ (14)
+  is never preserved;
 - ordinary group chatter is ignored without invoking Opus;
 - PDF bytes are read from the local media directory and forwarded to the Next
   intake; its `replyMessage` is sent verbatim;

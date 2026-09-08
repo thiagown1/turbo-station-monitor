@@ -125,14 +125,65 @@ function parseAgentInstruction(value) {
   return { action: 'invalid' };
 }
 
-function redactForModel(value) {
-  return String(value || '')
+// Telefone só é telefone quando vem com cara de telefone: DDD entre parênteses,
+// separador entre os blocos ou prefixo +55, e sempre como token completo de
+// dígitos. O regex anterior (\(?\d{2}\)?\s*9?\d{4}[-\s]?\d{4}) casava qualquer
+// corrida de 10 dígitos, inclusive no meio de um id alfanumérico: no aviso
+// diário do grupo "GO2508130004" saiu como "GO[telefone oculto]".
+const PHONE_RE = /(?<![A-Za-z0-9])(?:\+?55[\s-]?)?(?:\(\d{2}\)\s*|\d{2}[\s-]?)?9?\d{4}[-\s]?\d{4}(?![A-Za-z0-9])/g;
+
+// CPF (11) e CNPJ (14) sem pontuação continuam mascarados pela regra genérica de
+// dígitos, então um id com esse comprimento nunca entra na lista de preservados.
+const DOCUMENT_DIGIT_LENGTHS = new Set([11, 14]);
+const STATION_ID_RE = /^[A-Za-z0-9_-]{3,64}$/;
+
+function isPreservableId(value) {
+  if (typeof value !== 'string') return false;
+  const token = value.trim();
+  if (!STATION_ID_RE.test(token)) return false;
+  return !(/^\d+$/.test(token) && DOCUMENT_DIGIT_LENGTHS.has(token.length));
+}
+
+/**
+ * Junta os ids de estação que saíram das nossas próprias ferramentas. Eles não
+ * são PII e não podem ser mastigados pelas máscaras — "414030001957" virava
+ * "***1957" no grupo. Só vale para texto que o agente escreve a partir desses
+ * dados; mensagem de entrada continua passando pela redação estrita.
+ */
+function collectStationIds(payload, found = new Set()) {
+  if (!payload || typeof payload !== 'object') return found;
+  if (Array.isArray(payload)) {
+    for (const item of payload) collectStationIds(item, found);
+    return found;
+  }
+  for (const [key, value] of Object.entries(payload)) {
+    if ((key === 'stationId' || key === 'id') && isPreservableId(value)) found.add(value.trim());
+    else collectStationIds(value, found);
+  }
+  return found;
+}
+
+function redactSegment(value) {
+  return value
     .replace(/\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b/g, '[CNPJ oculto]')
     .replace(/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b/g, '[CPF oculto]')
-    .replace(/\(?\d{2}\)?\s*9?\d{4}[-\s]?\d{4}/g, '[telefone oculto]')
+    .replace(PHONE_RE, '[telefone oculto]')
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, '[email oculto]')
     .replace(/\b(CPF|CNPJ|titular|endere[cç]o)\s*[:=-]\s*[^\n,;]+/gi, '$1: [oculto]')
-    .replace(/\b\d{8,14}\b/g, (digits) => `***${digits.slice(-4)}`)
+    .replace(/\b\d{8,14}\b/g, (digits) => `***${digits.slice(-4)}`);
+}
+
+function redactForModel(value, keep) {
+  const text = String(value || '');
+  const tokens = [...(keep || [])].filter(isPreservableId).sort((a, b) => b.length - a.length);
+  if (!tokens.length) return redactSegment(text).slice(0, 2000);
+  // isPreservableId já restringe os tokens a [A-Za-z0-9_-], então nenhum deles
+  // carrega metacaractere de regex e a alternância pode ser montada direto.
+  const splitter = new RegExp(`(${tokens.join('|')})`, 'g');
+  return text
+    .split(splitter)
+    .map((segment, index) => (index % 2 === 1 ? segment : redactSegment(segment)))
+    .join('')
     .slice(0, 2000);
 }
 
@@ -358,6 +409,10 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     const messages = await loadContext(event.conversationId, 30);
     const openDrafts = await queryTool('drafts_abertos', {});
     const trustedStationIds = new Set();
+    // Conjunto separado, e de propósito mais largo: trustedStationIds é o gate
+    // de resolve_draft (só 'estacoes' alimenta ele) e não pode ser afrouxado.
+    // Este aqui só evita que a redação mastigue um id que veio de ferramenta.
+    const seenStationIds = collectStationIds(openDrafts);
     const modelTurn = {};
     let raw = await runAgent(initialPrompt(event, messages, openDrafts, blocoDeFatos()), modelTurn);
     let instruction = parseAgentInstruction(raw);
@@ -366,6 +421,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     while (instruction.action === 'tool' && calls < maxToolCalls) {
       const data = await queryTool(instruction.tool, instruction.params);
       rememberTrustedStationIds(instruction.tool, data, trustedStationIds);
+      collectStationIds(data, seenStationIds);
       calls += 1;
       raw = await runAgent(toolResultPrompt(instruction.tool, instruction.params, data), modelTurn);
       instruction = parseAgentInstruction(raw);
@@ -420,7 +476,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     if (instruction.action === 'silent') return { status: 'silent', toolCalls: calls };
     if (instruction.action !== 'reply') return { status: 'blocked', reason: 'invalid_agent_output', toolCalls: calls };
 
-    await sendReply(redactForModel(instruction.text), {
+    await sendReply(redactForModel(instruction.text, seenStationIds), {
       ...event,
       contadorDraftId: event.quotedContadorDraftId || undefined,
     });
@@ -488,7 +544,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     ].join('\n');
     const instruction = parseAgentInstruction(await runAgent(prompt));
     if (instruction.action !== 'reply') return { status: 'silent' };
-    await sendReply(redactForModel(instruction.text), { kind: 'heartbeat', groupJid: config.groupConversationId });
+    await sendReply(redactForModel(instruction.text, collectStationIds(results)), { kind: 'heartbeat', groupJid: config.groupConversationId });
     return { status: 'sent' };
   }
 
@@ -583,7 +639,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
 
     const instruction = parseAgentInstruction(await runAgent(prompt));
     if (instruction.action !== 'reply') return { status: 'silent', lacunas };
-    await sendReply(redactForModel(instruction.text), {
+    await sendReply(redactForModel(instruction.text, collectStationIds(lacunas)), {
       kind: 'regularizacao',
       groupJid: config.groupConversationId,
     });
@@ -633,7 +689,7 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
     const instruction = parseAgentInstruction(await runAgent(prompt));
     if (instruction.action === 'silent') return { status: 'silent', period };
     if (instruction.action !== 'reply') throw new Error('contador_monthly_invalid_instruction');
-    const replyText = redactForModel(instruction.text);
+    const replyText = redactForModel(instruction.text, collectStationIds(results));
     if (typeof hooks.beforeSend === 'function') await hooks.beforeSend({ text: replyText, period });
     await sendReply(replyText, { kind: 'monthly_summary', groupJid: config.groupConversationId });
     return { status: 'sent', period };
@@ -650,6 +706,7 @@ module.exports = {
   classifyInbound,
   parseAgentInstruction,
   redactForModel,
+  collectStationIds,
   heartbeatHasActionable,
   extractDraftReplyLiterals,
   draftFieldsMatchReply,
