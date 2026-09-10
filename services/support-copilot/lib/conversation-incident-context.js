@@ -10,6 +10,11 @@ const STATION_STATE_WORDS = [
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
+const STATION_NOUN_PREFIX_PATTERN = [
+  'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
+  'fornecimento', 'internet', 'luz', 'rede', 'sinal', 'transformador',
+  'esta[cç][aã]o',
+].join('|');
 const GENERIC_STATION_SUBJECTS = new Set([
   'alimentacao', 'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
   'estacao', 'fornecimento', 'internet', 'local', 'luz', 'posto', 'rede',
@@ -142,7 +147,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const natural = new RegExp(
-        `^(?:(?:o|a)\\s+)?(?:carregador\\s+(?:(?:do|da|de)\\s+)?)?(?:esta[cç][aã]o\\s+(?:(?:do|da|de)\\s+)?)?(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        `^(?:(?:o|a)\\s+)?(?:(?:${STATION_NOUN_PREFIX_PATTERN})\\s+(?:(?:do|da|de)\\s+)?)*(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
         'i',
       ).exec(conversational);
       if (natural) addCandidate(natural[1]);
