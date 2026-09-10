@@ -54,7 +54,8 @@ async function prepareStationInvestigation(input, deps = {}) {
   if (!prior) persistStationOwnership(input);
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
-  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit ?? 20), input.messageId)) {
+  if ((!prior || prior.status === 'claimed')
+      && dailyLimitReached(input.brandId, Number(policy.dailyLimit ?? 20), input.messageId)) {
     return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
   }
   let context;
@@ -74,11 +75,14 @@ async function routeStationInvestigation(input, deps = {}) {
   if (!preparation.ready) return preparation.result;
   const { policy, mentionedJid, context } = preparation;
   const now = nowIso();
-  db.prepare(`INSERT INTO station_investigation_jobs
-    (message_id, conversation_id, brand_id, group_jid, instance, context_fingerprint, context_message_ids_json, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 1, ?, ?, ?)
-    ON CONFLICT(message_id) DO UPDATE SET status='processing', attempts=attempts+1, updated_at=excluded.updated_at`)
-    .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, now, now);
+  const acquired = db.prepare(`UPDATE station_investigation_jobs
+    SET status='processing', attempts=attempts+1, context_fingerprint=?, context_message_ids_json=?, updated_at=?
+    WHERE message_id=? AND status IN ('claimed', 'retry')`)
+    .run(context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, input.messageId);
+  if (acquired.changes !== 1) {
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+    return { duplicate: true, status: current?.status || 'unknown' };
+  }
   try {
     const response = await (deps.request || fetch)(`${baseUrl()}/api/agents/station-investigations`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },

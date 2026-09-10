@@ -418,6 +418,68 @@ test('does not charge ownership-only markers against the daily investigation lim
   assert.equal(prepared.ready, true);
 });
 
+test('rechecks the daily limit when a rate-limited claimed message is replayed', async () => {
+  const rateLimitedInput = { ...input('rate-limited-replay'), brandId: 'rate-limit-replay-brand' };
+  let contextBuilds = 0;
+  const deps = {
+    loadConfig: async () => config({ dailyLimit: 0 }),
+    buildContext: () => {
+      contextBuilds++;
+      return context('rate-limited-replay');
+    },
+  };
+
+  const first = await prepareStationInvestigation(rateLimitedInput, deps);
+  const replay = await prepareStationInvestigation(rateLimitedInput, deps);
+
+  assert.deepEqual(first.result, { skipped: true, reason: 'daily_limit' });
+  assert.deepEqual(replay.result, { skipped: true, reason: 'daily_limit' });
+  assert.equal(first.claimed, true);
+  assert.equal(replay.claimed, true);
+  assert.equal(contextBuilds, 0);
+});
+
+test('atomically prevents concurrent deliveries from investigating or sending twice', async () => {
+  let requestCount = 0;
+  let sendCount = 0;
+  let releaseRequest;
+  const responsePromise = new Promise((resolve) => {
+    releaseRequest = () => resolve(jsonResponse({
+      decision: 'send',
+      confidence: 'high',
+      stationIds: ['AR2608200012'],
+      reply: 'Resposta concorrente única.',
+    }));
+  });
+  const concurrentInput = { ...input('concurrent-delivery'), brandId: 'concurrent-delivery-brand' };
+  const deps = {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('concurrent-delivery'),
+    request: async () => {
+      requestCount++;
+      return responsePromise;
+    },
+    sendText: async () => {
+      sendCount++;
+      return { key: { id: 'outbound-concurrent-guard' } };
+    },
+  };
+
+  const firstPromise = routeStationInvestigation(concurrentInput, deps);
+  const secondPromise = routeStationInvestigation(concurrentInput, deps);
+  for (let attempt = 0; attempt < 20 && requestCount === 0; attempt++) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  assert.equal(requestCount, 1);
+  releaseRequest();
+  const results = await Promise.all([firstPromise, secondPromise]);
+
+  assert.equal(results.filter((result) => result.status === 'sent').length, 1);
+  assert.equal(results.filter((result) => result.duplicate === true).length, 1);
+  assert.equal(requestCount, 1);
+  assert.equal(sendCount, 1);
+});
+
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
   const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
     loadConfig: async () => config(),
