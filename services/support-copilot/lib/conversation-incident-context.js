@@ -10,6 +10,11 @@ const STATION_STATE_WORDS = [
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
+const STATE_FIRST_NON_NAME_TAIL_PATTERN = [
+  'agora', 'hoje', 'ainda', 'j[aá]', 'atualmente', 'novamente', 'de\\s+novo',
+  'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
+  'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
+].join('|');
 const STATION_NOUN_PREFIX_PATTERN = [
   'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
   'fornecimento', 'internet', 'luz', 'rede', 'sinal', 'transformador',
@@ -107,6 +112,17 @@ function uniqueStationNames(values) {
   });
 }
 
+function stateFirstStationName(raw) {
+  const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATE_FIRST_NON_NAME_TAIL_PATTERN})$`, 'i');
+  let name = String(raw || '').trim();
+  let previous;
+  do {
+    previous = name;
+    name = name.replace(trailingPredicate, '').trim();
+  } while (name !== previous);
+  return name;
+}
+
 function stationNamesFrom(text, options = {}) {
   const includeExplicit = options.includeExplicit !== false;
   const includeNatural = options.includeNatural !== false;
@@ -152,7 +168,7 @@ function stationNamesFrom(text, options = {}) {
         'i',
       ).exec(conversational);
       if (stateFirst) {
-        addCandidate(stateFirst[1]);
+        addCandidate(stateFirstStationName(stateFirst[1]));
         continue;
       }
       const natural = new RegExp(
