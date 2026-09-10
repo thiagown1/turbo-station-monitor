@@ -113,6 +113,7 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Habibs não voltou?', 'Habibs'],
     ['Habibs ainda não voltou?', 'Habibs'],
     ['A estação do Habibs caiu?', 'Habibs'],
+    ['O carregador da estação do Habibs caiu?', 'Habibs'],
     ['Estação: Lago Norte caiu?', 'Lago Norte'],
   ];
 

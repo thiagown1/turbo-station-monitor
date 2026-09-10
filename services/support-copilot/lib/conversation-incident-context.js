@@ -142,7 +142,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const natural = new RegExp(
-        `^(?:(?:o|a)\\s+)?(?:(?:carregador|esta[cç][aã]o)\\s+(?:(?:do|da|de)\\s+)?)?(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        `^(?:(?:o|a)\\s+)?(?:carregador\\s+(?:(?:do|da|de)\\s+)?)?(?:esta[cç][aã]o\\s+(?:(?:do|da|de)\\s+)?)?(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
         'i',
       ).exec(conversational);
       if (natural) addCandidate(natural[1]);
