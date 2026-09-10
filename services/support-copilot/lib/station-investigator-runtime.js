@@ -7,11 +7,20 @@ const { sendText } = require('./evolution-client');
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
 
-function dailyLimitReached(brandId, limit) {
+function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - 86_400_000).toISOString();
-  const row = db.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE brand_id = ? AND created_at >= ?').get(brandId, since);
+  const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
+    WHERE brand_id = ? AND created_at >= ? AND message_id <> ?`).get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
+}
+
+function persistStationOwnership(input) {
+  const now = nowIso();
+  db.prepare(`INSERT OR IGNORE INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'claimed', 0, ?, ?, ?)`)
+    .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, now, now, now);
 }
 
 async function prepareStationInvestigation(input, deps = {}) {
@@ -41,9 +50,10 @@ async function prepareStationInvestigation(input, deps = {}) {
   // group, this workflow owns the message. Any later failure must stay silent
   // and fail closed instead of falling through to a second, generic responder.
   const claimed = true;
+  if (!prior) persistStationOwnership(input);
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
-  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) {
+  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit ?? 20), input.messageId)) {
     return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
   }
   let context;

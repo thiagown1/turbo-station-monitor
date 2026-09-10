@@ -331,6 +331,77 @@ test('claims an allowlisted structured mention even when a later safety gate blo
   });
 });
 
+test('persists ownership for every safety gate reached after a valid claim', async (t) => {
+  const scenarios = [
+    {
+      name: 'kill switch',
+      id: 'owned-kill-switch',
+      deps: { loadConfig: async () => config({ killSwitch: true }) },
+      reason: 'send_disabled',
+    },
+    {
+      name: 'daily limit',
+      id: 'owned-daily-limit',
+      deps: { loadConfig: async () => config({ dailyLimit: 0 }) },
+      reason: 'daily_limit',
+    },
+    {
+      name: 'context failure',
+      id: 'owned-context-failure',
+      deps: {
+        loadConfig: async () => config(),
+        buildContext: () => { throw new Error('context failed'); },
+      },
+      reason: 'context_failed',
+    },
+    {
+      name: 'low confidence',
+      id: 'owned-low-confidence',
+      deps: {
+        loadConfig: async () => config(),
+        buildContext: () => ({ ...context('owned-low-confidence'), contextConfidence: 'low' }),
+      },
+      reason: 'low_context_confidence',
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const prepared = await prepareStationInvestigation(input(scenario.id), scenario.deps);
+      assert.equal(prepared.claimed, true);
+      assert.deepEqual(prepared.result, { skipped: true, reason: scenario.reason });
+      const job = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(scenario.id);
+      assert.deepEqual(job, { status: 'claimed' });
+    });
+  }
+
+  const replay = await prepareStationInvestigation(input('owned-kill-switch'), {
+    loadConfig: async () => config({ enabled: false }),
+  });
+  assert.deepEqual(replay, {
+    claimed: true,
+    ready: false,
+    result: { skipped: true, reason: 'disabled' },
+  });
+});
+
+test('persists ownership when the central service is unavailable after a valid claim', async () => {
+  const originalBaseUrl = process.env.AGENT_EVENT_BASE_URL;
+  delete process.env.AGENT_EVENT_BASE_URL;
+  try {
+    const prepared = await prepareStationInvestigation(input('owned-central-unavailable'), {
+      loadConfig: async () => config(),
+    });
+    assert.equal(prepared.claimed, true);
+    assert.deepEqual(prepared.result, { skipped: true, reason: 'central_unavailable' });
+    const job = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?')
+      .get('owned-central-unavailable');
+    assert.deepEqual(job, { status: 'claimed' });
+  } finally {
+    process.env.AGENT_EVENT_BASE_URL = originalBaseUrl;
+  }
+});
+
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
   const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
     loadConfig: async () => config(),
