@@ -14,20 +14,44 @@ function dailyLimitReached(brandId, limit) {
   return Number(row?.count || 0) >= limit;
 }
 
-async function routeStationInvestigation(input, deps = {}) {
+async function prepareStationInvestigation(input, deps = {}) {
   const config = await (deps.loadConfig || loadConfig)(input.brandId).catch(() => null);
   const policy = config?.stationInvestigator;
-  if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) return { skipped: true, reason: 'disabled' };
-  if (policy.killSwitch) return { skipped: true, reason: 'send_disabled' };
-  if (!policy.allowedConversationIds?.includes(input.conversationId)) return { skipped: true, reason: 'conversation_not_allowed' };
+  if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'disabled' } };
+  }
+  if (!policy.allowedConversationIds?.includes(input.conversationId)) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'conversation_not_allowed' } };
+  }
   const mentionedJid = findAllowedStructuredMention(input.whatsappContext, policy.mentionJids || []);
-  if (!mentionedJid) return { skipped: true, reason: 'structured_mention_required' };
-  if (!baseUrl() || !secret()) return { skipped: true, reason: 'central_unavailable' };
+  if (!mentionedJid) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'structured_mention_required' } };
+  }
+
+  // Once an explicitly allowlisted bot mention is present in an allowlisted
+  // group, this workflow owns the message. Any later failure must stay silent
+  // and fail closed instead of falling through to a second, generic responder.
+  const claimed = true;
+  if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
+  if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
-  if (prior?.status === 'sent' || prior?.status === 'review') return { duplicate: true, status: prior.status };
-  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) return { skipped: true, reason: 'daily_limit' };
+  if (prior?.status === 'sent' || prior?.status === 'review') {
+    return { claimed, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) {
+    return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+  }
   const context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
-  if (context.contextConfidence === 'low') return { skipped: true, reason: 'low_context_confidence' };
+  if (context.contextConfidence === 'low') {
+    return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
+  }
+  return { claimed, ready: true, policy, mentionedJid, context };
+}
+
+async function routeStationInvestigation(input, deps = {}) {
+  const preparation = deps.prepared || await prepareStationInvestigation(input, deps);
+  if (!preparation.ready) return preparation.result;
+  const { policy, mentionedJid, context } = preparation;
   const now = nowIso();
   db.prepare(`INSERT INTO station_investigation_jobs
     (message_id, conversation_id, brand_id, group_jid, instance, context_fingerprint, context_message_ids_json, status, attempts, next_attempt_at, created_at, updated_at)
@@ -66,4 +90,4 @@ async function routeStationInvestigation(input, deps = {}) {
   }
 }
 
-module.exports = { routeStationInvestigation, dailyLimitReached };
+module.exports = { prepareStationInvestigation, routeStationInvestigation, dailyLimitReached };

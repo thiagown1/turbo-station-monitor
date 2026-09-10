@@ -10,7 +10,7 @@ process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
 process.env.AGENT_EVENT_SECRET = 'test-secret';
 
 const { db } = require('../lib/db');
-const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
 
 test.after(() => {
   db.close();
@@ -271,4 +271,138 @@ test('keeps the kill switch authoritative before analysis or delivery', async ()
   assert.deepEqual(result, { skipped: true, reason: 'send_disabled' });
   assert.equal(requestCount, 0);
   assert.equal(sendCount, 0);
+});
+
+test('claims an allowlisted structured mention even when a later safety gate blocks it', async () => {
+  const prepared = await prepareStationInvestigation(input('claimed-kill-switch'), {
+    loadConfig: async () => config({ killSwitch: true }),
+    buildContext: () => {
+      throw new Error('context must not be built behind the kill switch');
+    },
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: true,
+    ready: false,
+    result: { skipped: true, reason: 'send_disabled' },
+  });
+});
+
+test('does not claim a lookalike plain-text mention without provider metadata', async () => {
+  const withoutMention = input('unstructured-lookalike');
+  withoutMention.whatsappContext.mentionedJids = [];
+
+  const prepared = await prepareStationInvestigation(withoutMention, {
+    loadConfig: async () => config(),
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: false,
+    ready: false,
+    result: { skipped: true, reason: 'structured_mention_required' },
+  });
+});
+
+test('routes Luans natural Habibs question to shadow review after an exact mention', async () => {
+  const conversationId = 'conv-habibs-pilot';
+  const brandId = 'turbo_station';
+  const requester = '5561999999999@s.whatsapp.net';
+  const insert = db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`);
+  const questionAt = new Date(Date.now() - 60_000).toISOString();
+  const mentionAt = new Date().toISOString();
+  insert.run(
+    'habibs-question', conversationId, brandId, '[Luan]: Habibs desarmou de novo?',
+    'Habibs desarmou de novo?', 'habibs-question', questionAt, '[]', requester, 'Luan', questionAt,
+  );
+  insert.run(
+    'habibs-mention', conversationId, brandId, '[Luan]: @Turbo Station Suporte',
+    '@Turbo Station Suporte', 'habibs-mention', mentionAt,
+    JSON.stringify(['support-bot@s.whatsapp.net']), requester, 'Luan', mentionAt,
+  );
+
+  let requestBody;
+  let sendCount = 0;
+  const result = await routeStationInvestigation({
+    ...input('habibs-mention'),
+    conversationId,
+    brandId,
+    receivedAt: mentionAt,
+  }, {
+    loadConfig: async () => config({ autoSend: false, allowedConversationIds: [conversationId] }),
+    request: async (_url, options) => {
+      requestBody = JSON.parse(options.body);
+      return jsonResponse({
+        decision: 'review',
+        confidence: 'medium',
+        stationIds: ['DFAR2606180001'],
+        candidateReply: 'Resposta candidata sobre o Habibs.',
+        reply: null,
+      });
+    },
+    sendText: async () => {
+      sendCount++;
+    },
+  });
+
+  assert.equal(result.status, 'review');
+  assert.equal(sendCount, 0);
+  assert.equal(requestBody.context.effectiveQuestion, 'Habibs desarmou de novo?');
+  assert.equal(requestBody.context.contextConfidence, 'medium');
+  assert.deepEqual(requestBody.context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+  assert.equal(requestBody.mentionedJid, 'SUPPORT-BOT@s.whatsapp.net');
+});
+
+test('does not build context or call the central API without a structured mention', async () => {
+  let contextBuildCount = 0;
+  let requestCount = 0;
+  let sendCount = 0;
+  const withoutMention = input('plain-text-habibs');
+  withoutMention.whatsappContext.mentionedJids = [];
+
+  const result = await routeStationInvestigation(withoutMention, {
+    loadConfig: async () => config({ autoSend: false }),
+    buildContext: () => {
+      contextBuildCount++;
+      return context('plain-text-habibs');
+    },
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review' });
+    },
+    sendText: async () => {
+      sendCount++;
+    },
+  });
+
+  assert.deepEqual(result, { skipped: true, reason: 'structured_mention_required' });
+  assert.equal(contextBuildCount, 0);
+  assert.equal(requestCount, 0);
+  assert.equal(sendCount, 0);
+});
+
+test('does not send when autoSend is enabled but the central decision requires review', async () => {
+  let sendCount = 0;
+  const result = await routeStationInvestigation(input('central-review'), {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('central-review'),
+    request: async () => jsonResponse({
+      decision: 'review',
+      confidence: 'medium',
+      stationIds: ['DFAR2606180001'],
+      candidateReply: 'Aguardando revisão humana.',
+      reply: null,
+    }),
+    sendText: async () => {
+      sendCount++;
+    },
+  });
+
+  assert.equal(result.status, 'review');
+  assert.equal(sendCount, 0);
+  const job = db.prepare('SELECT status, decision, response_sent_at FROM station_investigation_jobs WHERE message_id = ?').get('central-review');
+  assert.deepEqual(job, { status: 'review', decision: 'review', response_sent_at: null });
 });

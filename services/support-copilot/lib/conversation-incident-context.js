@@ -3,6 +3,12 @@ const crypto = require('crypto');
 const DEFAULT_CONTEXT_HOURS = 72;
 const DEFAULT_MAX_MESSAGES = 40;
 const PREFERRED_QUESTION_WINDOW_MS = 30 * 60 * 1000;
+const STATION_STATE_WORDS = [
+  'desarmou', 'caiu', 'parou', 'voltou', 'está', 'esta', 'tá', 'ta',
+  'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
+  'perdeu', 'falhou', 'funciona', 'comunicou',
+];
+const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 
 function cleanBody(message) {
   const raw = String(message.raw_body || message.body || '').trim();
@@ -30,7 +36,7 @@ function withoutMentions(text) {
 
 function looksLikeQuestion(text) {
   const value = withoutMentions(text);
-  return value.includes('?') || /\b(confirma|consegue|verifica|voltou|normal|vivo|sinal|aconteceu|houve|falha|erro|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
+  return value.includes('?') || /\b(confirma|consegue|verifica|voltou|desarmou|caiu|parou|desligou|travou|normal|vivo|sinal|aconteceu|houve|falha|erro|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
 }
 
 function isMentionOnly(message) {
@@ -74,11 +80,41 @@ function stationIdsFrom(text) {
 function stationNamesFrom(text) {
   const value = String(text || '');
   const candidates = [];
-  for (const match of value.matchAll(/(?:🏢|esta[cç][aã]o\s*[:\-]?|se\s+o\s+)([^\n,.!?]{3,80}?)(?=\s+voltou\b|\n|$|[,!?])/gi)) {
-    const name = match[1].replace(/\b(?:voltou|est[aá]|ficou|segue)\b.*$/i, '').trim();
-    if (name && !/^(carregador|normal)$/i.test(name)) candidates.push(name);
+
+  const addCandidate = (raw) => {
+    const name = String(raw || '')
+      .replace(/^[\s:–—-]+|[\s:–—-]+$/g, '')
+      .replace(/^(?:o|a)\s+/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const normalized = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    if (name.length < 3) return;
+    if (/^(?:carregador|estacao|conector|equipamento|posto|local|normal|ele|ela|isso|ai|la)$/.test(normalized)) return;
+    candidates.push(name);
+  };
+
+  // Explicit station labels used by alerts and by more formal questions.
+  for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*[:\-]?\s*)([^\n,.!?]{0,80})/gi)) {
+    const tail = match[1].trim();
+    const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
+    addCandidate(state ? tail.slice(0, state.index) : tail);
   }
-  return [...new Set(candidates.map((name) => name.replace(/\s+/g, ' ')))];
+
+  // Natural group-chat phrasing: “Habibs desarmou?”, “o carregador do
+  // Habibs está offline?”, “será que o Primor caiu?”. The state word is a
+  // delimiter, never part of the candidate station name.
+  for (const line of value.split(/\r?\n/)) {
+    const conversational = withoutMentions(line)
+      .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
+      .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|consegue\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|pode\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|confirma(?:\s+se)?|verifica(?:\s+se)?|v[eê](?:\s+se)?)[\s,!:\-–—]*/i, '')
+      .trim();
+    const natural = new RegExp(
+      `^(?:o|a)?\\s*(?:carregador\\s+(?:do|da|de)\\s+)?(.{2,80}?)\\s+(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+      'i',
+    ).exec(conversational);
+    if (natural) addCandidate(natural[1]);
+  }
+  return [...new Set(candidates)];
 }
 
 function firstMatch(text, patterns) {

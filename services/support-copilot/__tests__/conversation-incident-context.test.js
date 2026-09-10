@@ -83,3 +83,67 @@ test('keeps forwarded alerts unverified even when they contain exact OCPP fields
   assert.equal(context.incidentSignals[0].provenance, 'forwarded_alert');
   assert.equal(context.incidentSignals[0].verified, false);
 });
+
+test('recognizes the natural Habibs question from the internal group', () => {
+  const context = reconstructIncidentContext([
+    message('question', '2026-09-10T15:30:00.000Z', 'luan', 'Habibs desarmou de novo?'),
+  ], 'question');
+
+  assert.equal(context.effectiveQuestion, 'Habibs desarmou de novo?');
+  assert.equal(context.contextConfidence, 'medium');
+  assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+  assert.doesNotMatch(context.ambiguities.join(','), /station_not_identified/);
+  assert.ok(context.requestedAspects.includes('current_health'));
+});
+
+test('recognizes common natural station-name phrasings', async (t) => {
+  const scenarios = [
+    ["O Habib's W3 Norte caiu de novo?", "Habib's W3 Norte"],
+    ['O carregador do Habibs está offline?', 'Habibs'],
+    ['A Livebox parou de comunicar?', 'Livebox'],
+    ['BIG BOX voltou ao normal?', 'BIG BOX'],
+    ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
+  ];
+
+  for (const [body, expectedName] of scenarios) {
+    await t.test(body, () => {
+      const context = reconstructIncidentContext([
+        message(`question-${expectedName}`, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], `question-${expectedName}`);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: expectedName }]);
+      assert.doesNotMatch(context.ambiguities.join(','), /station_not_identified/);
+    });
+  }
+});
+
+test('extracts the natural venue when the structured mention and question share a message', () => {
+  const context = reconstructIncidentContext([
+    message('trigger', '2026-09-10T15:30:00.000Z', 'luan', '@Turbo Station Suporte Habibs desarmou de novo?', {
+      mentioned_jids_json: JSON.stringify(['support-bot@s.whatsapp.net']),
+    }),
+  ], 'trigger');
+
+  assert.equal(context.effectiveQuestion, 'Habibs desarmou de novo?');
+  assert.equal(context.contextConfidence, 'medium');
+  assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+});
+
+test('does not invent a station name when the natural question omits the venue', () => {
+  const scenarios = [
+    'O carregador desarmou de novo?',
+    'Consegue verificar se desarmou de novo?',
+    'A estação caiu de novo?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    const context = reconstructIncidentContext([
+      message(`question-${index}`, '2026-09-10T15:30:00.000Z', 'luan', body),
+    ], `question-${index}`);
+
+    assert.equal(context.contextConfidence, 'low');
+    assert.deepEqual(context.stationHints, []);
+    assert.ok(context.ambiguities.includes('station_not_identified'));
+  }
+});

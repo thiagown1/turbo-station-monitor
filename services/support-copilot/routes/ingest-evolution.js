@@ -41,7 +41,7 @@ const {
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
-const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
 const {
   handleFinancialApprovalReply,
   sendFinancialApprovalAcknowledgement,
@@ -494,16 +494,22 @@ router.post('/', async (req, res) => {
     // Contador/group-suggestion behavior. A successful central classification
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
-      void routeStationInvestigation({
+      const stationInput = {
         messageId: externalMessageId || msgId, conversationId, brandId, groupJid, instance,
         senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
-      }).catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+      };
       const quoted = quotedOutboundMessage(message, conversationId);
       // Which agent serves this group is decided in the Agent Center, not here.
       // undefined means the central was unreachable, and classifyInbound then
       // falls back to CONTADOR_GROUP_CONVERSATION_ID.
       const { isAccountingGroup } = require('../lib/agent-router');
-      const accountingGroup = await isAccountingGroup(brandId, conversationId);
+      const [accountingGroup, stationPreparation] = await Promise.all([
+        isAccountingGroup(brandId, conversationId),
+        prepareStationInvestigation(stationInput).catch((err) => {
+          console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
+          return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
+        }),
+      ]);
       const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
@@ -531,6 +537,14 @@ router.post('/', async (req, res) => {
           if (!decision.silent && decision.reply) await sendReply(decision.reply, contadorEvent).catch((err) => console.warn(`${LOG_TAG} expense decision reply failed:`, err.message));
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
+      }
+      if (stationPreparation.claimed) {
+        void routeStationInvestigation(stationInput, { prepared: stationPreparation })
+          .catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group', stationInvestigation: true,
+        });
       }
       // Central media router: every image/PDF is classified once. Text-only
       // messages use a free deterministic gate and invoke the model only when
