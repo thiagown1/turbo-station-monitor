@@ -4,6 +4,8 @@ const { buildConversationIncidentContext } = require('./conversation-incident-co
 const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
 
+const PROCESSING_LEASE_MS = 120_000;
+
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
 
@@ -44,9 +46,16 @@ function releaseDailySlot(messageId) {
     .run(nowIso(), messageId);
 }
 
+function leaseExpired(job, now = Date.now()) {
+  const updatedAt = Date.parse(job?.updated_at || '');
+  return Number.isFinite(updatedAt) && updatedAt <= now - PROCESSING_LEASE_MS;
+}
+
 async function prepareStationInvestigation(input, deps = {}) {
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
-  if (['sent', 'review', 'reserved', 'processing'].includes(prior?.status)) {
+  const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
+  if (['sent', 'review', 'sending', 'delivery_unknown'].includes(prior?.status)
+      || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
     return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
   }
 
@@ -104,14 +113,19 @@ async function routeStationInvestigation(input, deps = {}) {
   if (!preparation.ready) return preparation.result;
   const { policy, mentionedJid, context } = preparation;
   const now = nowIso();
+  const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
   const acquired = db.prepare(`UPDATE station_investigation_jobs
     SET status='processing', attempts=attempts+1, context_fingerprint=?, context_message_ids_json=?, updated_at=?
-    WHERE message_id=? AND status IN ('reserved', 'retry')`)
-    .run(context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, input.messageId);
+    WHERE message_id=? AND (
+      status IN ('reserved', 'retry')
+      OR (status='processing' AND updated_at <= ?)
+    )`)
+    .run(context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, input.messageId, staleBefore);
   if (acquired.changes !== 1) {
     const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
     return { duplicate: true, status: current?.status || 'unknown' };
   }
+  let sendStarted = false;
   try {
     const response = await (deps.request || fetch)(`${baseUrl()}/api/agents/station-investigations`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },
@@ -125,8 +139,18 @@ async function routeStationInvestigation(input, deps = {}) {
         .run(result.decision || 'review', result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
       return { status: 'review', result };
     }
+    const sending = db.prepare(`UPDATE station_investigation_jobs
+      SET status='sending', decision='send', confidence=?, station_ids_json=?, result_json=?, updated_at=?
+      WHERE message_id=? AND status='processing'`)
+      .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
+    if (sending.changes !== 1) {
+      const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+      return { duplicate: true, status: current?.status || 'unknown' };
+    }
+    sendStarted = true;
     const sent = await (deps.sendText || sendText)(input.instance, input.groupJid, result.reply);
     const externalId = sent?.key?.id || null;
+    if (!externalId) throw new Error('station_delivery_id_missing');
     const sentAt = nowIso();
     db.transaction(() => {
       db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, created_at)
@@ -137,6 +161,11 @@ async function routeStationInvestigation(input, deps = {}) {
     })();
     return { status: 'sent', result };
   } catch (error) {
+    if (sendStarted) {
+      db.prepare("UPDATE station_investigation_jobs SET status='delivery_unknown', last_error=?, updated_at=? WHERE message_id=? AND status='sending'")
+        .run(String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
+      return { status: 'delivery_unknown', error: String(error?.message || error) };
+    }
     const next = new Date(Date.now() + 60_000).toISOString();
     db.prepare("UPDATE station_investigation_jobs SET status='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE message_id=?")
       .run(next, String(error?.message || error).slice(0, 500), nowIso(), input.messageId);

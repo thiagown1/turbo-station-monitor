@@ -504,6 +504,87 @@ test('atomically prevents concurrent deliveries from investigating or sending tw
   assert.equal(sendCount, 1);
 });
 
+test('reclaims an expired processing lease but leaves a live one fenced', async () => {
+  const now = new Date().toISOString();
+  const stale = new Date(Date.now() - 5 * 60_000).toISOString();
+  const insert = db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'processing', 1, ?, ?, ?)`);
+  insert.run('stale-processing', 'conv-pilot', 'lease-brand', '120363000000000000@g.us', 'turbostation', stale, stale, stale);
+  insert.run('live-processing', 'conv-pilot', 'lease-brand', '120363000000000000@g.us', 'turbostation', now, now, now);
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async () => config({ autoSend: false }),
+    buildContext: (_conversationId, messageId) => context(messageId),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review', confidence: 'high', stationIds: ['AR2608200012'] });
+    },
+  };
+
+  const recovered = await routeStationInvestigation({ ...input('stale-processing'), brandId: 'lease-brand' }, deps);
+  const fenced = await routeStationInvestigation({ ...input('live-processing'), brandId: 'lease-brand' }, deps);
+
+  assert.equal(recovered.status, 'review');
+  assert.deepEqual(fenced, { duplicate: true, status: 'processing' });
+  assert.equal(requestCount, 1);
+});
+
+test('never retries automatically after WhatsApp delivery becomes ambiguous', async () => {
+  const ambiguousInput = { ...input('ambiguous-send'), brandId: 'ambiguous-send-brand' };
+  let requestCount = 0;
+  let sendCount = 0;
+  const deps = {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('ambiguous-send'),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({
+        decision: 'send',
+        confidence: 'high',
+        stationIds: ['AR2608200012'],
+        reply: 'Resposta com entrega ambígua.',
+      });
+    },
+    sendText: async () => {
+      sendCount++;
+      throw new Error('socket closed without delivery confirmation');
+    },
+  };
+
+  const first = await routeStationInvestigation(ambiguousInput, deps);
+  const replay = await routeStationInvestigation(ambiguousInput, deps);
+  const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get('ambiguous-send');
+
+  assert.equal(first.status, 'delivery_unknown');
+  assert.deepEqual(replay, { duplicate: true, status: 'delivery_unknown' });
+  assert.equal(job.status, 'delivery_unknown');
+  assert.match(job.last_error, /socket closed/);
+  assert.equal(requestCount, 1);
+  assert.equal(sendCount, 1);
+});
+
+test('treats a successful WhatsApp response without a message id as ambiguous', async () => {
+  const missingIdInput = { ...input('missing-delivery-id'), brandId: 'missing-delivery-id-brand' };
+  const result = await routeStationInvestigation(missingIdInput, {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('missing-delivery-id'),
+    request: async () => jsonResponse({
+      decision: 'send',
+      confidence: 'high',
+      stationIds: ['AR2608200012'],
+      reply: 'Resposta sem comprovante de entrega.',
+    }),
+    sendText: async () => ({ accepted: true }),
+  });
+  const job = db.prepare('SELECT status, response_external_message_id FROM station_investigation_jobs WHERE message_id = ?')
+    .get('missing-delivery-id');
+
+  assert.equal(result.status, 'delivery_unknown');
+  assert.deepEqual(job, { status: 'delivery_unknown', response_external_message_id: null });
+});
+
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
   const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
     loadConfig: async () => config(),
