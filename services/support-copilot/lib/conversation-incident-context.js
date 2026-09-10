@@ -11,6 +11,7 @@ const STATION_STATE_WORDS = [
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
 const STATION_NON_NAME_FRAGMENT_PATTERN = [
+  STATION_STATE_PATTERN,
   'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',

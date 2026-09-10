@@ -186,6 +186,9 @@ test('does not invent a station name when the natural question omits the venue',
     'De novo caiu?',
     'Está tudo normal?',
     'Tudo voltou?',
+    'Esta estação caiu?',
+    'Esta estação voltou?',
+    'Esta estação está offline?',
   ];
 
   for (const [index, body] of scenarios.entries()) {
