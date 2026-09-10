@@ -288,6 +288,21 @@ test('claims an allowlisted structured mention even when a later safety gate blo
   });
 });
 
+test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
+  const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
+    loadConfig: async () => config(),
+    buildContext: () => {
+      throw new Error('trigger_message_not_found');
+    },
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: true,
+    ready: false,
+    result: { skipped: true, reason: 'context_failed' },
+  });
+});
+
 test('does not claim a lookalike plain-text mention without provider metadata', async () => {
   const withoutMention = input('unstructured-lookalike');
   withoutMention.whatsappContext.mentionedJids = [];

@@ -41,7 +41,12 @@ async function prepareStationInvestigation(input, deps = {}) {
   if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) {
     return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
   }
-  const context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
+  let context;
+  try {
+    context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
+  } catch {
+    return { claimed, ready: false, result: { skipped: true, reason: 'context_failed' } };
+  }
   if (context.contextConfidence === 'low') {
     return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
   }

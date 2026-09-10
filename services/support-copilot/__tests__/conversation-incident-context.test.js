@@ -101,6 +101,8 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ["O Habib's W3 Norte caiu de novo?", "Habib's W3 Norte"],
     ['O carregador do Habibs está offline?', 'Habibs'],
     ['A Livebox parou de comunicar?', 'Livebox'],
+    ['Arena caiu de novo?', 'Arena'],
+    ['Outback caiu?', 'Outback'],
     ['BIG BOX voltou ao normal?', 'BIG BOX'],
     ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
   ];
@@ -149,4 +151,16 @@ test('does not invent a station name when the natural question omits the venue',
     assert.deepEqual(context.stationHints, []);
     assert.ok(context.ambiguities.includes('station_not_identified'));
   }
+});
+
+test('does not borrow a natural station name from another participants earlier incident', () => {
+  const context = reconstructIncidentContext([
+    message('older-incident', '2026-09-10T15:00:00.000Z', 'yves', 'Habibs desarmou?'),
+    message('current-question', '2026-09-10T15:30:00.000Z', 'luan', 'Consegue verificar se desarmou de novo?'),
+  ], 'current-question');
+
+  assert.equal(context.effectiveQuestion, 'Consegue verificar se desarmou de novo?');
+  assert.equal(context.contextConfidence, 'low');
+  assert.deepEqual(context.stationHints, []);
+  assert.ok(context.ambiguities.includes('station_not_identified'));
 });

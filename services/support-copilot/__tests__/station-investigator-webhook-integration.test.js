@@ -233,6 +233,36 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
     assert.equal(investigationCount, 1, 'plain-text lookalike must not reach the investigator');
     assert.equal(gatewaySendCount, 0);
 
+    const staleReplayId = `${MESSAGE_ID}-stale-replay`;
+    const staleFirst = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(webhookPayload(staleReplayId, true, true)),
+    });
+    assert.equal(staleFirst.status, 201);
+    await waitUntil(() => investigationCount === 2);
+    await waitUntil(() => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      const job = probe.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(staleReplayId);
+      probe.close();
+      return job?.status === 'review';
+    });
+    const staleSetup = new Database(DB_PATH);
+    const staleStoredMessage = staleSetup.prepare('SELECT id FROM messages WHERE external_message_id = ?').get(staleReplayId);
+    staleSetup.prepare("UPDATE messages SET created_at = datetime('now', '-3 days') WHERE id = ?").run(staleStoredMessage.id);
+    staleSetup.prepare('DELETE FROM station_investigation_jobs WHERE message_id = ?').run(staleReplayId);
+    staleSetup.close();
+
+    const staleReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(webhookPayload(staleReplayId, true, true)),
+    });
+    assert.equal(staleReplay.status, 200);
+    assert.equal((await staleReplay.json()).duplicate, true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(investigationCount, 2, 'stale replay must not repeat a failed context investigation');
+
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare(`
       SELECT status, decision, confidence, station_ids_json, response_sent_at, response_external_message_id
@@ -240,6 +270,7 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
     `).get(MESSAGE_ID);
     const storedMessage = database.prepare('SELECT id FROM messages WHERE external_message_id = ?').get(MESSAGE_ID);
     const genericJobs = database.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?').get(storedMessage.id);
+    const staleGenericJobs = database.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?').get(staleStoredMessage.id);
     const suggestions = database.prepare('SELECT COUNT(*) count FROM suggestions WHERE source_message_id = ?').get(MESSAGE_ID);
     database.close();
 
@@ -252,6 +283,7 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
       response_external_message_id: null,
     });
     assert.equal(genericJobs.count, 0, 'claimed station message must not enter the generic agent pipeline');
+    assert.equal(staleGenericJobs.count, 0, 'stale replay with failed context must retain station ownership');
     assert.equal(suggestions.count, 0, 'claimed station message must not create a generic group suggestion');
     console.log('PASS station webhook shadow flow, structured mention, idempotency, isolation, and zero-send gates');
   } finally {

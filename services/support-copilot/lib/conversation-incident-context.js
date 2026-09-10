@@ -82,7 +82,9 @@ function stationIdsFrom(text) {
   return [...new Set(values.map((value) => value.toUpperCase()))];
 }
 
-function stationNamesFrom(text) {
+function stationNamesFrom(text, options = {}) {
+  const includeExplicit = options.includeExplicit !== false;
+  const includeNatural = options.includeNatural !== false;
   const value = String(text || '');
   const candidates = [];
 
@@ -98,26 +100,32 @@ function stationNamesFrom(text) {
     candidates.push(name);
   };
 
-  // Explicit station labels used by alerts and by more formal questions.
-  for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*[:\-]?\s*)([^\n,.!?]{0,80})/gi)) {
-    const tail = match[1].trim();
-    const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
-    addCandidate(state ? tail.slice(0, state.index) : tail);
+  if (includeExplicit) {
+    // Explicit station labels remain useful throughout the incident context,
+    // including forwarded equipment alerts that precede the request.
+    for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*[:\-]?\s*)([^\n,.!?]{0,80})/gi)) {
+      const tail = match[1].trim();
+      const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
+      addCandidate(state ? tail.slice(0, state.index) : tail);
+    }
   }
 
   // Natural group-chat phrasing: “Habibs desarmou?”, “o carregador do
   // Habibs está offline?”, “será que o Primor caiu?”. The state word is a
-  // delimiter, never part of the candidate station name.
-  for (const line of value.split(/\r?\n/)) {
-    const conversational = withoutMentions(line)
-      .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
-      .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|consegue\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|pode\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|confirma(?:\s+se)?|verifica(?:\s+se)?|v[eê](?:\s+se)?)[\s,!:\-–—]*/i, '')
-      .trim();
-    const natural = new RegExp(
-      `^(?:o|a)?\\s*(?:carregador\\s+(?:do|da|de)\\s+)?(.{2,80}?)\\s+(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
-      'i',
-    ).exec(conversational);
-    if (natural) addCandidate(natural[1]);
+  // delimiter, never part of the candidate station name. Natural names are
+  // only extracted from the effective question, never unrelated history.
+  if (includeNatural) {
+    for (const line of value.split(/\r?\n/)) {
+      const conversational = withoutMentions(line)
+        .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
+        .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|consegue\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|pode\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|confirma(?:\s+se)?|verifica(?:\s+se)?|v[eê](?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .trim();
+      const natural = new RegExp(
+        `^(?:(?:o|a)\\s+)?(?:carregador\\s+(?:do|da|de)\\s+)?(.{2,80}?)\\s+(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        'i',
+      ).exec(conversational);
+      if (natural) addCandidate(natural[1]);
+    }
   }
   return [...new Set(candidates)];
 }
@@ -185,7 +193,10 @@ function reconstructIncidentContext(messages, triggerMessageId, options = {}) {
   const relevant = ordered.filter((message) => parseProviderTime(message) <= parseProviderTime(trigger));
   const allText = relevant.map(cleanBody).join('\n');
   const stationIds = stationIdsFrom(allText);
-  const stationNames = stationNamesFrom([question, allText].join('\n'));
+  const stationNames = [...new Set([
+    ...stationNamesFrom(allText, { includeNatural: false }),
+    ...stationNamesFrom(question, { includeExplicit: false }),
+  ])];
   const incidentSignals = relevant.map(incidentSignal).filter(Boolean);
   const participantClaims = relevant.map(participantClaim).filter(Boolean);
   const ambiguities = [];
