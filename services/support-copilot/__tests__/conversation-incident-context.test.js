@@ -108,6 +108,10 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Consegue verificar pra gente se a Livebox voltou?', 'Livebox'],
     ['BIG BOX voltou ao normal?', 'BIG BOX'],
     ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
+    ['Habibs ainda está offline?', 'Habibs'],
+    ['Habibs já voltou?', 'Habibs'],
+    ['Habibs não voltou?', 'Habibs'],
+    ['Habibs ainda não voltou?', 'Habibs'],
   ];
 
   for (const [body, expectedName] of scenarios) {

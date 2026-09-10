@@ -15,17 +15,26 @@ function dailyLimitReached(brandId, limit) {
 }
 
 async function prepareStationInvestigation(input, deps = {}) {
+  const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+  if (prior?.status === 'sent' || prior?.status === 'review') {
+    return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+
+  // Persisted jobs keep ownership across provider replays even when the
+  // current config is temporarily unavailable or has since been tightened.
+  // Otherwise the same attachment can fall through to the generic router.
+  const claimedByPriorJob = Boolean(prior);
   const config = await (deps.loadConfig || loadConfig)(input.brandId).catch(() => null);
   const policy = config?.stationInvestigator;
   if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) {
-    return { claimed: false, ready: false, result: { skipped: true, reason: 'disabled' } };
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'disabled' } };
   }
   if (!policy.allowedConversationIds?.includes(input.conversationId)) {
-    return { claimed: false, ready: false, result: { skipped: true, reason: 'conversation_not_allowed' } };
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'conversation_not_allowed' } };
   }
   const mentionedJid = findAllowedStructuredMention(input.whatsappContext, policy.mentionJids || []);
   if (!mentionedJid) {
-    return { claimed: false, ready: false, result: { skipped: true, reason: 'structured_mention_required' } };
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'structured_mention_required' } };
   }
 
   // Once an explicitly allowlisted bot mention is present in an allowlisted
@@ -34,10 +43,6 @@ async function prepareStationInvestigation(input, deps = {}) {
   const claimed = true;
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
-  const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
-  if (prior?.status === 'sent' || prior?.status === 'review') {
-    return { claimed, ready: false, result: { duplicate: true, status: prior.status } };
-  }
   if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) {
     return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
   }

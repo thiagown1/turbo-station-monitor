@@ -253,6 +253,49 @@ test('does not investigate or send the same completed message twice', async () =
   assert.equal(sendCount, 1);
 });
 
+test('keeps persisted review ownership when current configuration is unavailable', async () => {
+  const messageId = 'review-owned-during-config-outage';
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'review', 1, ?, ?, ?)`)
+    .run(messageId, 'conv-pilot', 'turbo_station', '120363000000000000@g.us', 'turbostation', now, now, now);
+
+  let configLoads = 0;
+  const prepared = await prepareStationInvestigation(input(messageId), {
+    loadConfig: async () => {
+      configLoads++;
+      throw new Error('temporary config outage');
+    },
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: true,
+    ready: false,
+    result: { duplicate: true, status: 'review' },
+  });
+  assert.equal(configLoads, 0, 'terminal persisted ownership must be resolved before current config');
+});
+
+test('keeps a retry job claimed when the investigator is currently disabled', async () => {
+  const messageId = 'retry-owned-while-disabled';
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'retry', 1, ?, ?, ?)`)
+    .run(messageId, 'conv-pilot', 'turbo_station', '120363000000000000@g.us', 'turbostation', now, now, now);
+
+  const prepared = await prepareStationInvestigation(input(messageId), {
+    loadConfig: async () => config({ enabled: false }),
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: true,
+    ready: false,
+    result: { skipped: true, reason: 'disabled' },
+  });
+});
+
 test('keeps the kill switch authoritative before analysis or delivery', async () => {
   let requestCount = 0;
   let sendCount = 0;
