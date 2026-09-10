@@ -11,7 +11,8 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
-    WHERE brand_id = ? AND created_at >= ? AND message_id <> ?`).get(brandId, since, excludeMessageId);
+    WHERE brand_id = ? AND created_at >= ? AND status <> 'claimed' AND message_id <> ?`)
+    .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
 }
 

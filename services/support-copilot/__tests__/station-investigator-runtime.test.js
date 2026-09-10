@@ -402,6 +402,22 @@ test('persists ownership when the central service is unavailable after a valid c
   }
 });
 
+test('does not charge ownership-only markers against the daily investigation limit', async () => {
+  const blockedInput = { ...input('owned-without-investigation'), brandId: 'quota-test-brand' };
+  const blocked = await prepareStationInvestigation(blockedInput, {
+    loadConfig: async () => config({ killSwitch: true }),
+  });
+  assert.equal(blocked.claimed, true);
+
+  const investigationInput = { ...input('first-real-investigation'), brandId: 'quota-test-brand' };
+  const prepared = await prepareStationInvestigation(investigationInput, {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: () => context('first-real-investigation'),
+  });
+  assert.equal(prepared.claimed, true);
+  assert.equal(prepared.ready, true);
+});
+
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
   const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
     loadConfig: async () => config(),
