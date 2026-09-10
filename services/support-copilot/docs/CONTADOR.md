@@ -329,6 +329,41 @@ month's number, never chatter. A wrong fact is corrected by setting
 Both `aprender` and `responde_perguntas` are optional in the reply contract, so
 an instruction that carries neither has exactly the shape it always had.
 
+## O que o modelo enxerga de uma foto
+
+O corpo de uma mensagem de midia no banco e so `[imagem]`: o conteudo foi
+extraido uma vez pela classificacao central e guardado em
+`agent_media_analyses`. Ate 09/2026 o historico entregue ao modelo vinha so de
+`messages.body`, entao tres comprovantes seguidos chegavam como tres
+placeholders vazios - o Contador respondia sobre pendencias como se nada
+tivesse sido enviado, e era impossivel pedir a ele que conferisse um
+comprovante.
+
+`loadContext` agora faz LEFT JOIN em `agent_media_analyses` e `contextBlock`
+anexa uma linha curta por midia: tipo, resumo, valor e data. Referencia do
+comprovante e documento do favorecido ficam de fora de proposito - nao ajudam a
+responder no grupo e sao dado pessoal atravessando para o modelo. Analise que
+falhou, JSON quebrado ou midia ainda na fila nao mudam o corpo da mensagem.
+
+## Memoria durante a sessao e entre sessoes
+
+Sao duas memorias, com alcances diferentes:
+
+- `contador_fatos` / `contador_perguntas_abertas` (SQLite): a fonte da verdade.
+  `blocoDeFatos()` injeta os fatos no prompt do fluxo de **pergunta**. O aviso
+  diario nao usa esse bloco.
+- `CONTADOR_MEMORY_DIR` (arquivos no workspace do agente): projecao reescrita
+  inteira a cada fato aprendido ou pergunta encerrada, em `fatos-do-grupo.md`.
+  O OpenClaw le a memoria do workspace no bootstrap de **toda** sessao e a
+  indexa para busca, entao esse caminho cobre o aviso diario e qualquer sessao
+  nova. Vazio = nao projeta nada; falha de escrita e best-effort e nunca derruba
+  o turno.
+
+Isso importa porque a sessao do OpenClaw reinicia sozinha: com
+`session.idleMinutes` em 6h e o heartbeat rodando de 24 em 24h, cada rodada
+nasce numa sessao nova. Sem a memoria em arquivo o agente comeca do zero todo
+dia.
+
 ## Expense receipts and recurrence
 
 The central router may extract supplier, category, competency, currency and the

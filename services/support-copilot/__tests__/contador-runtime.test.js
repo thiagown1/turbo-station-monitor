@@ -14,6 +14,8 @@ const retryDbPath = `${dbPath}-retry`;
 const sendFailureDbPath = `${dbPath}-send-failure`;
 const deliveryDbPath = `${dbPath}-delivery`;
 const replyDbPath = `${dbPath}-reply`;
+const memoriaDbPath = `${dbPath}-memoria`;
+const memoriaDir = path.join(os.tmpdir(), `contador-memoria-${process.pid}-${Date.now()}`);
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
@@ -430,8 +432,57 @@ try {
   assert.equal(reply.replayedHandleCalls, 0);
   assert.deepEqual(reply.recoveredSent, { status: 'completed', reply_status: 'sent' });
   console.log('PASS Contador reply delivery is checkpointed and recovery never duplicates an ambiguous send');
+
+{
+  // A memoria do workspace e o que o agente le em TODA sessao nova, inclusive a
+  // do aviso diario. Sem esta projecao ela congela no dia em que foi semeada.
+  const memoriaOutput = execFileSync(process.execPath, ['-e', `
+    const { registrarFatos, resolverPerguntas, sincronizarMemoriaDoWorkspace } = require('./lib/contador-runtime');
+    const { db } = require('./lib/db');
+    db.prepare("INSERT INTO contador_perguntas_abertas (pergunta, status, created_at) VALUES (?, 'aberta', ?)")
+      .run('Qual o desagio da Lux na Metropole 3?', new Date().toISOString());
+    const gravados = registrarFatos(['Metropole 2 e Life Box pagam a fatura cheia da Neoenergia']);
+    const repetido = registrarFatos(['Metropole 2 e Life Box pagam a fatura cheia da Neoenergia']);
+    const fs = require('fs');
+    const path = require('path');
+    const arquivo = path.join(process.env.CONTADOR_MEMORY_DIR, 'fatos-do-grupo.md');
+    const depoisDoFato = fs.readFileSync(arquivo, 'utf8');
+    const pergunta = db.prepare("SELECT id FROM contador_perguntas_abertas LIMIT 1").get();
+    resolverPerguntas([pergunta.id]);
+    const depoisDaResposta = fs.readFileSync(arquivo, 'utf8');
+    delete process.env.CONTADOR_MEMORY_DIR;
+    const semEnv = sincronizarMemoriaDoWorkspace();
+    process.stdout.write(JSON.stringify({ gravados, repetido, depoisDoFato, depoisDaResposta, semEnv }));
+    db.close();
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: memoriaDbPath,
+      CONTADOR_MEMORY_DIR: memoriaDir,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+    },
+    encoding: 'utf8',
+  });
+  const memoria = JSON.parse(memoriaOutput.slice(memoriaOutput.lastIndexOf(String.fromCharCode(10)) + 1));
+  assert.equal(memoria.gravados, 1);
+  assert.equal(memoria.repetido, 0);
+  assert.match(memoria.depoisDoFato, /Metropole 2 e Life Box pagam a fatura cheia da Neoenergia/);
+  assert.match(memoria.depoisDoFato, /Qual o desagio da Lux na Metropole 3?/);
+  // Reescrita inteira, nao append: a pergunta respondida some do arquivo.
+  assert.equal(/Qual o desagio da Lux na Metropole 3?/.test(memoria.depoisDaResposta), false);
+  assert.match(memoria.depoisDaResposta, /Metropole 2 e Life Box pagam a fatura cheia da Neoenergia/);
+  // O fato aparece uma vez so, mesmo depois de duas reescritas.
+  assert.equal(memoria.depoisDaResposta.split('Metropole 2 e Life Box').length - 1, 1);
+  assert.equal(memoria.semEnv, false);
+  console.log('PASS Contador projects facts and open questions into the workspace memory');
+}
 } finally {
-  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath, replyDbPath]) {
+  fs.rmSync(memoriaDir, { recursive: true, force: true });
+  for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath, replyDbPath, memoriaDbPath]) {
     for (const suffix of ['', '-wal', '-shm']) fs.rmSync(`${target}${suffix}`, { force: true });
   }
 }

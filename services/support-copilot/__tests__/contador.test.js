@@ -5,6 +5,8 @@ const {
   buildContador,
   classifyInbound,
   parseAgentInstruction,
+  describeMediaAnalysis,
+  contextBlock,
 } = require('../lib/contador');
 
 const tests = [];
@@ -737,6 +739,56 @@ test('Agent Center decides the group, env var is only the fallback', () => {
     accountingGroup: undefined,
     body: 'quais contas faltam?',
   }, open).kind, 'query');
+});
+
+
+// Payload real de agent_media_analyses: o comprovante da Neoenergia que o Yves
+// postou no grupo em 08/09/2026 e sobre o qual o Contador nao disse nada.
+const ANALISE_REAL = JSON.stringify({
+  status: 'ok',
+  kind: 'partner_payment_receipt',
+  summary: 'Pagamento para NEOENERGIA BRASILIA',
+  confidence: 1,
+  amountCents: 1580040,
+  currency: 'BRL',
+  transactionDate: '2026-09-08',
+  receiptRef: 'E607011190202609081803DY52WVCBNZ4',
+  payeeDocument: '07522669000192',
+});
+
+test('o conteudo da imagem chega ao modelo, em vez de um placeholder vazio', () => {
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: '[Y]: [imagem]', created_at: '2026-09-08T18:03:53Z', media_result: ANALISE_REAL },
+  ]);
+  assert.match(linha.body, /NEOENERGIA BRASILIA/);
+  assert.match(linha.body, /R$ 15800,40|15800,40/);
+  assert.match(linha.body, /2026-09-08/);
+  // o corpo original continua la: a linha ainda diz que veio uma imagem
+  assert.match(linha.body, /[Y]/);
+});
+
+test('referencia e documento do favorecido NAO atravessam para o modelo', () => {
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: '[imagem]', created_at: '2026-09-08T18:03:53Z', media_result: ANALISE_REAL },
+  ]);
+  assert.equal(linha.body.includes('E607011190202609081803DY52WVCBNZ4'), false);
+  assert.equal(linha.body.includes('07522669000192'), false);
+});
+
+test('analise que falhou, json quebrado ou mensagem sem midia nao mudam o corpo', () => {
+  const falhou = JSON.stringify({ status: 'error', summary: 'nao consegui ler' });
+  assert.equal(describeMediaAnalysis(falhou), null);
+  assert.equal(describeMediaAnalysis('{isso nao e json'), null);
+  assert.equal(describeMediaAnalysis(null), null);
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: 'quais contas faltam?', created_at: '2026-09-08T18:03:53Z' },
+  ]);
+  assert.equal(linha.body, 'quais contas faltam?');
+});
+
+test('analise sem valor ainda entrega o resumo', () => {
+  const semValor = JSON.stringify({ status: 'ok', kind: 'energy_invoice', summary: 'Fatura Equatorial' });
+  assert.equal(describeMediaAnalysis(semValor), '[energy_invoice] Fatura Equatorial');
 });
 
 (async () => {
