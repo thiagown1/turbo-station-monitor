@@ -123,7 +123,7 @@ function stationNamesFrom(text, options = {}) {
   if (includeExplicit) {
     // Explicit station labels remain useful throughout the incident context,
     // including forwarded equipment alerts that precede the request.
-    for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*[:\-]?\s*)([^\n,.!?]{0,80})/gi)) {
+    for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*(?::|-)\s*|esta[cç][aã]o\s+(?!d(?:o|a|e)\b))([^\n,.!?]{0,80})/gi)) {
       const tail = match[1].trim();
       const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
       addCandidate(state ? tail.slice(0, state.index) : tail);
@@ -139,9 +139,10 @@ function stationNamesFrom(text, options = {}) {
       const conversational = withoutMentions(line)
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
         .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|(?:consegue|pode)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma|verifica|v[eê])(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const natural = new RegExp(
-        `^(?:(?:o|a)\\s+)?(?:carregador\\s+(?:do|da|de)\\s+)?(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        `^(?:(?:o|a)\\s+)?(?:(?:carregador|esta[cç][aã]o)\\s+(?:(?:do|da|de)\\s+)?)?(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
         'i',
       ).exec(conversational);
       if (natural) addCandidate(natural[1]);

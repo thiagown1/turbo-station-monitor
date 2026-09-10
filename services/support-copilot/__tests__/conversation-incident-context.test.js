@@ -112,6 +112,8 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Habibs já voltou?', 'Habibs'],
     ['Habibs não voltou?', 'Habibs'],
     ['Habibs ainda não voltou?', 'Habibs'],
+    ['A estação do Habibs caiu?', 'Habibs'],
+    ['Estação: Lago Norte caiu?', 'Lago Norte'],
   ];
 
   for (const [body, expectedName] of scenarios) {

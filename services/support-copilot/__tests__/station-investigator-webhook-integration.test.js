@@ -78,6 +78,30 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
   };
 }
 
+function quotedContadorPayload(messageId, quotedMessageId) {
+  return {
+    event: 'messages.upsert',
+    instance: 'turbostation',
+    data: {
+      key: {
+        remoteJid: GROUP_JID,
+        fromMe: false,
+        id: messageId,
+        participant: '5561999999999@s.whatsapp.net',
+      },
+      pushName: 'Luan',
+      messageType: 'extendedTextMessage',
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: {
+        extendedTextMessage: {
+          text: '@Turbo Station Suporte Habibs desarmou?',
+          contextInfo: { mentionedJid: [BOT_JID], stanzaId: quotedMessageId },
+        },
+      },
+    },
+  };
+}
+
 (async () => {
   let investigationCount = 0;
   let investigationRequest = null;
@@ -93,7 +117,7 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
         config: {
           enabled: true,
           agents: { stationSupport: true, accounting: false },
-          accountingGroupConversationIds: [],
+          accountingGroupConversationIds: [CONVERSATION_ID],
           stationInvestigator: {
             enabled: true,
             autoSend: false,
@@ -148,7 +172,10 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
         EVOLUTION_API_URL: `http://127.0.0.1:${gatewayPort}`,
         EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
         EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station',
-        CONTADOR_ENABLED: 'false',
+        CONTADOR_ENABLED: 'true',
+        CONTADOR_GROUP_CONVERSATION_ID: GROUP_JID,
+        CONTADOR_NEXT_BASE_URL: `http://127.0.0.1:${centralPort}`,
+        CONTADOR_NEXT_SECRET: AGENT_SECRET,
         GROUP_AGENT: '',
       },
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -262,6 +289,51 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
     assert.equal((await staleReplay.json()).duplicate, true);
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(investigationCount, 2, 'stale replay must not repeat a failed context investigation');
+
+    const quotedDraftExternalId = `${MESSAGE_ID}-contador-draft`;
+    const quotedReplyId = `${MESSAGE_ID}-contador-reply`;
+    const quotedSetup = new Database(DB_PATH);
+    quotedSetup.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body,
+       external_message_id, media_json, delivery_status, created_at)
+      VALUES (?, ?, ?, 'outbound', 'contador', ?, ?, ?, ?, 'sent', ?)`)
+      .run(
+        `${quotedDraftExternalId}-local`, CONVERSATION_ID, 'turbo_station',
+        'Qual estação devo considerar?', 'Qual estação devo considerar?', quotedDraftExternalId,
+        JSON.stringify({ contador: { kind: 'draft_prompt', draftId: 'draft-habibs' } }),
+        new Date().toISOString(),
+      );
+    quotedSetup.close();
+
+    const quotedReply = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
+    });
+    const quotedReplyBody = await quotedReply.json();
+    assert.equal(quotedReply.status, 201, JSON.stringify(quotedReplyBody));
+    assert.equal(quotedReplyBody.stationInvestigation, undefined, 'quoted Contador reply must take precedence');
+    await waitUntil(() => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      const count = probe.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get(quotedReplyId).count;
+      probe.close();
+      return count === 1;
+    });
+    assert.equal(investigationCount, 2, 'quoted Contador reply must not reach the station investigator');
+
+    const quotedReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
+    });
+    assert.equal(quotedReplay.status, 200);
+    assert.equal((await quotedReplay.json()).duplicate, true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const quotedReplayProbe = new Database(DB_PATH, { readonly: true });
+    const quotedJobCount = quotedReplayProbe.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get(quotedReplyId).count;
+    quotedReplayProbe.close();
+    assert.equal(quotedJobCount, 1, 'quoted Contador replay must remain idempotent');
+    assert.equal(investigationCount, 2, 'quoted Contador replay must not reach the station investigator');
 
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare(`

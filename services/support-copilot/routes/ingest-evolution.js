@@ -397,6 +397,10 @@ router.post('/', async (req, res) => {
             quotedContadorDraftId: quoted?.draftId || null,
           };
           void (async () => {
+            if (isQuotedContadorDraftReply(contadorEvent)) {
+              enqueueContadorMessage(contadorEvent);
+              return;
+            }
             let prepared;
             try {
               prepared = await prepareStationInvestigation(stationInput);
@@ -405,10 +409,6 @@ router.post('/', async (req, res) => {
             }
             if (prepared?.claimed) {
               await routeStationInvestigation(stationInput, { prepared });
-              return;
-            }
-            if (isQuotedContadorDraftReply(contadorEvent)) {
-              enqueueContadorMessage(contadorEvent);
               return;
             }
             if (media && ['image', 'document'].includes(media.media_type)) {
@@ -553,14 +553,6 @@ router.post('/', async (req, res) => {
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
       }
-      if (stationPreparation.claimed) {
-        void routeStationInvestigation(stationInput, { prepared: stationPreparation })
-          .catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
-        return res.status(201).json({
-          id: msgId, conversationId, created, duplicate: false,
-          source: 'evolution', channel: 'whatsapp-group', stationInvestigation: true,
-        });
-      }
       // Central media router: every image/PDF is classified once. Text-only
       // messages use a free deterministic gate and invoke the model only when
       // they look like a request to inspect a charger.
@@ -573,6 +565,13 @@ router.post('/', async (req, res) => {
         if (contadorRoute.kind === 'ignored') {
           scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
         }
+      } else if (stationPreparation.claimed) {
+        void routeStationInvestigation(stationInput, { prepared: stationPreparation })
+          .catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group', stationInvestigation: true,
+        });
       } else if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
         const { routeInboundMessageDurably } = require('../lib/agent-router');
         routeInboundMessageDurably({
