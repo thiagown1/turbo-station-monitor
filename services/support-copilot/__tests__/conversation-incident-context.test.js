@@ -166,6 +166,25 @@ test('does not invent a station name when the natural question omits the venue',
   }
 });
 
+test('strips every supported equipment prefix before a nested station venue', async (t) => {
+  const prefixes = [
+    'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
+    'fornecimento', 'internet', 'luz', 'rede', 'sinal', 'transformador',
+  ];
+
+  for (const [index, prefix] of prefixes.entries()) {
+    await t.test(prefix, () => {
+      const questionId = `equipment-prefix-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', `O ${prefix} da estação do Habibs caiu?`),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
 test('does not borrow a natural station name from another participants earlier incident', () => {
   const context = reconstructIncidentContext([
     message('older-incident', '2026-09-10T15:00:00.000Z', 'yves', 'Habibs desarmou?'),
