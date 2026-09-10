@@ -165,7 +165,7 @@ test('extracts the natural venue when the structured mention and question share 
   assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
 });
 
-test('does not invent a station name when the natural question omits the venue', () => {
+test('does not invent a station name when the natural question omits the venue', async (t) => {
   const scenarios = [
     'O carregador desarmou de novo?',
     'Consegue verificar se desarmou de novo?',
@@ -178,16 +178,24 @@ test('does not invent a station name when the natural question omits the venue',
     'Está online?',
     'Ficou sem energia?',
     'Como está agora?',
+    'Ainda não voltou?',
+    'Ainda está offline?',
+    'Não voltou?',
+    'Já voltou?',
+    'Hoje caiu?',
+    'De novo caiu?',
   ];
 
   for (const [index, body] of scenarios.entries()) {
-    const context = reconstructIncidentContext([
-      message(`question-${index}`, '2026-09-10T15:30:00.000Z', 'luan', body),
-    ], `question-${index}`);
+    await t.test(body, () => {
+      const context = reconstructIncidentContext([
+        message(`question-${index}`, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], `question-${index}`);
 
-    assert.equal(context.contextConfidence, 'low');
-    assert.deepEqual(context.stationHints, []);
-    assert.ok(context.ambiguities.includes('station_not_identified'));
+      assert.equal(context.contextConfidence, 'low');
+      assert.deepEqual(context.stationHints, []);
+      assert.ok(context.ambiguities.includes('station_not_identified'));
+    });
   }
 });
 

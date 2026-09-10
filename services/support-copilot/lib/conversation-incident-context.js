@@ -10,8 +10,8 @@ const STATION_STATE_WORDS = [
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
-const STATE_FIRST_NON_NAME_TAIL_PATTERN = [
-  'agora', 'hoje', 'ainda', 'j[aá]', 'atualmente', 'novamente', 'de\\s+novo',
+const STATION_NON_NAME_FRAGMENT_PATTERN = [
+  'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
 ].join('|');
@@ -113,7 +113,7 @@ function uniqueStationNames(values) {
 }
 
 function stateFirstStationName(raw) {
-  const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATE_FIRST_NON_NAME_TAIL_PATTERN})$`, 'i');
+  const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i');
   let name = String(raw || '').trim();
   let previous;
   do {
@@ -138,6 +138,7 @@ function stationNamesFrom(text, options = {}) {
     const normalized = normalizedStationName(name);
     if (name.length < 3) return;
     if (GENERIC_STATION_SUBJECTS.has(normalized)) return;
+    if (new RegExp(`^(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i').test(name)) return;
     candidates.push(name);
   };
 
