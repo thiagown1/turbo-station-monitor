@@ -439,6 +439,30 @@ test('rechecks the daily limit when a rate-limited claimed message is replayed',
   assert.equal(contextBuilds, 0);
 });
 
+test('atomically reserves the last daily slot across different concurrent messages', async () => {
+  const brandId = 'concurrent-quota-brand';
+  const deps = {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: (_conversationId, messageId) => context(messageId),
+  };
+
+  const results = await Promise.all([
+    prepareStationInvestigation({ ...input('quota-race-one'), brandId }, deps),
+    prepareStationInvestigation({ ...input('quota-race-two'), brandId }, deps),
+  ]);
+
+  assert.equal(results.filter((result) => result.ready === true).length, 1);
+  assert.equal(
+    results.filter((result) => result.result?.reason === 'daily_limit').length,
+    1,
+  );
+  const statuses = db.prepare('SELECT status FROM station_investigation_jobs WHERE brand_id = ? ORDER BY message_id')
+    .all(brandId)
+    .map((row) => row.status)
+    .sort();
+  assert.deepEqual(statuses, ['claimed', 'reserved']);
+});
+
 test('atomically prevents concurrent deliveries from investigating or sending twice', async () => {
   let requestCount = 0;
   let sendCount = 0;

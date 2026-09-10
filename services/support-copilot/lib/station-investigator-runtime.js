@@ -11,7 +11,7 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
-    WHERE brand_id = ? AND created_at >= ? AND status <> 'claimed' AND message_id <> ?`)
+    WHERE brand_id = ? AND updated_at >= ? AND status <> 'claimed' AND message_id <> ?`)
     .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
 }
@@ -24,9 +24,29 @@ function persistStationOwnership(input) {
     .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, now, now, now);
 }
 
+function reserveDailySlot(messageId, brandId, limit) {
+  return db.transaction(() => {
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(messageId);
+    if (current?.status !== 'claimed') {
+      return { acquired: false, status: current?.status || 'unknown', limitReached: false };
+    }
+    if (dailyLimitReached(brandId, limit, messageId)) {
+      return { acquired: false, status: 'claimed', limitReached: true };
+    }
+    const acquired = db.prepare("UPDATE station_investigation_jobs SET status='reserved', updated_at=? WHERE message_id=? AND status='claimed'")
+      .run(nowIso(), messageId);
+    return { acquired: acquired.changes === 1, status: acquired.changes === 1 ? 'reserved' : 'unknown', limitReached: false };
+  })();
+}
+
+function releaseDailySlot(messageId) {
+  db.prepare("UPDATE station_investigation_jobs SET status='claimed', updated_at=? WHERE message_id=? AND status='reserved'")
+    .run(nowIso(), messageId);
+}
+
 async function prepareStationInvestigation(input, deps = {}) {
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
-  if (prior?.status === 'sent' || prior?.status === 'review') {
+  if (['sent', 'review', 'reserved', 'processing'].includes(prior?.status)) {
     return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
   }
 
@@ -54,17 +74,26 @@ async function prepareStationInvestigation(input, deps = {}) {
   if (!prior) persistStationOwnership(input);
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
-  if ((!prior || prior.status === 'claimed')
-      && dailyLimitReached(input.brandId, Number(policy.dailyLimit ?? 20), input.messageId)) {
-    return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+  let reservedDailySlot = false;
+  if (!prior || prior.status === 'claimed') {
+    const reservation = reserveDailySlot(input.messageId, input.brandId, Number(policy.dailyLimit ?? 20));
+    if (!reservation.acquired) {
+      if (!reservation.limitReached) {
+        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
+      }
+      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+    }
+    reservedDailySlot = true;
   }
   let context;
   try {
     context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
   } catch {
+    if (reservedDailySlot) releaseDailySlot(input.messageId);
     return { claimed, ready: false, result: { skipped: true, reason: 'context_failed' } };
   }
   if (context.contextConfidence === 'low') {
+    if (reservedDailySlot) releaseDailySlot(input.messageId);
     return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
   }
   return { claimed, ready: true, policy, mentionedJid, context };
@@ -77,7 +106,7 @@ async function routeStationInvestigation(input, deps = {}) {
   const now = nowIso();
   const acquired = db.prepare(`UPDATE station_investigation_jobs
     SET status='processing', attempts=attempts+1, context_fingerprint=?, context_message_ids_json=?, updated_at=?
-    WHERE message_id=? AND status IN ('claimed', 'retry')`)
+    WHERE message_id=? AND status IN ('reserved', 'retry')`)
     .run(context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, input.messageId);
   if (acquired.changes !== 1) {
     const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
