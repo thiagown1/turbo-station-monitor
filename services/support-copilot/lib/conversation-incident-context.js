@@ -143,9 +143,17 @@ function stationNamesFrom(text, options = {}) {
     for (const line of value.split(/\r?\n/)) {
       const conversational = withoutMentions(line)
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
-        .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+se|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
+      const stateFirst = new RegExp(
+        `^(?:como\\s+)?(?:est[aá]|anda|ficou)\\s+(?:(?:o|a)\\s+)?(?:(?:${STATION_NOUN_PREFIX_PATTERN})\\s+(?:(?:do|da|de)\\s+)?)*(.{2,80}?)(?=\\s*[?!,.…]*$)`,
+        'i',
+      ).exec(conversational);
+      if (stateFirst) {
+        addCandidate(stateFirst[1]);
+        continue;
+      }
       const natural = new RegExp(
         `^(?:(?:o|a)\\s+)?(?:(?:${STATION_NOUN_PREFIX_PATTERN})\\s+(?:(?:do|da|de)\\s+)?)*(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
         'i',
