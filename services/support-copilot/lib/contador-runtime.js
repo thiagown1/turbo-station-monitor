@@ -139,13 +139,22 @@ async function readMedia(media) {
   return fs.promises.readFile(resolveMediaPath(media));
 }
 
+/**
+ * O historico que vai para o modelo, com o conteudo das midias junto.
+ *
+ * O LEFT JOIN em agent_media_analyses e o que impede o Contador de ver um
+ * comprovante como "[Imagem]" vazio: a classificacao ja foi paga uma vez, e sem
+ * isso o resultado morre no banco. Fica LEFT porque midia sem analise (ou ainda
+ * na fila) nao pode sumir do historico.
+ */
 function loadContext(conversationId, limit = 30) {
   if (!conversationId) return [];
   return db.prepare(`
-    SELECT direction, body, created_at
-    FROM messages
-    WHERE conversation_id = ?
-    ORDER BY datetime(created_at) DESC
+    SELECT m.direction, m.body, m.created_at, a.result_json AS media_result
+    FROM messages m
+    LEFT JOIN agent_media_analyses a ON a.message_id = m.id
+    WHERE m.conversation_id = ?
+    ORDER BY datetime(m.created_at) DESC
     LIMIT ?
   `).all(conversationId, Math.min(30, Math.max(1, limit))).reverse();
 }
@@ -171,8 +180,62 @@ function resolverPerguntas(ids) {
   `);
   let n = 0;
   db.transaction(() => { for (const id of lista) n += stmt.run(now, id).changes; })();
-  if (n) console.log(`${LOG_TAG} [contador] encerrou ${n} pergunta(s)`);
+  if (n) {
+    console.log(`${LOG_TAG} [contador] encerrou ${n} pergunta(s)`);
+    sincronizarMemoriaDoWorkspace();
+  }
   return n;
+}
+
+/**
+ * Projeta os fatos e as perguntas abertas num arquivo de memoria do workspace
+ * do agente OpenClaw.
+ *
+ * A fonte da verdade continua sendo o SQLite: este arquivo e uma copia, reescrita
+ * inteira a cada mudanca (nunca append, senao um fato revogado ficaria para
+ * sempre). O motivo de existir e que o bloco de fatos so e injetado no prompt do
+ * fluxo de pergunta - o aviso diario e qualquer sessao nova nao o veem. No
+ * workspace o OpenClaw le a memoria no bootstrap de toda sessao e indexa o
+ * arquivo para busca.
+ *
+ * Best-effort de proposito: memoria e um extra, entao um disco cheio ou uma
+ * permissao errada nao pode derrubar o turno do agente.
+ */
+function sincronizarMemoriaDoWorkspace() {
+  const dir = String(process.env.CONTADOR_MEMORY_DIR || '').trim();
+  if (!dir) return false;
+  try {
+    const fatos = listarFatos(80);
+    const perguntas = listarPerguntasAbertas(30);
+    const linhas = [
+      '# Fatos do grupo de Contas',
+      '',
+      'Gerado automaticamente a partir de contador_fatos e contador_perguntas_abertas.',
+      'Nao edite a mao: o arquivo e reescrito inteiro quando o agente aprende algo.',
+      'A fonte da verdade e o banco do support-copilot.',
+      '',
+      '## O que ja sabemos',
+      '',
+    ];
+    if (fatos.length) {
+      for (const f of fatos) linhas.push('- ' + f.fato);
+    } else {
+      linhas.push('_Nada registrado ainda._');
+    }
+    linhas.push('', '## Perguntas abertas', '');
+    if (perguntas.length) {
+      for (const p of perguntas) linhas.push('- ' + p.pergunta);
+    } else {
+      linhas.push('_Nenhuma._');
+    }
+    linhas.push('');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'fatos-do-grupo.md'), linhas.join(String.fromCharCode(10)), 'utf8');
+    return true;
+  } catch (err) {
+    console.warn(`${LOG_TAG} [contador] falha ao sincronizar memoria do workspace:`, err.message);
+    return false;
+  }
 }
 
 /** Fatos ativos que o grupo ja ensinou, mais recentes primeiro. */
@@ -202,7 +265,10 @@ function registrarFatos(fatos, origemMessageId = null) {
   db.transaction(() => {
     for (const fato of lista) gravados += stmt.run(fato, origemMessageId, now).changes;
   })();
-  if (gravados) console.log(`${LOG_TAG} [contador] aprendeu ${gravados} fato(s)`);
+  if (gravados) {
+    console.log(`${LOG_TAG} [contador] aprendeu ${gravados} fato(s)`);
+    sincronizarMemoriaDoWorkspace();
+  }
   return gravados;
 }
 
@@ -750,6 +816,7 @@ module.exports = {
   registrarFatos,
   listarPerguntasAbertas,
   resolverPerguntas,
+  sincronizarMemoriaDoWorkspace,
   startContadorRuntime,
   resolveMediaPath,
   sendReply,

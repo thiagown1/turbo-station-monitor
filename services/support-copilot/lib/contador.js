@@ -187,12 +187,52 @@ function redactForModel(value, keep) {
     .slice(0, 2000);
 }
 
+/**
+ * O que o modelo pode ler de uma foto ou PDF do grupo.
+ *
+ * O corpo da mensagem de midia e so "[Imagem]": o conteudo foi extraido uma vez
+ * pela classificacao central e mora em agent_media_analyses. Sem isto o Contador
+ * ve tres comprovantes seguidos como tres placeholders vazios e responde sobre
+ * pendencias como se nada tivesse sido enviado.
+ *
+ * So entram resumo, tipo, valor e data. Documento do favorecido, referencia do
+ * comprovante e identificadores ficam de fora de proposito: para responder no
+ * grupo eles nao acrescentam nada e sao dado pessoal atravessando para o modelo.
+ */
+function describeMediaAnalysis(raw) {
+  if (!raw) return null;
+  let parsed = raw;
+  if (typeof raw === 'string') {
+    try { parsed = JSON.parse(raw); } catch (_) { return null; }
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  if (parsed.status && parsed.status !== 'ok') return null;
+  const partes = [];
+  const resumo = typeof parsed.summary === 'string' ? parsed.summary.trim() : '';
+  if (resumo) partes.push(resumo);
+  const centavos = Number(parsed.amountCents);
+  if (Number.isFinite(centavos) && centavos > 0) {
+    partes.push('R$ ' + (centavos / 100).toFixed(2).replace('.', ','));
+  }
+  const data = typeof parsed.transactionDate === 'string' ? parsed.transactionDate.slice(0, 10) : '';
+  if (data) partes.push(data);
+  if (!partes.length) return null;
+  const tipo = typeof parsed.kind === 'string' && parsed.kind ? parsed.kind : 'anexo';
+  return '[' + tipo + '] ' + partes.join(' - ');
+}
+
 function contextBlock(messages) {
-  return (messages || []).slice(-30).map((message) => ({
-    direction: message.direction,
-    body: redactForModel(message.body),
-    createdAt: message.created_at || message.createdAt || null,
-  }));
+  return (messages || []).slice(-30).map((message) => {
+    const anexo = describeMediaAnalysis(message.media_result != null ? message.media_result : message.mediaResult);
+    const corpo = anexo
+      ? [message.body, anexo].filter((parte) => typeof parte === 'string' && parte.trim()).join(' ')
+      : message.body;
+    return {
+      direction: message.direction,
+      body: redactForModel(corpo),
+      createdAt: message.created_at || message.createdAt || null,
+    };
+  });
 }
 
 function parseLiteralNumber(token) {
@@ -710,4 +750,6 @@ module.exports = {
   heartbeatHasActionable,
   extractDraftReplyLiterals,
   draftFieldsMatchReply,
+  describeMediaAnalysis,
+  contextBlock,
 };
