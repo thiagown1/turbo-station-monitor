@@ -106,12 +106,19 @@ function quotedContadorPayload(messageId, quotedMessageId) {
   let investigationCount = 0;
   let investigationRequest = null;
   let gatewaySendCount = 0;
+  let unavailableConfigCount = 0;
   let child;
   let childOutput = '';
 
   const central = jsonServer((req, res, body) => {
     assert.equal(req.headers.authorization, `Bearer ${AGENT_SECRET}`);
     if (req.method === 'GET' && req.url.startsWith('/api/agents/config?')) {
+      const requestedBrand = new URL(req.url, 'http://central.test').searchParams.get('brandId');
+      if (requestedBrand === 'unavailable_brand') {
+        unavailableConfigCount += 1;
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         config: {
@@ -171,7 +178,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
         AGENT_EVENT_SECRET: AGENT_SECRET,
         EVOLUTION_API_URL: `http://127.0.0.1:${gatewayPort}`,
         EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
-        EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station',
+        EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station,outage:unavailable_brand',
         CONTADOR_ENABLED: 'true',
         CONTADOR_GROUP_CONVERSATION_ID: GROUP_JID,
         CONTADOR_NEXT_BASE_URL: `http://127.0.0.1:${centralPort}`,
@@ -207,6 +214,18 @@ function quotedContadorPayload(messageId, quotedMessageId) {
       body: JSON.stringify(webhookPayload(`${MESSAGE_ID}-unauthenticated`)),
     });
     assert.equal(unauthenticated.status, 401);
+
+    const unavailableId = `${MESSAGE_ID}-config-unavailable`;
+    const unavailablePayload = webhookPayload(unavailableId, false);
+    unavailablePayload.instance = 'outage';
+    unavailablePayload.data.message.extendedTextMessage.text = 'Oi';
+    const unavailable = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(unavailablePayload),
+    });
+    assert.equal(unavailable.status, 201);
+    assert.equal(unavailableConfigCount, 1, 'one inbound message must reuse one failed Agent Center lookup');
 
     const first = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',

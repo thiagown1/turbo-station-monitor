@@ -52,6 +52,11 @@ async function loadConfig(brandId) {
   }
 }
 
+function accountingGroupFromConfig(config, conversationId) {
+  if (!config) return undefined;
+  return (config.accountingGroupConversationIds || []).includes(conversationId);
+}
+
 /**
  * Resolve group -> accounting agent from the Agent Center, the single place an
  * operator edits which agent serves which group.
@@ -62,8 +67,7 @@ async function loadConfig(brandId) {
 async function isAccountingGroup(brandId, conversationId) {
   try {
     const config = await loadConfig(brandId);
-    if (!config) return undefined;
-    return (config.accountingGroupConversationIds || []).includes(conversationId);
+    return accountingGroupFromConfig(config, conversationId);
   } catch (_) {
     return undefined;
   }
@@ -603,6 +607,7 @@ module.exports = {
   deliverDueMediaJobs,
   startAgentEventWorker,
   loadConfig,
+  accountingGroupFromConfig,
   isAccountingGroup,
   shouldDeferEnergyInvoice,
   isPdfInput,

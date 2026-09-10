@@ -556,9 +556,12 @@ router.post('/', async (req, res) => {
           source: 'evolution', channel: 'whatsapp-group',
         });
       }
-      const { isAccountingGroup } = require('../lib/agent-router');
-      contadorEvent.accountingGroup = await isAccountingGroup(brandId, conversationId);
-      const stationPreparation = await prepareStationInvestigation(stationInput).catch((err) => {
+      const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+      const sharedAgentConfig = await loadConfig(brandId).catch(() => null);
+      contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
+      const stationPreparation = await prepareStationInvestigation(stationInput, {
+        loadConfig: async () => sharedAgentConfig,
+      }).catch((err) => {
         console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
         return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
       });
