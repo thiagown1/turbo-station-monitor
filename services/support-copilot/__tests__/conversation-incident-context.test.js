@@ -171,6 +171,9 @@ test('does not invent a station name when the natural question omits the venue',
     'Consegue verificar se desarmou de novo?',
     'A estação caiu de novo?',
     'A energia caiu de novo?',
+    'A alimentação caiu?',
+    'O local caiu?',
+    'O posto caiu?',
     'A rede caiu?',
     'O disjuntor desarmou?',
     'O sistema caiu?',
@@ -224,6 +227,26 @@ test('strips every supported equipment prefix before a nested station venue', as
       const questionId = `equipment-prefix-${index}`;
       const context = reconstructIncidentContext([
         message(questionId, '2026-09-10T15:30:00.000Z', 'luan', `O ${prefix} da estação do Habibs caiu?`),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
+test('strips every declared generic prefix before a real station venue', async (t) => {
+  const scenarios = [
+    'A alimentação da estação do Habibs caiu?',
+    'O local da estação do Habibs caiu?',
+    'O posto do Habibs caiu?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `generic-prefix-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
       ], questionId);
 
       assert.equal(context.contextConfidence, 'medium');

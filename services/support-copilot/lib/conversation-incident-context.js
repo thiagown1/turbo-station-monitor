@@ -18,16 +18,18 @@ const STATION_NON_NAME_FRAGMENT_PATTERN = [
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
   'tudo', 'todos?', 'todas?', 'algo', 'nada', 'todo\\s+mundo',
 ].join('|');
-const STATION_NOUN_PREFIX_PATTERN = [
-  'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
-  'fornecimento', 'internet', 'luz', 'rede', 'servidor', 'sinal', 'sistema',
-  'transformador',
-  'esta[cç][aã]o',
-].join('|');
+const GENERIC_STATION_NOUNS = [
+  ['alimenta[cç][aã]o', 'alimentacao'], ['carregador', 'carregador'],
+  ['conector', 'conector'], ['disjuntor', 'disjuntor'], ['energia', 'energia'],
+  ['equipamento', 'equipamento'], ['esta[cç][aã]o', 'estacao'],
+  ['fornecimento', 'fornecimento'], ['internet', 'internet'], ['local', 'local'],
+  ['luz', 'luz'], ['posto', 'posto'], ['rede', 'rede'], ['servidor', 'servidor'],
+  ['sinal', 'sinal'], ['sistema', 'sistema'], ['transformador', 'transformador'],
+];
+const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
 const GENERIC_STATION_SUBJECTS = new Set([
-  'alimentacao', 'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
-  'estacao', 'fornecimento', 'internet', 'local', 'luz', 'posto', 'rede',
-  'servidor', 'sinal', 'sistema', 'transformador', 'normal', 'ele', 'ela',
+  ...GENERIC_STATION_NOUNS.map(([, normalized]) => normalized),
+  'normal', 'ele', 'ela',
   'isso', 'ai', 'la',
 ]);
 
