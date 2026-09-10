@@ -76,6 +76,22 @@ test('does not reuse a question that received an outbound answer', () => {
   assert.ok(context.ambiguities.includes('missing_effective_question'));
 });
 
+test('does not reopen a recently answered natural question for an isolated mention', () => {
+  const messages = [
+    message('recent-question', '2026-09-10T15:00:00.000Z', 'luan', 'Habibs caiu?'),
+    { ...message('recent-answer', '2026-09-10T15:05:00.000Z', 'support', 'Já voltou ao normal.'), direction: 'outbound' },
+    message('recent-mention', '2026-09-10T15:20:00.000Z', 'luan', '@Turbo Station Suporte', {
+      mentioned_jids_json: JSON.stringify(['bot@s.whatsapp.net']),
+    }),
+  ];
+
+  const context = reconstructIncidentContext(messages, 'recent-mention');
+  assert.equal(context.questionMessageId, 'recent-mention');
+  assert.equal(context.contextConfidence, 'low');
+  assert.deepEqual(context.stationHints, []);
+  assert.ok(context.ambiguities.includes('missing_effective_question'));
+});
+
 test('keeps forwarded alerts unverified even when they contain exact OCPP fields', () => {
   const context = reconstructIncidentContext([
     message('alert', '2026-08-22T18:50:49.000Z', 'someone', 'ID AR2608200012 status: Faulted errorCode: UnderVoltage', { is_forwarded: 1 }),
@@ -115,6 +131,10 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['A estação do Habibs caiu?', 'Habibs'],
     ['O carregador da estação do Habibs caiu?', 'Habibs'],
     ['O conector da estação do Habibs caiu?', 'Habibs'],
+    ['O conector 2 da estação do Habibs caiu?', 'Habibs'],
+    ['O carregador 2 do Habibs caiu?', 'Habibs'],
+    ['O conector A do Habibs caiu?', 'Habibs'],
+    ['O carregador nº 2 do Habibs caiu?', 'Habibs'],
     ['O disjuntor da estação do Habibs desarmou?', 'Habibs'],
     ['A energia da estação do Habibs caiu?', 'Habibs'],
     ['Estação: Lago Norte caiu?', 'Lago Norte'],
@@ -129,6 +149,7 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Como está o Habibs agora?', 'Habibs'],
     ['Como está o Habibs ainda offline?', 'Habibs'],
     ['Está o Habibs online?', 'Habibs'],
+    ['Como está o conector 2 da estação do Habibs?', 'Habibs'],
     ['Você sabe como está o Habibs?', 'Habibs'],
     ['Como anda a estação do Habibs?', 'Habibs'],
     ['Vocês sabem como ficou o Habibs?', 'Habibs'],

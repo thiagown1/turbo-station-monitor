@@ -1,6 +1,6 @@
 # Station investigator intake
 
-The WhatsApp boundary persists provider timestamps, structured mentions, quotes and forwarding provenance. Only an exact provider mention whose JID is in the central allowlist may create an investigation job. Plain-text lookalikes are ignored.
+The WhatsApp boundary persists provider timestamps, structured mentions, quotes and forwarding provenance. Only an exact provider mention whose JID is in the central allowlist may create an investigation job. Plain-text lookalikes are ignored. An isolated mention never reopens a candidate question followed by an outbound answer, even inside the preferred 30-minute window. Generic equipment prefixes and their optional identifiers are removed before a venue is accepted as a station hint.
 
 Jobs are idempotent by source message ID and retain the context fingerprint and message references rather than another full chat copy. The global gate, station-support gate, investigator gate, conversation allowlist and kill switch must pass before analysis. The exact allowed JID found in the provider's structured mention metadata is forwarded to the central API as `mentionedJid`; visible text is never used as authorization.
 

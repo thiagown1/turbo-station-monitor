@@ -27,6 +27,8 @@ const GENERIC_STATION_NOUNS = [
   ['sinal', 'sinal'], ['sistema', 'sistema'], ['transformador', 'transformador'],
 ];
 const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
+const STATION_EQUIPMENT_IDENTIFIER_PATTERN = '(?:n(?:[.º°o])?\\s*)?(?:#?\\d{1,3}|[a-z])';
+const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de)\\s+)?)*`;
 const GENERIC_STATION_SUBJECTS = new Set([
   ...GENERIC_STATION_NOUNS.map(([, normalized]) => normalized),
   'normal', 'ele', 'ela',
@@ -85,16 +87,17 @@ function effectiveQuestion(messages, trigger) {
       && parseProviderTime(message).getTime() <= triggerAt
       && looksLikeQuestion(cleanBody(message)))
     .sort((a, b) => parseProviderTime(b).getTime() - parseProviderTime(a).getTime());
-  const preferred = prior.find((message) => triggerAt - parseProviderTime(message).getTime() <= PREFERRED_QUESTION_WINDOW_MS);
+  const unanswered = prior.filter((candidate) => !messages.some((message) =>
+    message.direction === 'outbound'
+    && parseProviderTime(message) > parseProviderTime(candidate)
+    && parseProviderTime(message) < parseProviderTime(trigger)));
+  const preferred = unanswered.find((message) => triggerAt - parseProviderTime(message).getTime() <= PREFERRED_QUESTION_WINDOW_MS);
   if (preferred) return preferred;
 
   // A real group can mention the agent well after asking (the Lago Norte case
   // waited ~67 minutes). Fall back only when no operator/bot outbound answer
   // exists after the candidate, so an old resolved issue is never reopened.
-  return prior.find((candidate) => !messages.some((message) =>
-    message.direction === 'outbound'
-    && parseProviderTime(message) > parseProviderTime(candidate)
-    && parseProviderTime(message) < parseProviderTime(trigger))) || trigger;
+  return unanswered[0] || trigger;
 }
 
 function stationIdsFrom(text) {
@@ -173,7 +176,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const stateFirst = new RegExp(
-        `^(?:como\\s+)?(?:est[aá]|anda|ficou)\\s+(?:(?:o|a)\\s+)?(?:(?:${STATION_NOUN_PREFIX_PATTERN})\\s+(?:(?:do|da|de)\\s+)?)*(.{2,80}?)(?=\\s*[?!,.…]*$)`,
+        `^(?:como\\s+)?(?:est[aá]|anda|ficou)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
         'i',
       ).exec(conversational);
       if (stateFirst) {
@@ -181,7 +184,7 @@ function stationNamesFrom(text, options = {}) {
         continue;
       }
       const natural = new RegExp(
-        `^(?:(?:o|a)\\s+)?(?:(?:${STATION_NOUN_PREFIX_PATTERN})\\s+(?:(?:do|da|de)\\s+)?)*(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        `^(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
         'i',
       ).exec(conversational);
       if (natural) addCandidate(natural[1]);
