@@ -19,13 +19,15 @@ const STATION_NON_NAME_FRAGMENT_PATTERN = [
 ].join('|');
 const STATION_NOUN_PREFIX_PATTERN = [
   'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
-  'fornecimento', 'internet', 'luz', 'rede', 'sinal', 'transformador',
+  'fornecimento', 'internet', 'luz', 'rede', 'servidor', 'sinal', 'sistema',
+  'transformador',
   'esta[cç][aã]o',
 ].join('|');
 const GENERIC_STATION_SUBJECTS = new Set([
   'alimentacao', 'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
   'estacao', 'fornecimento', 'internet', 'local', 'luz', 'posto', 'rede',
-  'sinal', 'transformador', 'normal', 'ele', 'ela', 'isso', 'ai', 'la',
+  'servidor', 'sinal', 'sistema', 'transformador', 'normal', 'ele', 'ela',
+  'isso', 'ai', 'la',
 ]);
 
 function cleanBody(message) {

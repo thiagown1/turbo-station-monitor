@@ -173,6 +173,8 @@ test('does not invent a station name when the natural question omits the venue',
     'A energia caiu de novo?',
     'A rede caiu?',
     'O disjuntor desarmou?',
+    'O sistema caiu?',
+    'O servidor caiu?',
     'Alguém sabe se a energia voltou?',
     'Está offline?',
     'Está online?',
@@ -207,7 +209,8 @@ test('does not invent a station name when the natural question omits the venue',
 test('strips every supported equipment prefix before a nested station venue', async (t) => {
   const prefixes = [
     'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
-    'fornecimento', 'internet', 'luz', 'rede', 'sinal', 'transformador',
+    'fornecimento', 'internet', 'luz', 'rede', 'servidor', 'sinal', 'sistema',
+    'transformador',
   ];
 
   for (const [index, prefix] of prefixes.entries()) {
