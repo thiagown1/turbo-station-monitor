@@ -129,6 +129,9 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Você sabe como está o Habibs?', 'Habibs'],
     ['Como anda a estação do Habibs?', 'Habibs'],
     ['Vocês sabem como ficou o Habibs?', 'Habibs'],
+    ['Alguém sabe se o Habibs voltou?', 'Habibs'],
+    ['Se o Habibs voltou?', 'Habibs'],
+    ['Não sei se o Habibs voltou?', 'Habibs'],
     ['Habibs, caiu?', 'Habibs'],
     ['Habibs: caiu?', 'Habibs'],
     ['Habibs... caiu?', 'Habibs'],
@@ -167,6 +170,7 @@ test('does not invent a station name when the natural question omits the venue',
     'A energia caiu de novo?',
     'A rede caiu?',
     'O disjuntor desarmou?',
+    'Alguém sabe se a energia voltou?',
   ];
 
   for (const [index, body] of scenarios.entries()) {

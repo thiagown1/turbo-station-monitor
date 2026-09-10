@@ -144,6 +144,7 @@ function stationNamesFrom(text, options = {}) {
       const conversational = withoutMentions(line)
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
         .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const stateFirst = new RegExp(
