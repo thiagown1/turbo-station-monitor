@@ -220,6 +220,14 @@ function parsedMentionedJids(value) {
   }
 }
 
+function failDueJobIfUnchanged(job, reason) {
+  const updatedAt = nowIso();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='failed', next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status=? AND updated_at=?`)
+    .run(updatedAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
+}
+
 async function deliverDueStationInvestigations(deps = {}) {
   if (deliveringStationInvestigations) return;
   deliveringStationInvestigations = true;
@@ -232,12 +240,10 @@ async function deliverDueStationInvestigations(deps = {}) {
     for (const job of due) {
       const source = sourceMessageFor(job);
       if (!source) {
-        const updatedAt = nowIso();
-        db.prepare("UPDATE station_investigation_jobs SET status='failed', next_attempt_at=?, last_error='source_message_missing', updated_at=? WHERE message_id=?")
-          .run(updatedAt, updatedAt, job.message_id);
+        failDueJobIfUnchanged(job, 'source_message_missing');
         continue;
       }
-      await routeStationInvestigation({
+      const result = await routeStationInvestigation({
         messageId: job.message_id,
         conversationId: job.conversation_id,
         brandId: job.brand_id,
@@ -254,6 +260,9 @@ async function deliverDueStationInvestigations(deps = {}) {
           forwardingScore: Number(source.forwarding_score || 0),
         },
       }, deps);
+      if (['context_failed', 'low_context_confidence', 'structured_mention_required'].includes(result?.reason)) {
+        failDueJobIfUnchanged(job, result.reason);
+      }
     }
   } finally {
     deliveringStationInvestigations = false;

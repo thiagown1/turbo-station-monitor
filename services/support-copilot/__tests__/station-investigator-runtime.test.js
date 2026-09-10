@@ -688,6 +688,142 @@ test('fails closed when a due station retry has lost its source message', async 
   assert.deepEqual(job, { status: 'failed', last_error: 'source_message_missing' });
 });
 
+test('finalizes due station jobs whose incident context can no longer be reconstructed', async () => {
+  const staleAt = new Date(0).toISOString();
+  const createdAt = new Date().toISOString();
+  const cases = [
+    { messageId: 'context-expired-retry', status: 'retry', attempts: 1 },
+    { messageId: 'context-expired-reserved', status: 'reserved', attempts: 0 },
+    { messageId: 'context-expired-processing', status: 'processing', attempts: 1 },
+  ];
+  for (const item of cases) {
+    const brandId = `${item.messageId}-brand`;
+    db.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+       provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+       sender_id, sender_name, created_at)
+      VALUES (?, 'conv-pilot', ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, 'Luan', ?)`)
+      .run(
+        `${item.messageId}-local`, brandId,
+        '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+        item.messageId, staleAt, JSON.stringify(['support-bot@s.whatsapp.net']),
+        '5511999999999@s.whatsapp.net', staleAt,
+      );
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', ?, ?, ?, ?, ?)`)
+      .run(item.messageId, brandId, item.status, item.attempts, staleAt, createdAt, staleAt);
+  }
+  let contextAttempts = 0;
+
+  await deliverDueStationInvestigations({
+    loadConfig: async () => config(),
+    buildContext: () => {
+      contextAttempts++;
+      throw new Error('source message outside retained context');
+    },
+  });
+  await deliverDueStationInvestigations({
+    loadConfig: async () => config(),
+    buildContext: () => {
+      contextAttempts++;
+      throw new Error('must not be retried');
+    },
+  });
+
+  for (const item of cases) {
+    const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?')
+      .get(item.messageId);
+    assert.deepEqual(job, { status: 'failed', last_error: 'context_failed' }, item.status);
+  }
+  assert.equal(contextAttempts, cases.length, 'terminal jobs must not loop through the worker again');
+});
+
+test('finalizes due station jobs with invalid reconstructed evidence', async () => {
+  const staleAt = new Date(0).toISOString();
+  const createdAt = new Date().toISOString();
+  const cases = [
+    { messageId: 'context-became-low', mentionedJids: ['support-bot@s.whatsapp.net'], reason: 'low_context_confidence' },
+    { messageId: 'structured-mention-lost', mentionedJids: [], reason: 'structured_mention_required' },
+  ];
+  for (const item of cases) {
+    const brandId = `${item.messageId}-brand`;
+    db.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+       provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+       sender_id, sender_name, created_at)
+      VALUES (?, 'conv-pilot', ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, 'Luan', ?)`)
+      .run(
+        `${item.messageId}-local`, brandId,
+        '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+        item.messageId, staleAt, JSON.stringify(item.mentionedJids),
+        '5511999999999@s.whatsapp.net', staleAt,
+      );
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 1, ?, ?, ?)`)
+      .run(item.messageId, brandId, staleAt, createdAt, staleAt);
+  }
+
+  await deliverDueStationInvestigations({
+    loadConfig: async () => config(),
+    buildContext: () => ({ contextConfidence: 'low', contextFingerprint: 'stale', messageRefs: [] }),
+  });
+
+  for (const item of cases) {
+    const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?')
+      .get(item.messageId);
+    assert.deepEqual(job, { status: 'failed', last_error: item.reason }, item.messageId);
+  }
+});
+
+test('does not overwrite a concurrent station transition while finalizing stale context', async () => {
+  const messageId = 'context-finalization-cas';
+  const brandId = `${messageId}-brand`;
+  const staleAt = new Date(0).toISOString();
+  const createdAt = new Date().toISOString();
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, 'conv-pilot', ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, 'Luan', ?)`)
+    .run(
+      `${messageId}-local`, brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      messageId, staleAt, JSON.stringify(['support-bot@s.whatsapp.net']),
+      '5511999999999@s.whatsapp.net', staleAt,
+    );
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, created_at, updated_at)
+    VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 1, ?, ?, ?)`)
+    .run(messageId, brandId, staleAt, createdAt, staleAt);
+  let releaseConfig;
+  let announceConfigLoad;
+  const configLoadStarted = new Promise((resolve) => { announceConfigLoad = resolve; });
+  const configRelease = new Promise((resolve) => { releaseConfig = resolve; });
+
+  const draining = deliverDueStationInvestigations({
+    loadConfig: async () => {
+      announceConfigLoad();
+      await configRelease;
+      return config();
+    },
+    buildContext: () => { throw new Error('stale context'); },
+  });
+  await configLoadStarted;
+  db.prepare("UPDATE station_investigation_jobs SET status='sent', updated_at=? WHERE message_id=?")
+    .run(new Date().toISOString(), messageId);
+  releaseConfig();
+  await draining;
+
+  const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get(messageId);
+  assert.deepEqual(job, { status: 'sent', last_error: null });
+});
+
 test('caps station retry attempts and keeps the terminal failure owned', async () => {
   const messageId = 'retry-exhausted';
   const exhaustedInput = { ...input(messageId), brandId: 'retry-exhausted-brand' };
