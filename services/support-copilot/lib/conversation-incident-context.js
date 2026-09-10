@@ -41,7 +41,9 @@ function withoutMentions(text) {
 
 function looksLikeQuestion(text) {
   const value = withoutMentions(text);
-  return value.includes('?') || /\b(confirma|consegue|verifica|voltou|desarmou|caiu|parou|desligou|travou|normal|vivo|sinal|aconteceu|houve|falha|erro|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
+  const hasStationState = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').test(value);
+  return value.includes('?') || hasStationState
+    || /\b(confirma|consegue|verifica|normal|vivo|sinal|aconteceu|houve|falha|erro|offline|online|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
 }
 
 function isMentionOnly(message) {
@@ -82,6 +84,23 @@ function stationIdsFrom(text) {
   return [...new Set(values.map((value) => value.toUpperCase()))];
 }
 
+function normalizedStationName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function uniqueStationNames(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const normalized = normalizedStationName(value);
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
 function stationNamesFrom(text, options = {}) {
   const includeExplicit = options.includeExplicit !== false;
   const includeNatural = options.includeNatural !== false;
@@ -94,7 +113,7 @@ function stationNamesFrom(text, options = {}) {
       .replace(/^(?:o|a)\s+/i, '')
       .replace(/\s+/g, ' ')
       .trim();
-    const normalized = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+    const normalized = normalizedStationName(name);
     if (name.length < 3) return;
     if (GENERIC_STATION_SUBJECTS.has(normalized)) return;
     candidates.push(name);
@@ -118,7 +137,7 @@ function stationNamesFrom(text, options = {}) {
     for (const line of value.split(/\r?\n/)) {
       const conversational = withoutMentions(line)
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
-        .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|consegue\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|pode\s+(?:verificar|confirmar|ver)\b(?:\s+se)?|confirma(?:\s+se)?|verifica(?:\s+se)?|v[eê](?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|(?:consegue|pode)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma|verifica|v[eê])(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .trim();
       const natural = new RegExp(
         `^(?:(?:o|a)\\s+)?(?:carregador\\s+(?:do|da|de)\\s+)?(.{2,80}?)\\s+(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
@@ -127,7 +146,7 @@ function stationNamesFrom(text, options = {}) {
       if (natural) addCandidate(natural[1]);
     }
   }
-  return [...new Set(candidates)];
+  return uniqueStationNames(candidates);
 }
 
 function firstMatch(text, patterns) {
@@ -193,10 +212,10 @@ function reconstructIncidentContext(messages, triggerMessageId, options = {}) {
   const relevant = ordered.filter((message) => parseProviderTime(message) <= parseProviderTime(trigger));
   const allText = relevant.map(cleanBody).join('\n');
   const stationIds = stationIdsFrom(allText);
-  const stationNames = [...new Set([
+  const stationNames = uniqueStationNames([
     ...stationNamesFrom(allText, { includeNatural: false }),
     ...stationNamesFrom(question, { includeExplicit: false }),
-  ])];
+  ]);
   const incidentSignals = relevant.map(incidentSignal).filter(Boolean);
   const participantClaims = relevant.map(participantClaim).filter(Boolean);
   const ambiguities = [];

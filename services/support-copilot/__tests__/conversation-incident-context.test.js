@@ -55,6 +55,7 @@ test('reconstructs the Lago Norte incident and binds a later isolated mention', 
   assert.match(context.effectiveQuestion, /lago norte voltou ao normal/i);
   assert.equal(context.contextConfidence, 'high');
   assert.deepEqual(context.stationHints.filter((hint) => hint.kind === 'id'), [{ kind: 'id', value: 'AR2608200012' }]);
+  assert.deepEqual(context.stationHints.filter((hint) => hint.kind === 'name'), [{ kind: 'name', value: 'Lago Norte' }]);
   assert.deepEqual(context.incidentSignals.map((signal) => signal.info), ['ACDC Module Error', 'AC Input UnderVoltage']);
   assert.equal(context.participantClaims[0].verified, false);
   assert.equal(context.participantClaims[0].provenance, 'participant_report');
@@ -103,6 +104,8 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['A Livebox parou de comunicar?', 'Livebox'],
     ['Arena caiu de novo?', 'Arena'],
     ['Outback caiu?', 'Outback'],
+    ['Confirma pra mim se o Habibs voltou?', 'Habibs'],
+    ['Consegue verificar pra gente se a Livebox voltou?', 'Livebox'],
     ['BIG BOX voltou ao normal?', 'BIG BOX'],
     ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
   ];
@@ -163,4 +166,23 @@ test('does not borrow a natural station name from another participants earlier i
   assert.equal(context.contextConfidence, 'low');
   assert.deepEqual(context.stationHints, []);
   assert.ok(context.ambiguities.includes('station_not_identified'));
+});
+
+test('reuses unpunctuated prior questions for every supported station state word', () => {
+  const states = ['continua offline', 'segue offline', 'reiniciou', 'comunicou'];
+
+  for (const [index, state] of states.entries()) {
+    const questionId = `state-question-${index}`;
+    const mentionId = `state-mention-${index}`;
+    const context = reconstructIncidentContext([
+      message(questionId, '2026-09-10T15:00:00.000Z', 'luan', `Habibs ${state}`),
+      message(mentionId, '2026-09-10T15:05:00.000Z', 'luan', '@Turbo Station Suporte', {
+        mentioned_jids_json: JSON.stringify(['support-bot@s.whatsapp.net']),
+      }),
+    ], mentionId);
+
+    assert.equal(context.questionMessageId, questionId, state);
+    assert.equal(context.contextConfidence, 'medium', state);
+    assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }], state);
+  }
 });
