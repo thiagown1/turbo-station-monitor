@@ -517,14 +517,6 @@ router.post('/', async (req, res) => {
       // Which agent serves this group is decided in the Agent Center, not here.
       // undefined means the central was unreachable, and classifyInbound then
       // falls back to CONTADOR_GROUP_CONVERSATION_ID.
-      const { isAccountingGroup } = require('../lib/agent-router');
-      const [accountingGroup, stationPreparation] = await Promise.all([
-        isAccountingGroup(brandId, conversationId),
-        prepareStationInvestigation(stationInput).catch((err) => {
-          console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
-          return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
-        }),
-      ]);
       const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
@@ -536,7 +528,6 @@ router.post('/', async (req, res) => {
         senderId,
         body,
         media,
-        accountingGroup,
         replyToContador: quoted?.source === 'contador',
         quotedContadorDraftId: quoted?.draftId || null,
       };
@@ -553,19 +544,29 @@ router.post('/', async (req, res) => {
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
       }
-      // Central media router: every image/PDF is classified once. Text-only
-      // messages use a free deterministic gate and invoke the model only when
-      // they look like a request to inspect a charger.
-      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
       if (isQuotedContadorDraftReply(contadorEvent)) {
-        // A quoted draft answer belongs to the Contador loop even when it says
-        // "estação". The Next boundary still revalidates the stable sender
-        // allowlist before accepting any financial mutation.
+        // Resolve authenticated Contador continuations before the stateful
+        // station preflight so they cannot reserve station quota or ownership.
         const contadorRoute = enqueueContadorMessage(contadorEvent);
         if (contadorRoute.kind === 'ignored') {
           scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
         }
-      } else if (stationPreparation.claimed) {
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group',
+        });
+      }
+      const { isAccountingGroup } = require('../lib/agent-router');
+      contadorEvent.accountingGroup = await isAccountingGroup(brandId, conversationId);
+      const stationPreparation = await prepareStationInvestigation(stationInput).catch((err) => {
+        console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
+        return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
+      });
+      // Central media router: every image/PDF is classified once. Text-only
+      // messages use a free deterministic gate and invoke the model only when
+      // they look like a request to inspect a charger.
+      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
+      if (stationPreparation.claimed) {
         void routeStationInvestigation(stationInput, { prepared: stationPreparation })
           .catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
         return res.status(201).json({

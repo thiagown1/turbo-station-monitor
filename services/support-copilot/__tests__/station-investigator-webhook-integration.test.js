@@ -319,6 +319,11 @@ function quotedContadorPayload(messageId, quotedMessageId) {
       probe.close();
       return count === 1;
     });
+    const quotedStationProbe = new Database(DB_PATH, { readonly: true });
+    const quotedStationJobCount = quotedStationProbe.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?')
+      .get(quotedReplyId).count;
+    quotedStationProbe.close();
+    assert.equal(quotedStationJobCount, 0, 'quoted Contador reply must not reserve station ownership or quota');
     assert.equal(investigationCount, 2, 'quoted Contador reply must not reach the station investigator');
 
     const quotedReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
@@ -331,8 +336,11 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     await new Promise((resolve) => setTimeout(resolve, 150));
     const quotedReplayProbe = new Database(DB_PATH, { readonly: true });
     const quotedJobCount = quotedReplayProbe.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?').get(quotedReplyId).count;
+    const quotedReplayStationCount = quotedReplayProbe.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?')
+      .get(quotedReplyId).count;
     quotedReplayProbe.close();
     assert.equal(quotedJobCount, 1, 'quoted Contador replay must remain idempotent');
+    assert.equal(quotedReplayStationCount, 0, 'quoted Contador replay must stay outside station ownership and quota');
     assert.equal(investigationCount, 2, 'quoted Contador replay must not reach the station investigator');
 
     const database = new Database(DB_PATH, { readonly: true });
