@@ -115,7 +115,7 @@ function stationNamesFrom(text, options = {}) {
 
   const addCandidate = (raw) => {
     const name = String(raw || '')
-      .replace(/^[\s:–—-]+|[\s:–—-]+$/g, '')
+      .replace(/^[\s,.;:!?…–—-]+|[\s,.;:!?…–—-]+$/g, '')
       .replace(/^(?:o|a)\s+/i, '')
       .replace(/\s+/g, ' ')
       .trim();
@@ -142,7 +142,7 @@ function stationNamesFrom(text, options = {}) {
   if (includeNatural) {
     for (const line of value.split(/\r?\n/)) {
       const conversational = withoutMentions(line)
-        .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:\s+pessoal)?[\s,!:\-–—]*/i, '')
+        .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
         .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:ser[aá]\s+que|sabe\s+se|(?:consegue|pode)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma|verifica|v[eê])(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
