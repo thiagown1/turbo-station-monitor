@@ -9,6 +9,11 @@ const STATION_STATE_WORDS = [
   'perdeu', 'falhou', 'funciona', 'comunicou',
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
+const GENERIC_STATION_SUBJECTS = new Set([
+  'alimentacao', 'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',
+  'estacao', 'fornecimento', 'internet', 'local', 'luz', 'posto', 'rede',
+  'sinal', 'transformador', 'normal', 'ele', 'ela', 'isso', 'ai', 'la',
+]);
 
 function cleanBody(message) {
   const raw = String(message.raw_body || message.body || '').trim();
@@ -89,7 +94,7 @@ function stationNamesFrom(text) {
       .trim();
     const normalized = name.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
     if (name.length < 3) return;
-    if (/^(?:carregador|estacao|conector|equipamento|posto|local|normal|ele|ela|isso|ai|la)$/.test(normalized)) return;
+    if (GENERIC_STATION_SUBJECTS.has(normalized)) return;
     candidates.push(name);
   };
 

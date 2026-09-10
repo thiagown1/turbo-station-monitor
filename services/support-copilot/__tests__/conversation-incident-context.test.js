@@ -135,6 +135,9 @@ test('does not invent a station name when the natural question omits the venue',
     'O carregador desarmou de novo?',
     'Consegue verificar se desarmou de novo?',
     'A estação caiu de novo?',
+    'A energia caiu de novo?',
+    'A rede caiu?',
+    'O disjuntor desarmou?',
   ];
 
   for (const [index, body] of scenarios.entries()) {

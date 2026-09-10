@@ -47,7 +47,8 @@ function jsonServer(handler) {
   });
 }
 
-function webhookPayload(messageId, structuredMention = true) {
+function webhookPayload(messageId, structuredMention = true, withMedia = false) {
+  const contextInfo = structuredMention ? { mentionedJid: [BOT_JID] } : {};
   return {
     event: 'messages.upsert',
     instance: 'turbostation',
@@ -59,12 +60,18 @@ function webhookPayload(messageId, structuredMention = true) {
         participant: '5561999999999@s.whatsapp.net',
       },
       pushName: 'Luan',
-      messageType: 'extendedTextMessage',
+      messageType: withMedia ? 'imageMessage' : 'extendedTextMessage',
       messageTimestamp: Math.floor(Date.now() / 1000),
-      message: {
+      message: withMedia ? {
+        imageMessage: {
+          caption: '@Turbo Station Suporte Habibs desarmou de novo?',
+          mimetype: 'image/jpeg',
+          contextInfo,
+        },
+      } : {
         extendedTextMessage: {
           text: '@Turbo Station Suporte Habibs desarmou de novo?',
-          contextInfo: structuredMention ? { mentionedJid: [BOT_JID] } : {},
+          contextInfo,
         },
       },
     },
@@ -177,7 +184,7 @@ function webhookPayload(messageId, structuredMention = true) {
     const first = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
-      body: JSON.stringify(webhookPayload(MESSAGE_ID)),
+      body: JSON.stringify(webhookPayload(MESSAGE_ID, true, true)),
     });
     const firstBody = await first.json();
     assert.equal(first.status, 201, JSON.stringify(firstBody));
@@ -206,7 +213,7 @@ function webhookPayload(messageId, structuredMention = true) {
     const replay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
-      body: JSON.stringify(webhookPayload(MESSAGE_ID)),
+      body: JSON.stringify(webhookPayload(MESSAGE_ID, true, true)),
     });
     assert.equal(replay.status, 200);
     assert.equal((await replay.json()).duplicate, true);
@@ -231,7 +238,8 @@ function webhookPayload(messageId, structuredMention = true) {
       SELECT status, decision, confidence, station_ids_json, response_sent_at, response_external_message_id
       FROM station_investigation_jobs WHERE message_id = ?
     `).get(MESSAGE_ID);
-    const genericJobs = database.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?').get(MESSAGE_ID);
+    const storedMessage = database.prepare('SELECT id FROM messages WHERE external_message_id = ?').get(MESSAGE_ID);
+    const genericJobs = database.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?').get(storedMessage.id);
     const suggestions = database.prepare('SELECT COUNT(*) count FROM suggestions WHERE source_message_id = ?').get(MESSAGE_ID);
     database.close();
 

@@ -377,9 +377,10 @@ router.post('/', async (req, res) => {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
         if (direction === 'inbound') {
-          void routeStationInvestigation({ messageId: externalMessageId, conversationId, brandId, groupJid,
-            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext })
-            .catch(err => console.warn(`${LOG_TAG} duplicate investigator recovery failed for ${dup.id}:`, err.message));
+          const stationInput = {
+            messageId: externalMessageId, conversationId, brandId, groupJid,
+            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
+          };
           const quoted = quotedOutboundMessage(message, conversationId);
           const contadorEvent = {
             messageId: externalMessageId,
@@ -395,18 +396,32 @@ router.post('/', async (req, res) => {
             replyToContador: quoted?.source === 'contador',
             quotedContadorDraftId: quoted?.draftId || null,
           };
-          if (isQuotedContadorDraftReply(contadorEvent)) {
-            enqueueContadorMessage(contadorEvent);
-          } else if (media && ['image', 'document'].includes(media.media_type)) {
-            const { routeInboundMessageDurably } = require('../lib/agent-router');
-            routeInboundMessageDurably({
-              messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
-              instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
-              replyToContador: contadorEvent.replyToContador,
-              quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
-              deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
-            }).catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
-          }
+          void (async () => {
+            let prepared;
+            try {
+              prepared = await prepareStationInvestigation(stationInput);
+            } catch (err) {
+              console.warn(`${LOG_TAG} duplicate investigator preflight failed for ${dup.id}:`, err.message);
+            }
+            if (prepared?.claimed) {
+              await routeStationInvestigation(stationInput, { prepared });
+              return;
+            }
+            if (isQuotedContadorDraftReply(contadorEvent)) {
+              enqueueContadorMessage(contadorEvent);
+              return;
+            }
+            if (media && ['image', 'document'].includes(media.media_type)) {
+              const { routeInboundMessageDurably } = require('../lib/agent-router');
+              await routeInboundMessageDurably({
+                messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
+                instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+                replyToContador: contadorEvent.replyToContador,
+                quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+                deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+              });
+            }
+          })().catch(err => console.warn(`${LOG_TAG} duplicate recovery failed for ${dup.id}:`, err.message));
         }
         return res.json({ id: dup.id, conversationId, duplicate: true });
       }
