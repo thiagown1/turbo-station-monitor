@@ -10,7 +10,12 @@ process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
 process.env.AGENT_EVENT_SECRET = 'test-secret';
 
 const { db } = require('../lib/db');
-const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const { routeInboundMessageDurably } = require('../lib/agent-router');
+const {
+  deliverDueStationInvestigations,
+  prepareStationInvestigation,
+  routeStationInvestigation,
+} = require('../lib/station-investigator-runtime');
 
 test.after(() => {
   db.close();
@@ -624,6 +629,175 @@ test('retries a WhatsApp send that the gateway explicitly rejected', async () =>
   assert.equal(replay.status, 'sent');
   assert.equal(requestCount, 2);
   assert.equal(sendCount, 2);
+});
+
+test('drains a due station retry without waiting for a provider replay', async () => {
+  const messageId = 'background-retry';
+  const retryInput = { ...input(messageId), brandId: 'background-retry-brand' };
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`)
+    .run(
+      'background-retry-local', retryInput.conversationId, retryInput.brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      messageId, retryInput.receivedAt, JSON.stringify(retryInput.whatsappContext.mentionedJids),
+      retryInput.senderId, 'Luan', retryInput.receivedAt,
+    );
+
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async () => config({ autoSend: false }),
+    buildContext: () => context(messageId),
+    request: async () => {
+      requestCount++;
+      if (requestCount === 1) throw new Error('central temporarily unavailable');
+      return jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] });
+    },
+  };
+
+  const first = await routeStationInvestigation(retryInput, deps);
+  assert.equal(first.status, 'retry');
+  db.prepare('UPDATE station_investigation_jobs SET next_attempt_at = ? WHERE message_id = ?')
+    .run(new Date(0).toISOString(), messageId);
+
+  await deliverDueStationInvestigations(deps);
+
+  const job = db.prepare('SELECT status, attempts, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get(messageId);
+  assert.equal(job.status, 'review');
+  assert.equal(job.attempts, 2);
+  assert.equal(job.last_error, null);
+  assert.equal(requestCount, 2);
+});
+
+test('fails closed when a due station retry has lost its source message', async () => {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, created_at, updated_at)
+    VALUES (?, 'conv-pilot', 'missing-source-brand', '120363000000000000@g.us',
+      'turbostation', 'retry', 1, ?, ?, ?)`)
+    .run('missing-source-retry', new Date(0).toISOString(), now, now);
+
+  await deliverDueStationInvestigations();
+
+  const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get('missing-source-retry');
+  assert.deepEqual(job, { status: 'failed', last_error: 'source_message_missing' });
+});
+
+test('caps station retry attempts and keeps the terminal failure owned', async () => {
+  const messageId = 'retry-exhausted';
+  const exhaustedInput = { ...input(messageId), brandId: 'retry-exhausted-brand' };
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'retry', 4, ?, ?, ?)`)
+    .run(
+      messageId, exhaustedInput.conversationId, exhaustedInput.brandId,
+      exhaustedInput.groupJid, exhaustedInput.instance, new Date(0).toISOString(), now, now,
+    );
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async () => config(),
+    buildContext: () => context(messageId),
+    request: async () => {
+      requestCount++;
+      throw new Error('central still unavailable');
+    },
+  };
+
+  const lastAttempt = await routeStationInvestigation(exhaustedInput, deps);
+  const replay = await routeStationInvestigation(exhaustedInput, deps);
+  const job = db.prepare('SELECT status, attempts, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get(messageId);
+
+  assert.equal(lastAttempt.status, 'failed');
+  assert.deepEqual(replay, { duplicate: true, status: 'failed' });
+  assert.deepEqual(job, { status: 'failed', attempts: 5, last_error: 'central still unavailable' });
+  assert.equal(requestCount, 1);
+});
+
+test('keeps a durable generic media job from being claimed after config recovery', async () => {
+  const externalId = 'generic-owned-external';
+  const localId = 'generic-owned-local';
+  const genericInput = { ...input(externalId), brandId: 'generic-owned-brand' };
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`)
+    .run(
+      localId, genericInput.conversationId, genericInput.brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      externalId, genericInput.receivedAt, JSON.stringify(genericInput.whatsappContext.mentionedJids),
+      genericInput.senderId, 'Luan', genericInput.receivedAt,
+    );
+  db.prepare(`INSERT INTO agent_media_jobs
+    (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, '{}', 'retry', 1, ?, ?, ?)`)
+    .run(localId, new Date().toISOString(), new Date().toISOString(), new Date().toISOString());
+
+  let configLoads = 0;
+  const prepared = await prepareStationInvestigation(genericInput, {
+    loadConfig: async () => {
+      configLoads++;
+      return config();
+    },
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: false,
+    ready: false,
+    result: { skipped: true, reason: 'generic_pipeline_owned' },
+  });
+  assert.equal(configLoads, 0, 'persisted generic ownership should win before current config');
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?').get(externalId).count, 0);
+});
+
+test('keeps a durable station claim from being acquired by the generic pipeline', async () => {
+  const externalId = 'station-owned-external';
+  const localId = 'station-owned-local';
+  const stationInput = { ...input(externalId), brandId: 'station-owned-brand' };
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`)
+    .run(
+      localId, stationInput.conversationId, stationInput.brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      externalId, stationInput.receivedAt, JSON.stringify(stationInput.whatsappContext.mentionedJids),
+      stationInput.senderId, 'Luan', stationInput.receivedAt,
+    );
+  const prepared = await prepareStationInvestigation(stationInput, {
+    loadConfig: async () => config({ killSwitch: true }),
+  });
+  assert.equal(prepared.claimed, true);
+
+  const generic = await routeInboundMessageDurably({
+    messageId: localId,
+    externalMessageId: externalId,
+    conversationId: stationInput.conversationId,
+    brandId: stationInput.brandId,
+    groupJid: stationInput.groupJid,
+    instance: stationInput.instance,
+    sender: 'Luan',
+    senderId: stationInput.senderId,
+    body: '[Luan]: @Turbo Station Suporte Habibs caiu?',
+    media: { media_type: 'image', url: 'https://example.invalid/evidence.jpg' },
+    receivedAt: stationInput.receivedAt,
+  });
+
+  assert.deepEqual(generic, {
+    skipped: true,
+    reason: 'station_pipeline_owned',
+    fallbackHandled: true,
+  });
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?').get(localId).count, 0);
 });
 
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {

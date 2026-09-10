@@ -10,6 +10,7 @@ const STATION_STATE_WORDS = [
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
+const STATION_INTERROGATIVE_PREFIX_PATTERN = /^(?:qual|quais|algum(?:a|as)?|onde|que)\b/i;
 const STATION_NON_NAME_FRAGMENT_PATTERN = [
   STATION_STATE_PATTERN,
   'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
@@ -141,6 +142,7 @@ function stationNamesFrom(text, options = {}) {
       .trim();
     const normalized = normalizedStationName(name);
     if (name.length < 3) return;
+    if (STATION_INTERROGATIVE_PREFIX_PATTERN.test(name)) return;
     if (GENERIC_STATION_SUBJECTS.has(normalized)) return;
     if (new RegExp(`^(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i').test(name)) return;
     candidates.push(name);

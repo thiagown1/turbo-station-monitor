@@ -306,11 +306,19 @@ async function routeInboundMessage(input) {
 }
 
 function persistMediaJob(input) {
-  const now = nowIso();
-  db.prepare(`INSERT OR IGNORE INTO agent_media_jobs
-    (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
-    .run(input.messageId, JSON.stringify(input), now, now, now);
+  return db.transaction(() => {
+    const existing = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+    if (existing) return true;
+    const stationMessageId = input.externalMessageId || input.messageId;
+    const stationJob = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(stationMessageId);
+    if (stationJob) return false;
+    const now = nowIso();
+    db.prepare(`INSERT INTO agent_media_jobs
+      (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
+      .run(input.messageId, JSON.stringify(input), now, now, now);
+    return true;
+  })();
 }
 
 async function deliverSkippedMediaFallback(input) {
@@ -457,7 +465,9 @@ async function processMediaJob(messageId) {
 }
 
 function routeInboundMessageDurably(input) {
-  persistMediaJob(input);
+  if (!persistMediaJob(input)) {
+    return Promise.resolve({ skipped: true, reason: 'station_pipeline_owned', fallbackHandled: true });
+  }
   if (Date.now() < mediaModelUnavailableUntil) {
     return Promise.resolve({ queued: true, waitingForModel: true });
   }
@@ -590,11 +600,13 @@ function startAgentEventWorker() {
   worker = setInterval(() => {
     void deliverDueEvents();
     void deliverDueMediaJobs();
+    void require('./station-investigator-runtime').deliverDueStationInvestigations();
     void processFinancialApprovalWork();
   }, 30_000);
   worker.unref?.();
   void deliverDueEvents();
   void deliverDueMediaJobs();
+  void require('./station-investigator-runtime').deliverDueStationInvestigations();
   void processFinancialApprovalWork();
 }
 

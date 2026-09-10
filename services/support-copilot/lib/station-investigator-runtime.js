@@ -5,6 +5,8 @@ const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
 
 const PROCESSING_LEASE_MS = 120_000;
+const STATION_JOB_MAX_ATTEMPTS = 5;
+let deliveringStationInvestigations = false;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
@@ -18,12 +20,26 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   return Number(row?.count || 0) >= limit;
 }
 
+function genericPipelineJob(input) {
+  return db.prepare(`SELECT jobs.status
+    FROM agent_media_jobs jobs
+    JOIN messages message ON message.id = jobs.message_id
+    WHERE message.conversation_id = ? AND message.brand_id = ?
+      AND (message.external_message_id = ? OR message.id = ?)
+    LIMIT 1`)
+    .get(input.conversationId, input.brandId, input.messageId, input.messageId);
+}
+
 function persistStationOwnership(input) {
-  const now = nowIso();
-  db.prepare(`INSERT OR IGNORE INTO station_investigation_jobs
-    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, 'claimed', 0, ?, ?, ?)`)
-    .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, now, now, now);
+  return db.transaction(() => {
+    if (genericPipelineJob(input)) return false;
+    const now = nowIso();
+    db.prepare(`INSERT OR IGNORE INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'claimed', 0, ?, ?, ?)`)
+      .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, now, now, now);
+    return true;
+  })();
 }
 
 function reserveDailySlot(messageId, brandId, limit) {
@@ -59,9 +75,12 @@ function isDefinitiveDeliveryRejection(error) {
 async function prepareStationInvestigation(input, deps = {}) {
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
   const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
-  if (['sent', 'review', 'sending', 'delivery_unknown'].includes(prior?.status)
+  if (['sent', 'review', 'sending', 'delivery_unknown', 'failed'].includes(prior?.status)
       || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
     return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+  if (!prior && genericPipelineJob(input)) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
   }
 
   // Persisted jobs keep ownership across provider replays even when the
@@ -85,7 +104,9 @@ async function prepareStationInvestigation(input, deps = {}) {
   // group, this workflow owns the message. Any later failure must stay silent
   // and fail closed instead of falling through to a second, generic responder.
   const claimed = true;
-  if (!prior) persistStationOwnership(input);
+  if (!prior && !persistStationOwnership(input)) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
+  }
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
   let reservedDailySlot = false;
@@ -140,12 +161,12 @@ async function routeStationInvestigation(input, deps = {}) {
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`investigator_http_${response.status}`);
     if (!policy.autoSend || result.decision !== 'send' || !result.reply) {
-      db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, updated_at=? WHERE message_id=?")
+      db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=? WHERE message_id=?")
         .run(result.decision || 'review', result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
       return { status: 'review', result };
     }
     const sending = db.prepare(`UPDATE station_investigation_jobs
-      SET status='sending', decision='send', confidence=?, station_ids_json=?, result_json=?, updated_at=?
+      SET status='sending', decision='send', confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=?
       WHERE message_id=? AND status='processing'`)
       .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
     if (sending.changes !== 1) {
@@ -161,7 +182,7 @@ async function routeStationInvestigation(input, deps = {}) {
       db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, created_at)
         VALUES (?, ?, ?, 'outbound', 'station-investigator', ?, ?, 'sent', ?)`)
         .run(randomId('msg'), input.conversationId, input.brandId, result.reply, externalId, sentAt);
-      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, response_sent_at=?, response_external_message_id=?, updated_at=? WHERE message_id=?")
+      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, last_error=NULL, response_sent_at=?, response_external_message_id=?, updated_at=? WHERE message_id=?")
         .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), sentAt, externalId, sentAt, input.messageId);
     })();
     return { status: 'sent', result };
@@ -171,11 +192,77 @@ async function routeStationInvestigation(input, deps = {}) {
         .run(String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
       return { status: 'delivery_unknown', error: String(error?.message || error) };
     }
-    const next = new Date(Date.now() + 60_000).toISOString();
-    db.prepare("UPDATE station_investigation_jobs SET status='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE message_id=?")
-      .run(next, String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
-    return { status: 'retry', error: String(error?.message || error) };
+    const attempts = Number(db.prepare('SELECT attempts FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId)?.attempts || 1);
+    const retryable = attempts < STATION_JOB_MAX_ATTEMPTS;
+    const updatedAt = nowIso();
+    const next = retryable ? new Date(Date.now() + 60_000).toISOString() : updatedAt;
+    db.prepare("UPDATE station_investigation_jobs SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE message_id=?")
+      .run(retryable ? 'retry' : 'failed', next, String(error?.message || error).slice(0, 500), updatedAt, input.messageId);
+    return { status: retryable ? 'retry' : 'failed', error: String(error?.message || error) };
   }
 }
 
-module.exports = { prepareStationInvestigation, routeStationInvestigation, dailyLimitReached };
+function sourceMessageFor(job) {
+  return db.prepare(`SELECT * FROM messages
+    WHERE conversation_id = ? AND brand_id = ?
+      AND (external_message_id = ? OR id = ?)
+    ORDER BY CASE WHEN external_message_id = ? THEN 0 ELSE 1 END
+    LIMIT 1`)
+    .get(job.conversation_id, job.brand_id, job.message_id, job.message_id, job.message_id);
+}
+
+function parsedMentionedJids(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function deliverDueStationInvestigations(deps = {}) {
+  if (deliveringStationInvestigations) return;
+  deliveringStationInvestigations = true;
+  try {
+    const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
+    const due = db.prepare(`SELECT * FROM station_investigation_jobs
+      WHERE (status = 'retry' AND datetime(next_attempt_at) <= datetime('now'))
+         OR (status IN ('reserved', 'processing') AND updated_at <= ?)
+      ORDER BY datetime(created_at) ASC LIMIT 5`).all(staleBefore);
+    for (const job of due) {
+      const source = sourceMessageFor(job);
+      if (!source) {
+        const updatedAt = nowIso();
+        db.prepare("UPDATE station_investigation_jobs SET status='failed', next_attempt_at=?, last_error='source_message_missing', updated_at=? WHERE message_id=?")
+          .run(updatedAt, updatedAt, job.message_id);
+        continue;
+      }
+      await routeStationInvestigation({
+        messageId: job.message_id,
+        conversationId: job.conversation_id,
+        brandId: job.brand_id,
+        groupJid: job.group_jid,
+        instance: job.instance,
+        senderId: source.sender_id,
+        receivedAt: source.provider_timestamp || source.created_at,
+        whatsappContext: {
+          providerTimestamp: source.provider_timestamp || source.created_at,
+          quotedMessageId: source.quoted_message_id || null,
+          quotedSenderId: source.quoted_sender_id || null,
+          mentionedJids: parsedMentionedJids(source.mentioned_jids_json),
+          isForwarded: Boolean(source.is_forwarded),
+          forwardingScore: Number(source.forwarding_score || 0),
+        },
+      }, deps);
+    }
+  } finally {
+    deliveringStationInvestigations = false;
+  }
+}
+
+module.exports = {
+  deliverDueStationInvestigations,
+  prepareStationInvestigation,
+  routeStationInvestigation,
+  dailyLimitReached,
+};

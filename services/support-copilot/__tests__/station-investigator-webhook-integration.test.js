@@ -107,6 +107,8 @@ function quotedContadorPayload(messageId, quotedMessageId) {
   let investigationRequest = null;
   let gatewaySendCount = 0;
   let unavailableConfigCount = 0;
+  let outageConfigAvailable = false;
+  let outageConversationId = null;
   let child;
   let childOutput = '';
 
@@ -114,7 +116,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(req.headers.authorization, `Bearer ${AGENT_SECRET}`);
     if (req.method === 'GET' && req.url.startsWith('/api/agents/config?')) {
       const requestedBrand = new URL(req.url, 'http://central.test').searchParams.get('brandId');
-      if (requestedBrand === 'unavailable_brand') {
+      if (requestedBrand === 'unavailable_brand' && !outageConfigAvailable) {
         unavailableConfigCount += 1;
         res.writeHead(503, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
@@ -129,7 +131,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
             enabled: true,
             autoSend: false,
             killSwitch: false,
-            allowedConversationIds: [CONVERSATION_ID],
+            allowedConversationIds: [CONVERSATION_ID, outageConversationId].filter(Boolean),
             mentionJids: [BOT_JID],
             dailyLimit: 20,
             contextHours: 24,
@@ -225,7 +227,43 @@ function quotedContadorPayload(messageId, quotedMessageId) {
       body: JSON.stringify(unavailablePayload),
     });
     assert.equal(unavailable.status, 201);
+    outageConversationId = (await unavailable.json()).conversationId;
     assert.equal(unavailableConfigCount, 1, 'one inbound message must reuse one failed Agent Center lookup');
+
+    const genericOwnedId = `${MESSAGE_ID}-generic-owned`;
+    const genericOwnedPayload = webhookPayload(genericOwnedId, true, true);
+    genericOwnedPayload.instance = 'outage';
+    const genericFirst = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(genericOwnedPayload),
+    });
+    assert.equal(genericFirst.status, 201);
+    await waitUntil(() => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      const stored = probe.prepare('SELECT id FROM messages WHERE external_message_id = ?').get(genericOwnedId);
+      const generic = stored
+        ? probe.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(stored.id)
+        : null;
+      probe.close();
+      return generic;
+    });
+
+    outageConfigAvailable = true;
+    const genericReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(genericOwnedPayload),
+    });
+    assert.equal(genericReplay.status, 200);
+    assert.equal((await genericReplay.json()).duplicate, true);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const genericOwnershipProbe = new Database(DB_PATH, { readonly: true });
+    const genericStationJobs = genericOwnershipProbe.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?')
+      .get(genericOwnedId).count;
+    genericOwnershipProbe.close();
+    assert.equal(genericStationJobs, 0, 'a durable generic job must retain ownership after config recovery');
+    assert.equal(investigationCount, 0, 'generic ownership must block a second station investigation');
 
     const first = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
