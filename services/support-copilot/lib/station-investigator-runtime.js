@@ -51,6 +51,11 @@ function leaseExpired(job, now = Date.now()) {
   return Number.isFinite(updatedAt) && updatedAt <= now - PROCESSING_LEASE_MS;
 }
 
+function isDefinitiveDeliveryRejection(error) {
+  const statusCode = Number(error?.statusCode);
+  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599;
+}
+
 async function prepareStationInvestigation(input, deps = {}) {
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
   const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
@@ -161,7 +166,7 @@ async function routeStationInvestigation(input, deps = {}) {
     })();
     return { status: 'sent', result };
   } catch (error) {
-    if (sendStarted) {
+    if (sendStarted && !isDefinitiveDeliveryRejection(error)) {
       db.prepare("UPDATE station_investigation_jobs SET status='delivery_unknown', last_error=?, updated_at=? WHERE message_id=? AND status='sending'")
         .run(String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
       return { status: 'delivery_unknown', error: String(error?.message || error) };

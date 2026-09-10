@@ -14,6 +14,7 @@ const STATION_NON_NAME_FRAGMENT_PATTERN = [
   'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
+  'tudo', 'todos?', 'todas?', 'algo', 'nada', 'todo\\s+mundo',
 ].join('|');
 const STATION_NOUN_PREFIX_PATTERN = [
   'carregador', 'conector', 'disjuntor', 'energia', 'equipamento',

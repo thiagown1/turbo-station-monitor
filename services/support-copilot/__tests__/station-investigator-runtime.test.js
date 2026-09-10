@@ -585,6 +585,47 @@ test('treats a successful WhatsApp response without a message id as ambiguous', 
   assert.deepEqual(job, { status: 'delivery_unknown', response_external_message_id: null });
 });
 
+test('retries a WhatsApp send that the gateway explicitly rejected', async () => {
+  const rejectedInput = { ...input('rejected-send'), brandId: 'rejected-send-brand' };
+  let requestCount = 0;
+  let sendCount = 0;
+  const deps = {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('rejected-send'),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({
+        decision: 'send',
+        confidence: 'high',
+        stationIds: ['AR2608200012'],
+        reply: 'Resposta rejeitada antes da entrega.',
+      });
+    },
+    sendText: async () => {
+      sendCount++;
+      if (sendCount === 1) {
+        const rejected = new Error('Evolution API sendText failed: 401');
+        rejected.statusCode = 401;
+        throw rejected;
+      }
+      return { key: { id: 'wamid-rejected-retry' } };
+    },
+  };
+
+  const first = await routeStationInvestigation(rejectedInput, deps);
+  const retryJob = db.prepare('SELECT status, next_attempt_at, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get('rejected-send');
+  const replay = await routeStationInvestigation(rejectedInput, deps);
+
+  assert.equal(first.status, 'retry');
+  assert.equal(retryJob.status, 'retry');
+  assert.ok(retryJob.next_attempt_at);
+  assert.match(retryJob.last_error, /401/);
+  assert.equal(replay.status, 'sent');
+  assert.equal(requestCount, 2);
+  assert.equal(sendCount, 2);
+});
+
 test('preserves station ownership when context reconstruction fails after the structured mention gate', async () => {
   const prepared = await prepareStationInvestigation(input('claimed-context-failure'), {
     loadConfig: async () => config(),
