@@ -123,12 +123,16 @@ function uniqueStationNames(values) {
 }
 
 function stateFirstStationName(raw) {
+  const leadingPredicate = new RegExp(`^(?:${STATION_NON_NAME_FRAGMENT_PATTERN})(?:\\s+(?:o|a))?\\s+`, 'i');
   const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i');
   let name = String(raw || '').trim();
   let previous;
   do {
     previous = name;
-    name = name.replace(trailingPredicate, '').trim();
+    name = name
+      .replace(leadingPredicate, '')
+      .replace(trailingPredicate, '')
+      .trim();
   } while (name !== previous);
   return name;
 }

@@ -196,6 +196,28 @@ test('parses every supported station state before the venue', async (t) => {
   }
 });
 
+test('strips leading status predicates between a state verb and the venue', async (t) => {
+  const scenarios = [
+    'Está offline o Habibs?',
+    'Continua offline o Habibs?',
+    'Segue fora do ar o Habibs?',
+    'Ficou sem energia o Habibs?',
+    'Está ainda offline o Habibs?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `state-first-leading-predicate-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
 test('extracts the natural venue when the structured mention and question share a message', () => {
   const context = reconstructIncidentContext([
     message('trigger', '2026-09-10T15:30:00.000Z', 'luan', '@Turbo Station Suporte Habibs desarmou de novo?', {

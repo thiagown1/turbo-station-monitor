@@ -536,6 +536,48 @@ test('reclaims an expired processing lease but leaves a live one fenced', async 
   assert.equal(requestCount, 1);
 });
 
+test('terminalizes an expired processing lease that already reached the attempt cap', async () => {
+  const messageId = 'stale-processing-exhausted';
+  const stale = new Date(Date.now() - 5 * 60_000).toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'processing', 5, ?, ?, ?)`)
+    .run(
+      messageId, 'conv-pilot', 'stale-exhausted-brand',
+      '120363000000000000@g.us', 'turbostation', stale, stale, stale,
+    );
+  let configLoads = 0;
+  let contextBuilds = 0;
+  let requestCount = 0;
+
+  const result = await routeStationInvestigation({
+    ...input(messageId),
+    brandId: 'stale-exhausted-brand',
+  }, {
+    loadConfig: async () => {
+      configLoads++;
+      return config();
+    },
+    buildContext: () => {
+      contextBuilds++;
+      return context(messageId);
+    },
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review', confidence: 'high' });
+    },
+  });
+
+  const job = db.prepare('SELECT status, attempts, last_error FROM station_investigation_jobs WHERE message_id = ?')
+    .get(messageId);
+  assert.equal(result.status, 'failed');
+  assert.deepEqual(job, { status: 'failed', attempts: 5, last_error: 'attempt_limit_reached' });
+  assert.equal(configLoads, 0);
+  assert.equal(contextBuilds, 0);
+  assert.equal(requestCount, 0);
+});
+
 test('never retries automatically after WhatsApp delivery becomes ambiguous', async () => {
   const ambiguousInput = { ...input('ambiguous-send'), brandId: 'ambiguous-send-brand' };
   let requestCount = 0;

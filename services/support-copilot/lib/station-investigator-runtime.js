@@ -82,6 +82,19 @@ async function prepareStationInvestigation(input, deps = {}) {
       || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
     return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
   }
+  if ((prior?.status === 'retry' || resumableInFlight)
+      && Number(prior?.attempts || 0) >= STATION_JOB_MAX_ATTEMPTS) {
+    const failedAt = nowIso();
+    const failed = db.prepare(`UPDATE station_investigation_jobs
+      SET status='failed', next_attempt_at=?, last_error='attempt_limit_reached', updated_at=?
+      WHERE message_id=? AND status=? AND attempts>=? AND updated_at=?`)
+      .run(failedAt, failedAt, input.messageId, prior.status, STATION_JOB_MAX_ATTEMPTS, prior.updated_at);
+    if (failed.changes === 1) {
+      return { claimed: true, ready: false, result: { status: 'failed', reason: 'attempt_limit_reached' } };
+    }
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+    return { claimed: true, ready: false, result: { duplicate: true, status: current?.status || 'unknown' } };
+  }
   if (!prior && genericPipelineJob(input)) {
     return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
   }
@@ -148,8 +161,15 @@ async function routeStationInvestigation(input, deps = {}) {
     WHERE message_id=? AND (
       status IN ('reserved', 'retry')
       OR (status='processing' AND updated_at <= ?)
-    )`)
-    .run(context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, input.messageId, staleBefore);
+    ) AND attempts < ?`)
+    .run(
+      context.contextFingerprint,
+      JSON.stringify(context.messageRefs.map(x => x.id)),
+      now,
+      input.messageId,
+      staleBefore,
+      STATION_JOB_MAX_ATTEMPTS,
+    );
   if (acquired.changes !== 1) {
     const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
     return { duplicate: true, status: current?.status || 'unknown' };
