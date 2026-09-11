@@ -173,7 +173,19 @@ async function prepareStationInvestigation(input, deps = {}) {
   // current config is temporarily unavailable or has since been tightened.
   // Otherwise the same attachment can fall through to the generic router.
   const claimedByPriorJob = Boolean(prior);
-  const config = await (deps.loadConfig || loadConfig)(input.brandId).catch(() => null);
+  let config;
+  try {
+    config = await (deps.loadConfig || loadConfig)(input.brandId);
+  } catch (error) {
+    if (prior?.status === 'claimed') {
+      queueClaimedRetry(input.messageId, `config_unavailable: ${error?.message || 'load_failed'}`);
+    }
+    return {
+      claimed: claimedByPriorJob,
+      ready: false,
+      result: { skipped: true, reason: 'config_unavailable' },
+    };
+  }
   const policy = config?.stationInvestigator;
   if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) {
     return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'disabled' } };

@@ -138,6 +138,8 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['O Habibs se comunicou?', 'Habibs'],
     ['O Habibs não se comunicou?', 'Habibs'],
     ['A estação do Habibs caiu?', 'Habibs'],
+    ['A estação de recarga do Habibs caiu?', 'Habibs'],
+    ['Caiu a estação de recarga do Habibs?', 'Habibs'],
     ['Essa estação do Habibs caiu?', 'Habibs'],
     ['Aquele posto do Habibs caiu?', 'Habibs'],
     ['O carregador da estação do Habibs caiu?', 'Habibs'],

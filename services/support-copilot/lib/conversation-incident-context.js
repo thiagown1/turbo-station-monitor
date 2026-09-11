@@ -41,7 +41,7 @@ const GENERIC_STATION_NOUNS = [
 ];
 const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
 const STATION_EQUIPMENT_IDENTIFIER_PATTERN = '(?:n(?:[.º°o])?\\s*)?(?:#?\\d{1,3}|[a-z])';
-const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de|no|na)\\s+)?)*`;
+const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:esta[cç][aã]o\\s+de\\s+recarga|${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de|no|na)\\s+)?)*`;
 const GENERIC_STATION_SUBJECTS = new Set([
   ...GENERIC_STATION_NOUNS.map(([, normalized]) => normalized),
   'normal', 'ele', 'ela',
