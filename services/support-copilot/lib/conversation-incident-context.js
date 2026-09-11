@@ -145,6 +145,7 @@ function stateFirstStationName(raw) {
   let name = String(raw || '').trim();
   if (/^(?:(?:por|porque|devido|durante|ap[oó]s|depois|antes|desde|quando|enquanto)\b|at[eé](?=\s|$))/i.test(name)) return '';
   if (/^(?:[àa]s?\s+)?\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?(?=\s|$)/i.test(name)) return '';
+  if (/^(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)\b/i.test(name)) return '';
   let previous;
   do {
     previous = name;
