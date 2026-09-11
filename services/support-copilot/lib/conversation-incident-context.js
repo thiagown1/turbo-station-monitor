@@ -177,7 +177,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const stateFirst = new RegExp(
-        `^(?:como\\s+)?(?:est[aá]|anda|ficou)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
+        `^(?:como\\s+)?(?:${STATION_STATE_PATTERN}|anda)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
         'i',
       ).exec(conversational);
       if (stateFirst) {

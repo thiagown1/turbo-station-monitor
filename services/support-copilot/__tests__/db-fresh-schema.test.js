@@ -269,6 +269,8 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         for (const expected of ['fallback_applied_at', 'model_waits', 'last_model_wait_at']) {
           if (!mediaJobCols.includes(expected)) throw new Error('agent_media_jobs.' + expected + ' column missing');
         }
+        const stationJobCols = check.prepare("PRAGMA table_info('station_investigation_jobs')").all().map(r => r.name);
+        if (!stationJobCols.includes('quota_reserved_at')) throw new Error('station_investigation_jobs.quota_reserved_at column missing');
         const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
         if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
         const messageCols = check.prepare("PRAGMA table_info('messages')").all().map(r => r.name);

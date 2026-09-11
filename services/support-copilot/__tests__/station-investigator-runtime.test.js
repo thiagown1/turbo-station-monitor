@@ -12,6 +12,7 @@ process.env.AGENT_EVENT_SECRET = 'test-secret';
 const { db } = require('../lib/db');
 const { routeInboundMessageDurably } = require('../lib/agent-router');
 const {
+  dailyLimitReached,
   deliverDueStationInvestigations,
   prepareStationInvestigation,
   routeStationInvestigation,
@@ -846,6 +847,47 @@ test('backs off policy-blocked jobs so a later eligible retry can run', async ()
   assert.equal(requestCount, 1, 'the eligible sixth job must run on the next worker pass');
   assert.equal(db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?')
     .get(eligible.messageId).status, 'review');
+});
+
+test('does not renew daily quota age while backing off a policy-blocked retry', async () => {
+  const messageId = 'old-policy-blocked-quota';
+  const brandId = 'old-policy-blocked-quota-brand';
+  const oldReservation = new Date(Date.now() - 25 * 60 * 60 * 1_000).toISOString();
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, 'conv-pilot', ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, 'Luan', ?)`)
+    .run(
+      `${messageId}-local`, brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      messageId, oldReservation, JSON.stringify(['support-bot@s.whatsapp.net']),
+      '5511999999999@s.whatsapp.net', oldReservation,
+    );
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, quota_reserved_at, created_at, updated_at)
+    VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 1, ?, ?, ?, ?)`)
+    .run(messageId, brandId, new Date(0).toISOString(), oldReservation, oldReservation, oldReservation);
+
+  await deliverDueStationInvestigations({
+    loadConfig: async () => config({ allowedConversationIds: ['another-conversation'], dailyLimit: 1 }),
+  });
+
+  const blocked = db.prepare(`SELECT status, quota_reserved_at, updated_at
+    FROM station_investigation_jobs WHERE message_id = ?`).get(messageId);
+  assert.equal(blocked.status, 'retry');
+  assert.equal(blocked.quota_reserved_at, oldReservation);
+  assert.ok(Date.parse(blocked.updated_at) > Date.parse(oldReservation));
+  assert.equal(dailyLimitReached(brandId, 1), false, 'maintenance timestamps must not renew quota');
+
+  const fresh = await routeStationInvestigation({ ...input('fresh-after-old-policy-block'), brandId }, {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: () => context('fresh-after-old-policy-block'),
+    request: async () => jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] }),
+  });
+  assert.equal(fresh.status, 'review');
+  assert.equal(dailyLimitReached(brandId, 1), true);
 });
 
 test('does not overwrite a concurrent station transition while finalizing stale context', async () => {

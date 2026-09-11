@@ -16,7 +16,8 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - 86_400_000).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
-    WHERE brand_id = ? AND updated_at >= ? AND status <> 'claimed' AND message_id <> ?`)
+    WHERE brand_id = ? AND COALESCE(quota_reserved_at, created_at) >= ?
+      AND status <> 'claimed' AND message_id <> ?`)
     .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
 }
@@ -52,14 +53,15 @@ function reserveDailySlot(messageId, brandId, limit) {
     if (dailyLimitReached(brandId, limit, messageId)) {
       return { acquired: false, status: 'claimed', limitReached: true };
     }
-    const acquired = db.prepare("UPDATE station_investigation_jobs SET status='reserved', updated_at=? WHERE message_id=? AND status='claimed'")
-      .run(nowIso(), messageId);
+    const reservedAt = nowIso();
+    const acquired = db.prepare("UPDATE station_investigation_jobs SET status='reserved', quota_reserved_at=?, updated_at=? WHERE message_id=? AND status='claimed'")
+      .run(reservedAt, reservedAt, messageId);
     return { acquired: acquired.changes === 1, status: acquired.changes === 1 ? 'reserved' : 'unknown', limitReached: false };
   })();
 }
 
 function releaseDailySlot(messageId) {
-  db.prepare("UPDATE station_investigation_jobs SET status='claimed', updated_at=? WHERE message_id=? AND status='reserved'")
+  db.prepare("UPDATE station_investigation_jobs SET status='claimed', quota_reserved_at=NULL, updated_at=? WHERE message_id=? AND status='reserved'")
     .run(nowIso(), messageId);
 }
 

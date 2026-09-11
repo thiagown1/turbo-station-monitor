@@ -176,6 +176,26 @@ test('recognizes common natural station-name phrasings', async (t) => {
   }
 });
 
+test('parses every supported station state before the venue', async (t) => {
+  const states = [
+    'desarmou', 'caiu', 'parou', 'voltou', 'está', 'esta', 'tá', 'ta',
+    'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
+    'perdeu', 'falhou', 'funciona', 'comunicou', 'anda',
+  ];
+
+  for (const [index, state] of states.entries()) {
+    await t.test(state, () => {
+      const questionId = `state-first-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', `Como ${state} o Habibs?`),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
 test('extracts the natural venue when the structured mention and question share a message', () => {
   const context = reconstructIncidentContext([
     message('trigger', '2026-09-10T15:30:00.000Z', 'luan', '@Turbo Station Suporte Habibs desarmou de novo?', {

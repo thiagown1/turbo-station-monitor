@@ -601,6 +601,7 @@ try {
       context_message_ids_json TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       attempts INTEGER NOT NULL DEFAULT 0,
+      quota_reserved_at TEXT,
       next_attempt_at TEXT NOT NULL,
       last_error TEXT,
       decision TEXT,
@@ -620,6 +621,7 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} station investigator migration:`, err.message);
 }
+safeAddColumn('station_investigation_jobs', 'quota_reserved_at', 'TEXT DEFAULT NULL');
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
