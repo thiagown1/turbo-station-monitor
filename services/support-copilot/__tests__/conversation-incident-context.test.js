@@ -240,6 +240,27 @@ test('accepts modifiers before state-first station questions', async (t) => {
   }
 });
 
+test('does not treat qualitative time-of-day tails as station names', async (t) => {
+  const scenarios = [
+    'Caiu de madrugada?',
+    'Caiu de manhã?',
+    'Caiu à tarde?',
+    'Caiu à noite?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `state-first-time-of-day-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'low');
+      assert.deepEqual(context.stationHints, []);
+    });
+  }
+});
+
 test('strips modifiers before subject-first station questions', async (t) => {
   const scenarios = [
     'Hoje o Habibs caiu?',

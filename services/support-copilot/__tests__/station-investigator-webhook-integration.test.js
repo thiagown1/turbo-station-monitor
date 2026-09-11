@@ -106,11 +106,15 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
 
 (async () => {
   let investigationCount = 0;
+  let retryableOutageId = null;
+  let recoveredOutageInvestigationCount = 0;
   let investigationRequest = null;
   let gatewaySendCount = 0;
   let unavailableConfigCount = 0;
   let outageConfigAvailable = false;
   let outageConversationId = null;
+  let retryableConfigAvailable = false;
+  let retryableOutageConversationId = null;
   let accountingGroupAllowed = true;
   let forceConfigUnavailable = false;
   let returnNullConfig = false;
@@ -134,6 +138,10 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
         res.writeHead(503, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
       }
+      if (requestedBrand === 'retryable_brand' && !retryableConfigAvailable) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         config: {
@@ -146,7 +154,7 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
             enabled: true,
             autoSend: false,
             killSwitch: false,
-            allowedConversationIds: [CONVERSATION_ID, outageConversationId].filter(Boolean),
+            allowedConversationIds: [CONVERSATION_ID, outageConversationId, retryableOutageConversationId].filter(Boolean),
             mentionJids: [BOT_JID],
             dailyLimit: 20,
             contextHours: 24,
@@ -156,8 +164,12 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
       }));
     }
     if (req.method === 'POST' && req.url === '/api/agents/station-investigations') {
-      investigationCount += 1;
-      investigationRequest = body;
+      if (body.sourceMessageId === retryableOutageId) {
+        recoveredOutageInvestigationCount += 1;
+      } else {
+        investigationCount += 1;
+        investigationRequest = body;
+      }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       return res.end(JSON.stringify({
         decision: 'review',
@@ -195,7 +207,7 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
         AGENT_EVENT_SECRET: AGENT_SECRET,
         EVOLUTION_API_URL: `http://127.0.0.1:${gatewayPort}`,
         EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
-        EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station,outage:unavailable_brand',
+        EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station,outage:unavailable_brand,retryoutage:retryable_brand',
         CONTADOR_ENABLED: 'true',
         CONTADOR_GROUP_CONVERSATION_ID: GROUP_JID,
         CONTADOR_NEXT_BASE_URL: `http://127.0.0.1:${centralPort}`,
@@ -279,6 +291,30 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
     genericOwnershipProbe.close();
     assert.equal(genericStationJobs, 0, 'a durable generic job must retain ownership after config recovery');
     assert.equal(investigationCount, 0, 'generic ownership must block a second station investigation');
+
+    retryableOutageId = `${MESSAGE_ID}-retryable-config-outage`;
+    const retryableOutagePayload = webhookPayload(retryableOutageId, true);
+    retryableOutagePayload.instance = 'retryoutage';
+    const retryableOutage = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(retryableOutagePayload),
+    });
+    assert.equal(retryableOutage.status, 503, 'a mentioned station request must ask the provider to retry');
+    const retryableConversationProbe = new Database(DB_PATH, { readonly: true });
+    retryableOutageConversationId = retryableConversationProbe.prepare(
+      "SELECT id FROM conversations WHERE brand_id = 'retryable_brand' AND customer_phone = ?",
+    ).get(GROUP_JID).id;
+    retryableConversationProbe.close();
+    retryableConfigAvailable = true;
+    const recoveredOutage = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(retryableOutagePayload),
+    });
+    assert.equal(recoveredOutage.status, 200);
+    assert.equal((await recoveredOutage.json()).duplicate, true);
+    await waitUntil(() => recoveredOutageInvestigationCount === 1);
 
     const claimedOutageId = `${MESSAGE_ID}-claimed-config-outage`;
     const claimedOutageLocalId = `${claimedOutageId}-local`;

@@ -437,6 +437,12 @@ router.post('/', async (req, res) => {
                   return sharedAgentConfig;
                 },
               });
+              if (!prepared?.claimed
+                  && prepared?.result?.reason === 'config_unavailable'
+                  && !media
+                  && whatsappContext.mentionedJids.length > 0) {
+                throw new Error('station_config_unavailable');
+              }
               if (prepared?.claimed) {
                 void routeStationInvestigation(stationInput, { prepared })
                   .catch(err => console.warn(`${LOG_TAG} duplicate station recovery failed for ${dup.id}:`, err.message));
@@ -584,9 +590,16 @@ router.post('/', async (req, res) => {
       }
       const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
       const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
-      const sharedAgentConfig = quotedContadorReply
-        ? await loadConfig(brandId, { fresh: true })
-        : await loadConfig(brandId).catch(() => null);
+      let sharedAgentConfig = null;
+      let sharedAgentConfigError = null;
+      try {
+        sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : undefined);
+      } catch (error) {
+        sharedAgentConfigError = error;
+      }
+      if (quotedContadorReply && sharedAgentConfigError) {
+        return res.status(503).json({ error: 'fresh_agent_config_required' });
+      }
       if (quotedContadorReply && !sharedAgentConfig) {
         return res.status(503).json({ error: 'fresh_agent_config_required' });
       }
@@ -604,11 +617,20 @@ router.post('/', async (req, res) => {
         });
       }
       const stationPreparation = await prepareStationInvestigation(stationInput, {
-        loadConfig: async () => sharedAgentConfig,
+        loadConfig: async () => {
+          if (sharedAgentConfigError) throw sharedAgentConfigError;
+          return sharedAgentConfig;
+        },
       }).catch((err) => {
         console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
         return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
       });
+      if (!stationPreparation.claimed
+          && stationPreparation.result?.reason === 'config_unavailable'
+          && !media
+          && whatsappContext.mentionedJids.length > 0) {
+        return res.status(503).json({ error: 'station_config_unavailable' });
+      }
       // Central media router: every image/PDF is classified once. Text-only
       // messages use a free deterministic gate and invoke the model only when
       // they look like a request to inspect a charger.
