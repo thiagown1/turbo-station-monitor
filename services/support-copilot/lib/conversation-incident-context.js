@@ -144,6 +144,7 @@ function stateFirstStationName(raw) {
   const leadingStationNouns = new RegExp(`^${STATION_NOUN_SEQUENCE_PATTERN}`, 'i');
   let name = String(raw || '').trim();
   if (/^(?:(?:por|porque|devido|durante|ap[oó]s|depois|antes|desde|quando|enquanto)\b|at[eé](?=\s|$))/i.test(name)) return '';
+  if (/^(?:[àa]s?\s+)?\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?(?=\s|$)/i.test(name)) return '';
   let previous;
   do {
     previous = name;

@@ -352,12 +352,14 @@ function parsedMentionedJids(value) {
   }
 }
 
-function failDueJobIfUnchanged(job, reason) {
+function failDueJobIfUnchanged(job, reason, options = {}) {
   const updatedAt = nowIso();
   return db.prepare(`UPDATE station_investigation_jobs
-    SET status='failed', next_attempt_at=?, last_error=?, updated_at=?
+    SET status='failed',
+        quota_reserved_at=CASE WHEN ? THEN NULL ELSE quota_reserved_at END,
+        next_attempt_at=?, last_error=?, updated_at=?
     WHERE message_id=? AND status=? AND updated_at=?`)
-    .run(updatedAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
+    .run(options.releaseQuota ? 1 : 0, updatedAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
 }
 
 function rescheduleDueJobIfUnchanged(job, reason) {
@@ -385,7 +387,7 @@ async function deliverDueStationInvestigations(deps = {}) {
       }
       const source = sourceMessageFor(job);
       if (!source) {
-        failDueJobIfUnchanged(job, 'source_message_missing');
+        failDueJobIfUnchanged(job, 'source_message_missing', { releaseQuota: job.status === 'reserved' });
         continue;
       }
       const result = await routeStationInvestigation({

@@ -836,6 +836,24 @@ test('fails closed when a due station retry has lost its source message', async 
   assert.deepEqual(job, { status: 'failed', last_error: 'source_message_missing' });
 });
 
+test('releases unused quota when a stale reservation has lost its source message', async () => {
+  const staleAt = new Date(0).toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     quota_reserved_at, next_attempt_at, created_at, updated_at)
+    VALUES (?, 'conv-pilot', 'missing-reserved-source-brand', '120363000000000000@g.us',
+      'turbostation', 'reserved', 0, ?, ?, ?, ?)`)
+    .run('missing-source-reserved', new Date().toISOString(), staleAt, staleAt, staleAt);
+
+  await deliverDueStationInvestigations();
+
+  assert.deepEqual(
+    db.prepare('SELECT status, last_error, quota_reserved_at FROM station_investigation_jobs WHERE message_id = ?')
+      .get('missing-source-reserved'),
+    { status: 'failed', last_error: 'source_message_missing', quota_reserved_at: null },
+  );
+});
+
 test('finalizes due station jobs whose incident context can no longer be reconstructed', async () => {
   const staleAt = new Date(0).toISOString();
   const createdAt = new Date().toISOString();
