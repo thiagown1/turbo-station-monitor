@@ -11,12 +11,15 @@ const STATION_STATE_WORDS = [
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
 const STATION_INTERROGATIVE_PREFIX_PATTERN = /^(?:qual|quais|algum(?:a|as)?|onde|que)\b/i;
+const STATION_INTERROGATIVE_CONTEXT_PATTERN = /(?:^|\s)(?:qual|quais|algum(?:a|as)?|onde|que)\s*$/i;
 const STATION_NON_NAME_FRAGMENT_PATTERN = [
   STATION_STATE_PATTERN,
   'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
   'tudo', 'todos?', 'todas?', 'algo', 'nada', 'todo\\s+mundo',
+  'ess(?:e|a|es|as)', 'aquel(?:e|a|es|as)', 'isto', 'isso', 'aquilo',
+  'aqui', 'ali', 'acol[aá]', 'l[aá]', 'a[ií]',
 ].join('|');
 const GENERIC_STATION_NOUNS = [
   ['alimenta[cç][aã]o', 'alimentacao'], ['carregador', 'carregador'],
@@ -161,6 +164,9 @@ function stationNamesFrom(text, options = {}) {
     // Explicit station labels remain useful throughout the incident context,
     // including forwarded equipment alerts that precede the request.
     for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*(?::|-)\s*|esta[cç][aã]o\s+(?!d(?:o|a|e)\b))([^\n,.!?]{0,80})/gi)) {
+      const lineStart = value.lastIndexOf('\n', match.index) + 1;
+      const prefix = value.slice(lineStart, match.index).trim();
+      if (STATION_INTERROGATIVE_CONTEXT_PATTERN.test(prefix)) continue;
       const tail = match[1].trim();
       const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
       addCandidate(state ? tail.slice(0, state.index) : tail);
