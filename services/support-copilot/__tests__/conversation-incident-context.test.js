@@ -135,7 +135,9 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['O conector da estação do Habibs caiu?', 'Habibs'],
     ['O conector 2 da estação do Habibs caiu?', 'Habibs'],
     ['O carregador 2 do Habibs caiu?', 'Habibs'],
+    ['O carregador 2 no Habibs caiu?', 'Habibs'],
     ['O conector A do Habibs caiu?', 'Habibs'],
+    ['O conector A na Livebox parou?', 'Livebox'],
     ['O carregador nº 2 do Habibs caiu?', 'Habibs'],
     ['O disjuntor da estação do Habibs desarmou?', 'Habibs'],
     ['A energia da estação do Habibs caiu?', 'Habibs'],
@@ -218,6 +220,25 @@ test('strips leading status predicates between a state verb and the venue', asyn
   for (const [index, body] of scenarios.entries()) {
     await t.test(body, () => {
       const questionId = `state-first-leading-predicate-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
+test('strips past-time tails after state-first station names', async (t) => {
+  const scenarios = [
+    'Caiu o Habibs ontem?',
+    'Caiu o Habibs de manhã?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `state-first-past-time-${index}`;
       const context = reconstructIncidentContext([
         message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
       ], questionId);

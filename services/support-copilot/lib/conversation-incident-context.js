@@ -14,7 +14,9 @@ const STATION_INTERROGATIVE_PATTERN = 'qual|quais|algum(?:a|as)?|onde|que|por\\s
 const STATION_INTERROGATIVE_PREFIX_PATTERN = new RegExp(`^(?:${STATION_INTERROGATIVE_PATTERN})\\b`, 'i');
 const STATION_NON_NAME_FRAGMENT_PATTERN = [
   STATION_STATE_PATTERN,
-  'agora', 'hoje', 'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
+  'agora', 'hoje', 'ontem', 'de\\s+manh[aã]', 'pela\\s+manh[aã]',
+  '[àa]\\s+tarde', 'de\\s+tarde', '[àa]\\s+noite',
+  'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'com\\s+(?:falha|problema|erro)',
   'dando\\s+(?:falha|problema|erro)', 'de\\s+comunicar', 'comunica[cç][aã]o',
@@ -33,7 +35,7 @@ const GENERIC_STATION_NOUNS = [
 ];
 const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
 const STATION_EQUIPMENT_IDENTIFIER_PATTERN = '(?:n(?:[.º°o])?\\s*)?(?:#?\\d{1,3}|[a-z])';
-const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de)\\s+)?)*`;
+const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de|no|na)\\s+)?)*`;
 const GENERIC_STATION_SUBJECTS = new Set([
   ...GENERIC_STATION_NOUNS.map(([, normalized]) => normalized),
   'normal', 'ele', 'ela',
