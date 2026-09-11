@@ -1021,6 +1021,61 @@ test('atomically re-reserves expired retry quota before resuming investigation',
   assert.equal(dailyLimitReached(brandId, 1), true);
 });
 
+test('atomically reserves previously uncharged outage retries before analysis', async () => {
+  const brandId = 'unreserved-outage-retry-brand';
+  const createdAt = new Date().toISOString();
+  for (const messageId of ['unreserved-retry-a', 'unreserved-retry-b']) {
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, quota_reserved_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 0, ?, NULL, ?, ?)`)
+      .run(messageId, brandId, new Date(0).toISOString(), createdAt, createdAt);
+  }
+
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: (_conversationId, messageId) => context(messageId),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] });
+    },
+  };
+  const results = await Promise.all([
+    routeStationInvestigation({ ...input('unreserved-retry-a'), brandId }, deps),
+    routeStationInvestigation({ ...input('unreserved-retry-b'), brandId }, deps),
+  ]);
+
+  assert.equal(requestCount, 1);
+  assert.deepEqual(results.map((result) => result.status || result.reason).sort(), ['daily_limit', 'review']);
+  const reservations = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
+    WHERE brand_id = ? AND quota_reserved_at IS NOT NULL`).get(brandId).count;
+  assert.equal(reservations, 1);
+});
+
+test('reconciles stale sending jobs to delivery_unknown without another send', async () => {
+  const staleAt = new Date(Date.now() - 3 * 60_000).toISOString();
+  for (const messageId of ['stale-sending-replay', 'stale-sending-worker']) {
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, quota_reserved_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', 'stale-sending-brand', '120363000000000000@g.us',
+       'turbostation', 'sending', 1, ?, ?, ?, ?)`)
+      .run(messageId, staleAt, staleAt, staleAt, staleAt);
+  }
+
+  const replay = await prepareStationInvestigation(input('stale-sending-replay'));
+  assert.deepEqual(replay.result, { duplicate: true, status: 'delivery_unknown' });
+  await deliverDueStationInvestigations();
+
+  for (const messageId of ['stale-sending-replay', 'stale-sending-worker']) {
+    assert.deepEqual(
+      db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?').get(messageId),
+      { status: 'delivery_unknown', last_error: 'stale_sending_reconciled' },
+    );
+  }
+});
+
 test('does not reacquire expired retry quota when context fails before analysis', async () => {
   const messageId = 'expired-retry-invalid-context';
   const brandId = `${messageId}-brand`;

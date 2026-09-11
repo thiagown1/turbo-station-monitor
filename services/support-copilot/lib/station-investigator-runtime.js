@@ -17,9 +17,8 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
   const since = new Date(Date.now() - DAILY_QUOTA_WINDOW_MS).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
-    WHERE brand_id = ? AND COALESCE(quota_reserved_at, created_at) >= ?
+    WHERE brand_id = ? AND quota_reserved_at >= ?
       AND status <> 'claimed'
-      AND NOT (status='failed' AND quota_reserved_at IS NULL)
       AND message_id <> ?`)
     .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
@@ -71,7 +70,7 @@ function reserveDailySlot(messageId, brandId, limit) {
 }
 
 function quotaReservationExpired(job, now = Date.now()) {
-  const reservedAt = Date.parse(job?.quota_reserved_at || job?.created_at || '');
+  const reservedAt = Date.parse(job?.quota_reserved_at || '');
   return !Number.isFinite(reservedAt) || reservedAt < now - DAILY_QUOTA_WINDOW_MS;
 }
 
@@ -121,6 +120,14 @@ function leaseExpired(job, now = Date.now()) {
   return Number.isFinite(updatedAt) && updatedAt <= now - PROCESSING_LEASE_MS;
 }
 
+function reconcileStaleSending(job) {
+  const updatedAt = nowIso();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='delivery_unknown', last_error='stale_sending_reconciled', updated_at=?
+    WHERE message_id=? AND status='sending' AND updated_at=?`)
+    .run(updatedAt, job.message_id, job.updated_at);
+}
+
 function isDefinitiveDeliveryRejection(error) {
   const statusCode = Number(error?.statusCode);
   return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 499;
@@ -133,6 +140,10 @@ function retryDue(job, now = Date.now()) {
 
 async function prepareStationInvestigation(input, deps = {}) {
   const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+  if (prior?.status === 'sending' && leaseExpired(prior)) {
+    reconcileStaleSending(prior);
+    return { claimed: true, ready: false, result: { duplicate: true, status: 'delivery_unknown' } };
+  }
   const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
   if (['sent', 'review', 'sending', 'delivery_unknown', 'failed'].includes(prior?.status)
       || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
@@ -343,9 +354,13 @@ async function deliverDueStationInvestigations(deps = {}) {
     const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
     const due = db.prepare(`SELECT * FROM station_investigation_jobs
       WHERE (status = 'retry' AND datetime(next_attempt_at) <= datetime('now'))
-         OR (status IN ('reserved', 'processing') AND updated_at <= ?)
+         OR (status IN ('reserved', 'processing', 'sending') AND updated_at <= ?)
       ORDER BY datetime(created_at) ASC LIMIT 5`).all(staleBefore);
     for (const job of due) {
+      if (job.status === 'sending') {
+        reconcileStaleSending(job);
+        continue;
+      }
       const source = sourceMessageFor(job);
       if (!source) {
         failDueJobIfUnchanged(job, 'source_message_missing');
