@@ -149,6 +149,9 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['O carregador 2 no Habibs caiu?', 'Habibs'],
     ['O conector A do Habibs caiu?', 'Habibs'],
     ['O conector A na Livebox parou?', 'Livebox'],
+    ['Caiu em Lago Norte?', 'Lago Norte'],
+    ['Está offline em Lago Norte?', 'Lago Norte'],
+    ['A estação em Lago Norte caiu?', 'Lago Norte'],
     ['O carregador nº 2 do Habibs caiu?', 'Habibs'],
     ['O disjuntor da estação do Habibs desarmou?', 'Habibs'],
     ['A energia da estação do Habibs caiu?', 'Habibs'],
@@ -319,6 +322,10 @@ test('strips past-time tails after state-first station names', async (t) => {
   const scenarios = [
     'Caiu o Habibs ontem?',
     'Caiu o Habibs de manhã?',
+    'Caiu o Habibs às 10h?',
+    'Caiu o Habibs 10:30?',
+    'Voltou o Habibs há duas horas?',
+    'Está offline o Habibs faz uns 10 minutos?',
   ];
 
   for (const [index, body] of scenarios.entries()) {

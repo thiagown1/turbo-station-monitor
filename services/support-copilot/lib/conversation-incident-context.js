@@ -147,13 +147,17 @@ function stateFirstStationName(raw) {
   if (/^(?:(?:de|pela?|na)\s+(?:madrugada|manh[aã]|tarde|noite)|[àa]\s+(?:tarde|noite))\b/i.test(name)) return '';
   if (/^(?:[àa]s?\s+)?\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?(?=\s|$)/i.test(name)) return '';
   if (/^(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)\b/i.test(name)) return '';
+  name = name
+    .replace(/\s+(?:(?:[àa]s\s+\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?)|(?:\d{1,2}(?::\d{2}|\s*h(?:oras?)?)))$/i, '')
+    .replace(/\s+(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)$/i, '')
+    .trim();
   let previous;
   do {
     previous = name;
     name = name
       .replace(leadingPredicate, '')
       .replace(/^(?:ao\s+normal|ao\s+ar)(?:(?:\s+(?:o|a))?\s+|$)/i, '')
-      .replace(/^(?:no|na)\s+/i, '')
+      .replace(/^(?:no|na|em)\s+/i, '')
       .replace(leadingStationNouns, '')
       .replace(trailingPredicate, '')
       .trim();
@@ -171,6 +175,7 @@ function stationNamesFrom(text, options = {}) {
     const name = String(raw || '')
       .replace(/^[\s,.;:!?…–—-]+|[\s,.;:!?…–—-]+$/g, '')
       .replace(/^(?:o|a)\s+/i, '')
+      .replace(/^(?:no|na|em)\s+/i, '')
       .replace(/\s+/g, ' ')
       .trim();
     const normalized = normalizedStationName(name);
