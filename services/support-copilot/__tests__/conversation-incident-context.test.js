@@ -228,6 +228,10 @@ test('strips modifiers before subject-first station questions', async (t) => {
     'Hoje o Habibs caiu?',
     'Ontem o Habibs caiu?',
     'Ainda o Habibs está offline?',
+    'De manhã o Habibs caiu?',
+    'À tarde o Habibs caiu?',
+    'Agora Habibs caiu?',
+    'No momento Habibs está offline?',
   ];
 
   for (const [index, body] of scenarios.entries()) {
