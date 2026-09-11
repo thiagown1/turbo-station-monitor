@@ -397,13 +397,18 @@ router.post('/', async (req, res) => {
             quotedContadorDraftId: quoted?.draftId || null,
           };
           void (async () => {
+            const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+            const sharedAgentConfig = await loadConfig(brandId, { fresh: true }).catch(() => null);
+            contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
             if (isQuotedContadorDraftReply(contadorEvent)) {
               enqueueContadorMessage(contadorEvent);
               return;
             }
             let prepared;
             try {
-              prepared = await prepareStationInvestigation(stationInput);
+              prepared = await prepareStationInvestigation(stationInput, {
+                loadConfig: async () => sharedAgentConfig,
+              });
             } catch (err) {
               console.warn(`${LOG_TAG} duplicate investigator preflight failed for ${dup.id}:`, err.message);
             }
@@ -544,6 +549,9 @@ router.post('/', async (req, res) => {
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
       }
+      const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+      const sharedAgentConfig = await loadConfig(brandId, { fresh: true }).catch(() => null);
+      contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
       if (isQuotedContadorDraftReply(contadorEvent)) {
         // Resolve authenticated Contador continuations before the stateful
         // station preflight so they cannot reserve station quota or ownership.
@@ -556,9 +564,6 @@ router.post('/', async (req, res) => {
           source: 'evolution', channel: 'whatsapp-group',
         });
       }
-      const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
-      const sharedAgentConfig = await loadConfig(brandId).catch(() => null);
-      contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
       const stationPreparation = await prepareStationInvestigation(stationInput, {
         loadConfig: async () => sharedAgentConfig,
       }).catch((err) => {

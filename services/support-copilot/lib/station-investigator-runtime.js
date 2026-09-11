@@ -100,6 +100,14 @@ function releaseDailySlot(messageId) {
     .run(nowIso(), messageId);
 }
 
+function queueClaimedRetry(messageId, reason) {
+  const now = nowIso();
+  db.prepare(`UPDATE station_investigation_jobs
+    SET status='retry', next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status='claimed'`)
+    .run(now, reason, now, messageId);
+}
+
 function failStaleReservedWithoutChargingQuota(job, reason) {
   const failedAt = nowIso();
   db.prepare(`UPDATE station_investigation_jobs
@@ -175,7 +183,10 @@ async function prepareStationInvestigation(input, deps = {}) {
     return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
   }
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
-  if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
+  if (!baseUrl() || !secret()) {
+    queueClaimedRetry(input.messageId, 'central_unavailable');
+    return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
+  }
   const staleReserved = prior?.status === 'reserved' && resumableInFlight;
   let reservedDailySlot = false;
   if (!prior || prior.status === 'claimed') {

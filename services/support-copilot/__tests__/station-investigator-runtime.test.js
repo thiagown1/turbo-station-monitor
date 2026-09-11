@@ -393,16 +393,43 @@ test('persists ownership for every safety gate reached after a valid claim', asy
 
 test('persists ownership when the central service is unavailable after a valid claim', async () => {
   const originalBaseUrl = process.env.AGENT_EVENT_BASE_URL;
+  const outageInput = input('owned-central-unavailable');
+  db.prepare(`INSERT INTO messages
+    (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+     provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+     sender_id, sender_name, created_at)
+    VALUES (?, ?, ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, ?, ?)`)
+    .run(
+      'owned-central-unavailable-local', outageInput.conversationId, outageInput.brandId,
+      '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+      outageInput.messageId, outageInput.receivedAt, JSON.stringify(outageInput.whatsappContext.mentionedJids),
+      outageInput.senderId, 'Luan', outageInput.receivedAt,
+    );
   delete process.env.AGENT_EVENT_BASE_URL;
   try {
-    const prepared = await prepareStationInvestigation(input('owned-central-unavailable'), {
+    const prepared = await prepareStationInvestigation(outageInput, {
       loadConfig: async () => config(),
     });
     assert.equal(prepared.claimed, true);
     assert.deepEqual(prepared.result, { skipped: true, reason: 'central_unavailable' });
-    const job = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?')
+    const job = db.prepare('SELECT status, next_attempt_at FROM station_investigation_jobs WHERE message_id = ?')
       .get('owned-central-unavailable');
-    assert.deepEqual(job, { status: 'claimed' });
+    assert.equal(job.status, 'retry');
+    assert.ok(Date.parse(job.next_attempt_at) <= Date.now());
+
+    process.env.AGENT_EVENT_BASE_URL = originalBaseUrl;
+    let requestCount = 0;
+    await deliverDueStationInvestigations({
+      loadConfig: async () => config({ autoSend: false }),
+      buildContext: () => context('owned-central-unavailable'),
+      request: async () => {
+        requestCount++;
+        return jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] });
+      },
+    });
+    assert.equal(requestCount, 1, 'restoring central configuration must drain the claimed outage job');
+    assert.equal(db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?')
+      .get('owned-central-unavailable').status, 'review');
   } finally {
     process.env.AGENT_EVENT_BASE_URL = originalBaseUrl;
   }

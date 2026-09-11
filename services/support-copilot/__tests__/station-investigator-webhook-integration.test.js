@@ -109,6 +109,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
   let unavailableConfigCount = 0;
   let outageConfigAvailable = false;
   let outageConversationId = null;
+  let accountingGroupAllowed = true;
   let child;
   let childOutput = '';
 
@@ -126,7 +127,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
         config: {
           enabled: true,
           agents: { stationSupport: true, accounting: false },
-          accountingGroupConversationIds: [CONVERSATION_ID],
+          accountingGroupConversationIds: accountingGroupAllowed ? [CONVERSATION_ID] : [],
           stationInvestigator: {
             enabled: true,
             autoSend: false,
@@ -399,6 +400,25 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(quotedJobCount, 1, 'quoted Contador replay must remain idempotent');
     assert.equal(quotedReplayStationCount, 0, 'quoted Contador replay must stay outside station ownership and quota');
     assert.equal(investigationCount, 2, 'quoted Contador replay must not reach the station investigator');
+
+    accountingGroupAllowed = false;
+    const disabledQuotedReplyId = `${MESSAGE_ID}-contador-disabled-reply`;
+    const disabledQuotedReply = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(disabledQuotedReplyId, quotedDraftExternalId)),
+    });
+    assert.equal(disabledQuotedReply.status, 201);
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const disabledQuotedProbe = new Database(DB_PATH, { readonly: true });
+    const disabledContadorCount = disabledQuotedProbe.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?')
+      .get(disabledQuotedReplyId).count;
+    const disabledStationCount = disabledQuotedProbe.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?')
+      .get(disabledQuotedReplyId).count;
+    disabledQuotedProbe.close();
+    assert.equal(disabledContadorCount, 0, 'current Agent Center false must override the legacy accounting group fallback');
+    assert.equal(disabledStationCount, 0, 'a quoted Contador continuation must not fall through to station ownership');
+    accountingGroupAllowed = true;
 
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare(`

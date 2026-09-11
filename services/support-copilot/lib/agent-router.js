@@ -35,9 +35,9 @@ class AgentConfigUnavailableError extends Error {
   }
 }
 
-async function loadConfig(brandId) {
+async function loadConfig(brandId, options = {}) {
   const cached = configCache.get(brandId);
-  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!options.fresh && cached && cached.expiresAt > Date.now()) return cached.value;
   if (!baseUrl() || !secret()) return null;
   try {
     const res = await fetch(`${baseUrl()}/api/agents/config?brandId=${encodeURIComponent(brandId)}`, {
