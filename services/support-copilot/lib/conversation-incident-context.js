@@ -9,7 +9,7 @@ const STATION_STATE_WORDS = [
   'perdeu', 'falhou', 'funciona', 'comunicou',
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
-const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o';
+const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o|se';
 const STATION_INTERROGATIVE_PATTERN = 'qual|quais|algum(?:a|as)?|onde|que|por\\s+qu[eê]|como|quando|quem';
 const STATION_INTERROGATIVE_PREFIX_PATTERN = new RegExp(`^(?:${STATION_INTERROGATIVE_PATTERN})\\b`, 'i');
 const STATION_NON_NAME_FRAGMENT_PATTERN = [
