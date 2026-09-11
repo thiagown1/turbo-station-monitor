@@ -215,6 +215,8 @@ test('strips leading status predicates between a state verb and the venue', asyn
     'Está dando erro o Habibs?',
     'Parou de comunicar o Habibs?',
     'Perdeu comunicação o Habibs?',
+    'Está sem energia no Habibs?',
+    'Está sem comunicação na estação do Habibs?',
   ];
 
   for (const [index, body] of scenarios.entries()) {
