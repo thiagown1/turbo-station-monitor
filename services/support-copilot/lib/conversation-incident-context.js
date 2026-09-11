@@ -7,7 +7,8 @@ const STATION_STATE_WORDS = [
   'desarmou', 'caiu', 'parou', 'voltou', 'está', 'esta', 'tá', 'ta',
   'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
   'perdeu', 'falhou', 'funciona', 'comunicou',
-  'deu\\s+(?:erro|falha|problema)', 'apresentou\\s+(?:erro|falha|problema)',
+  'deu\\s+(?:erro|falha|problema)', 'teve\\s+(?:erro|falha|problema)',
+  'apresentou\\s+(?:erro|falha|problema)',
 ];
 const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
 const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o|se';
@@ -195,7 +196,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^(?:pessoal|gente|por\s+(?:favor|gentileza))[\s,.;:!?…\-–—]+/i, '')
         .replace(/^(?:eu\s+)?(?:acho|parece)\s+que\s+/i, '')
         .replace(/^(?:algu[eé]m\s+sabe|queria\s+saber)\s+se\s+/i, '')
-        .replace(/^(?:por\s+(?:favor|gentileza)[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^(?:por\s+(?:favor|gentileza)[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como|qual(?:is)?)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
         .replace(new RegExp(`^(?:ess[ae]|aquel[ae])\\s+(?=(?:${STATION_NOUN_PREFIX_PATTERN})\\b)`, 'i'), '')
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')

@@ -421,8 +421,8 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
       headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
       body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
     });
-    assert.equal(unavailableQuotedReplay.status, 503, 'quoted Contador replay must fail closed without fresh authority');
-    assert.equal((await unavailableQuotedReplay.json()).error, 'duplicate_recovery_failed');
+    assert.equal(unavailableQuotedReplay.status, 200, 'durably owned replay must not wait for fresh authority');
+    assert.equal((await unavailableQuotedReplay.json()).duplicate, true);
     forceConfigUnavailable = false;
 
     returnNullConfig = true;
@@ -431,8 +431,8 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
       headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
       body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
     });
-    assert.equal(nullConfigQuotedReplay.status, 503, 'quoted Contador replay must reject a null fresh config');
-    assert.equal((await nullConfigQuotedReplay.json()).error, 'duplicate_recovery_failed');
+    assert.equal(nullConfigQuotedReplay.status, 200, 'durably owned replay must not reload a null config');
+    assert.equal((await nullConfigQuotedReplay.json()).duplicate, true);
     returnNullConfig = false;
 
     accountingGroupAllowed = false;

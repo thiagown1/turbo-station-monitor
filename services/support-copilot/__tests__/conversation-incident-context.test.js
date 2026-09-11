@@ -129,6 +129,7 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Eu acho que o Habibs caiu?', 'Habibs'],
     ['Por gentileza, o Habibs caiu?', 'Habibs'],
     ['Habibs deu erro?', 'Habibs'],
+    ['Habibs teve erro?', 'Habibs'],
     ['O Habibs apresentou erro?', 'Habibs'],
     ['Habibs ainda está offline?', 'Habibs'],
     ['Habibs já voltou?', 'Habibs'],
@@ -200,6 +201,7 @@ test('parses every supported station state before the venue', async (t) => {
     'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
     'perdeu', 'falhou', 'funciona', 'comunicou', 'anda',
     'deu erro', 'deu falha', 'deu problema',
+    'teve erro', 'teve falha', 'teve problema',
     'apresentou erro', 'apresentou falha', 'apresentou problema',
   ];
 

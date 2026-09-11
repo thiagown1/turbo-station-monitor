@@ -228,6 +228,18 @@ function quotedOutboundMessage(message, conversationId) {
   return { ...row, draftId };
 }
 
+function durableReplayOwner(localMessageId, externalMessageId) {
+  return db.prepare(`
+    SELECT 'station' owner FROM station_investigation_jobs
+      WHERE message_id = ? AND status <> 'claimed'
+    UNION ALL
+    SELECT 'media' owner FROM agent_media_jobs WHERE message_id = ?
+    UNION ALL
+    SELECT 'contador' owner FROM contador_jobs WHERE message_id = ?
+    LIMIT 1
+  `).get(externalMessageId, localMessageId, externalMessageId) || null;
+}
+
 function recentConversationContext(conversationId) {
   try {
     const recentMsgs = db.prepare(
@@ -377,6 +389,9 @@ router.post('/', async (req, res) => {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
         if (direction === 'inbound') {
+          if (durableReplayOwner(dup.id, externalMessageId)) {
+            return res.json({ id: dup.id, conversationId, duplicate: true });
+          }
           const stationInput = {
             messageId: externalMessageId, conversationId, brandId, groupJid,
             instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
