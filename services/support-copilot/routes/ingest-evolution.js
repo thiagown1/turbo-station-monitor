@@ -400,7 +400,9 @@ router.post('/', async (req, res) => {
             await (async () => {
               const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
               const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
-              const sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : {}).catch(() => null);
+              const sharedAgentConfig = quotedContadorReply
+                ? await loadConfig(brandId, { fresh: true })
+                : await loadConfig(brandId).catch(() => null);
               contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
               if (quotedContadorReply) {
                 enqueueContadorMessage(contadorEvent);
@@ -556,7 +558,9 @@ router.post('/', async (req, res) => {
       }
       const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
       const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
-      const sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : {}).catch(() => null);
+      const sharedAgentConfig = quotedContadorReply
+        ? await loadConfig(brandId, { fresh: true })
+        : await loadConfig(brandId).catch(() => null);
       contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
       if (quotedContadorReply) {
         // Resolve authenticated Contador continuations before the stateful

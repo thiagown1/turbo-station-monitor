@@ -110,12 +110,17 @@ function quotedContadorPayload(messageId, quotedMessageId) {
   let outageConfigAvailable = false;
   let outageConversationId = null;
   let accountingGroupAllowed = true;
+  let forceConfigUnavailable = false;
   let child;
   let childOutput = '';
 
   const central = jsonServer((req, res, body) => {
     assert.equal(req.headers.authorization, `Bearer ${AGENT_SECRET}`);
     if (req.method === 'GET' && req.url.startsWith('/api/agents/config?')) {
+      if (forceConfigUnavailable) {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
+      }
       const requestedBrand = new URL(req.url, 'http://central.test').searchParams.get('brandId');
       if (requestedBrand === 'unavailable_brand' && !outageConfigAvailable) {
         unavailableConfigCount += 1;
@@ -400,6 +405,16 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(quotedJobCount, 1, 'quoted Contador replay must remain idempotent');
     assert.equal(quotedReplayStationCount, 0, 'quoted Contador replay must stay outside station ownership and quota');
     assert.equal(investigationCount, 2, 'quoted Contador replay must not reach the station investigator');
+
+    forceConfigUnavailable = true;
+    const unavailableQuotedReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
+    });
+    assert.equal(unavailableQuotedReplay.status, 503, 'quoted Contador replay must fail closed without fresh authority');
+    assert.equal((await unavailableQuotedReplay.json()).error, 'duplicate_recovery_failed');
+    forceConfigUnavailable = false;
 
     accountingGroupAllowed = false;
     const disabledQuotedReplyId = `${MESSAGE_ID}-contador-disabled-reply`;
