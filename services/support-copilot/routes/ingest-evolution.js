@@ -396,37 +396,42 @@ router.post('/', async (req, res) => {
             replyToContador: quoted?.source === 'contador',
             quotedContadorDraftId: quoted?.draftId || null,
           };
-          void (async () => {
-            const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
-            const sharedAgentConfig = await loadConfig(brandId, { fresh: true }).catch(() => null);
-            contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
-            if (isQuotedContadorDraftReply(contadorEvent)) {
-              enqueueContadorMessage(contadorEvent);
-              return;
-            }
-            let prepared;
-            try {
-              prepared = await prepareStationInvestigation(stationInput, {
+          try {
+            await (async () => {
+              const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+              const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
+              const sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : {}).catch(() => null);
+              contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
+              if (quotedContadorReply) {
+                enqueueContadorMessage(contadorEvent);
+                return;
+              }
+              const prepared = await prepareStationInvestigation(stationInput, {
                 loadConfig: async () => sharedAgentConfig,
               });
-            } catch (err) {
-              console.warn(`${LOG_TAG} duplicate investigator preflight failed for ${dup.id}:`, err.message);
-            }
-            if (prepared?.claimed) {
-              await routeStationInvestigation(stationInput, { prepared });
-              return;
-            }
-            if (media && ['image', 'document'].includes(media.media_type)) {
-              const { routeInboundMessageDurably } = require('../lib/agent-router');
-              await routeInboundMessageDurably({
-                messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
-                instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
-                replyToContador: contadorEvent.replyToContador,
-                quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
-                deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
-              });
-            }
-          })().catch(err => console.warn(`${LOG_TAG} duplicate recovery failed for ${dup.id}:`, err.message));
+              if (prepared?.claimed) {
+                void routeStationInvestigation(stationInput, { prepared })
+                  .catch(err => console.warn(`${LOG_TAG} duplicate station recovery failed for ${dup.id}:`, err.message));
+                return;
+              }
+              if (media && ['image', 'document'].includes(media.media_type)) {
+                const { routeInboundMessageDurably } = require('../lib/agent-router');
+                const recoveryInput = {
+                  messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
+                  instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+                  replyToContador: contadorEvent.replyToContador,
+                  quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+                  deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+                };
+                await routeInboundMessageDurably(recoveryInput, { enqueueOnly: true });
+                void routeInboundMessageDurably(recoveryInput)
+                  .catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
+              }
+            })();
+          } catch (err) {
+            console.warn(`${LOG_TAG} duplicate recovery failed for ${dup.id}:`, err.message);
+            return res.status(503).json({ error: 'duplicate_recovery_failed' });
+          }
         }
         return res.json({ id: dup.id, conversationId, duplicate: true });
       }
@@ -550,9 +555,10 @@ router.post('/', async (req, res) => {
         }
       }
       const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
-      const sharedAgentConfig = await loadConfig(brandId, { fresh: true }).catch(() => null);
+      const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
+      const sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : {}).catch(() => null);
       contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
-      if (isQuotedContadorDraftReply(contadorEvent)) {
+      if (quotedContadorReply) {
         // Resolve authenticated Contador continuations before the stateful
         // station preflight so they cannot reserve station quota or ownership.
         const contadorRoute = enqueueContadorMessage(contadorEvent);

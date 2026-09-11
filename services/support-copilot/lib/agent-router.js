@@ -464,10 +464,11 @@ async function processMediaJob(messageId) {
   }
 }
 
-function routeInboundMessageDurably(input) {
+function routeInboundMessageDurably(input, options = {}) {
   if (!persistMediaJob(input)) {
     return Promise.resolve({ skipped: true, reason: 'station_pipeline_owned', fallbackHandled: true });
   }
+  if (options.enqueueOnly) return Promise.resolve({ queued: true });
   if (Date.now() < mediaModelUnavailableUntil) {
     return Promise.resolve({ queued: true, waitingForModel: true });
   }

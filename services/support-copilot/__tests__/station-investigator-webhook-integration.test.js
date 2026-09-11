@@ -420,6 +420,32 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(disabledStationCount, 0, 'a quoted Contador continuation must not fall through to station ownership');
     accountingGroupAllowed = true;
 
+    const crashGapReplayId = `${MESSAGE_ID}-crash-gap-media`;
+    const crashGapLocalId = `${crashGapReplayId}-local`;
+    const crashGapSetup = new Database(DB_PATH);
+    crashGapSetup.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body,
+       external_message_id, media_json, created_at)
+      VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, ?, ?, ?, ?)`)
+      .run(
+        crashGapLocalId, CONVERSATION_ID,
+        '[Luan]: evidência do carregador', 'evidência do carregador', crashGapReplayId,
+        JSON.stringify({ media_type: 'image', url: '/tmp/crash-gap.jpg' }), new Date().toISOString(),
+      );
+    crashGapSetup.close();
+    const crashGapReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(webhookPayload(crashGapReplayId, false, true)),
+    });
+    assert.equal(crashGapReplay.status, 200);
+    assert.equal((await crashGapReplay.json()).duplicate, true);
+    const crashGapProbe = new Database(DB_PATH, { readonly: true });
+    const crashGapJobCount = crashGapProbe.prepare('SELECT COUNT(*) count FROM agent_media_jobs WHERE message_id = ?')
+      .get(crashGapLocalId).count;
+    crashGapProbe.close();
+    assert.equal(crashGapJobCount, 1, 'duplicate acknowledgement must follow the durable recovery enqueue');
+
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare(`
       SELECT status, decision, confidence, station_ids_json, response_sent_at, response_external_message_id
