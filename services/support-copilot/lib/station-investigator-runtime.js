@@ -18,7 +18,9 @@ function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   const since = new Date(Date.now() - DAILY_QUOTA_WINDOW_MS).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
     WHERE brand_id = ? AND COALESCE(quota_reserved_at, created_at) >= ?
-      AND status <> 'claimed' AND message_id <> ?`)
+      AND status <> 'claimed'
+      AND NOT (status='failed' AND quota_reserved_at IS NULL)
+      AND message_id <> ?`)
     .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
 }
@@ -98,6 +100,14 @@ function releaseDailySlot(messageId) {
     .run(nowIso(), messageId);
 }
 
+function failStaleReservedWithoutChargingQuota(job, reason) {
+  const failedAt = nowIso();
+  db.prepare(`UPDATE station_investigation_jobs
+    SET status='failed', quota_reserved_at=NULL, next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status='reserved' AND updated_at=?`)
+    .run(failedAt, reason, failedAt, job.message_id, job.updated_at);
+}
+
 function leaseExpired(job, now = Date.now()) {
   const updatedAt = Date.parse(job?.updated_at || '');
   return Number.isFinite(updatedAt) && updatedAt <= now - PROCESSING_LEASE_MS;
@@ -166,6 +176,7 @@ async function prepareStationInvestigation(input, deps = {}) {
   }
   if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
   if (!baseUrl() || !secret()) return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
+  const staleReserved = prior?.status === 'reserved' && resumableInFlight;
   let reservedDailySlot = false;
   if (!prior || prior.status === 'claimed') {
     const reservation = reserveDailySlot(input.messageId, input.brandId, Number(policy.dailyLimit ?? 20));
@@ -182,10 +193,12 @@ async function prepareStationInvestigation(input, deps = {}) {
     context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
   } catch {
     if (reservedDailySlot) releaseDailySlot(input.messageId);
+    else if (staleReserved) failStaleReservedWithoutChargingQuota(prior, 'context_failed');
     return { claimed, ready: false, result: { skipped: true, reason: 'context_failed' } };
   }
   if (context.contextConfidence === 'low') {
     if (reservedDailySlot) releaseDailySlot(input.messageId);
+    else if (staleReserved) failStaleReservedWithoutChargingQuota(prior, 'low_context_confidence');
     return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
   }
   if ((prior?.status === 'retry' || resumableInFlight) && quotaReservationExpired(prior)) {

@@ -1018,6 +1018,30 @@ test('does not reacquire expired retry quota when context fails before analysis'
     .get(messageId).quota_reserved_at, oldReservation);
 });
 
+test('releases a stale reservation when context fails before analysis', async () => {
+  const messageId = 'stale-reserved-invalid-context';
+  const brandId = `${messageId}-brand`;
+  const staleAt = new Date(Date.now() - 3 * 60_000).toISOString();
+  const freshReservation = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+     next_attempt_at, quota_reserved_at, created_at, updated_at)
+    VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'reserved', 0, ?, ?, ?, ?)`)
+    .run(messageId, brandId, staleAt, freshReservation, staleAt, staleAt);
+
+  const result = await routeStationInvestigation({ ...input(messageId), brandId }, {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: () => { throw new Error('stale reserved context'); },
+  });
+
+  assert.equal(result.reason, 'context_failed');
+  assert.deepEqual(
+    db.prepare('SELECT status, quota_reserved_at FROM station_investigation_jobs WHERE message_id = ?').get(messageId),
+    { status: 'failed', quota_reserved_at: null },
+  );
+  assert.equal(dailyLimitReached(brandId, 1), false);
+});
+
 test('does not overwrite a concurrent station transition while finalizing stale context', async () => {
   const messageId = 'context-finalization-cas';
   const brandId = `${messageId}-brand`;

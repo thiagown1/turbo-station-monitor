@@ -20,6 +20,7 @@ const STATION_NON_NAME_FRAGMENT_PATTERN = [
   'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
   'com\\s+(?:falha|problema|erro)',
   'dando\\s+(?:falha|problema|erro)', 'de\\s+comunicar', 'comunica[cç][aã]o',
+  'funcionar', 'de\\s+funcionar', 'sem\\s+funcionar',
   'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
   'tudo', 'todos?', 'todas?', 'algo', 'nada', 'todo\\s+mundo',
   'ess(?:e|a|es|as)', 'aquel(?:e|a|es|as)', 'isto', 'isso', 'aquilo',
