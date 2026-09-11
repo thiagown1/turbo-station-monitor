@@ -223,6 +223,26 @@ test('accepts modifiers before state-first station questions', async (t) => {
   }
 });
 
+test('strips modifiers before subject-first station questions', async (t) => {
+  const scenarios = [
+    'Hoje o Habibs caiu?',
+    'Ontem o Habibs caiu?',
+    'Ainda o Habibs está offline?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `modified-subject-first-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
 test('strips leading status predicates between a state verb and the venue', async (t) => {
   const scenarios = [
     'Está offline o Habibs?',
