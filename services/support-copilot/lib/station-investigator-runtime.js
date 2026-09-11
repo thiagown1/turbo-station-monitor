@@ -6,6 +6,7 @@ const { sendText } = require('./evolution-client');
 
 const PROCESSING_LEASE_MS = 120_000;
 const STATION_JOB_MAX_ATTEMPTS = 5;
+const STATION_POLICY_RETRY_MS = 5 * 60_000;
 let deliveringStationInvestigations = false;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
@@ -228,6 +229,15 @@ function failDueJobIfUnchanged(job, reason) {
     .run(updatedAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
 }
 
+function rescheduleDueJobIfUnchanged(job, reason) {
+  const updatedAt = nowIso();
+  const nextAttemptAt = new Date(Date.now() + STATION_POLICY_RETRY_MS).toISOString();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='retry', next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status=? AND updated_at=?`)
+    .run(nextAttemptAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
+}
+
 async function deliverDueStationInvestigations(deps = {}) {
   if (deliveringStationInvestigations) return;
   deliveringStationInvestigations = true;
@@ -262,6 +272,8 @@ async function deliverDueStationInvestigations(deps = {}) {
       }, deps);
       if (['context_failed', 'low_context_confidence', 'structured_mention_required'].includes(result?.reason)) {
         failDueJobIfUnchanged(job, result.reason);
+      } else if (result?.skipped) {
+        rescheduleDueJobIfUnchanged(job, result.reason || 'policy_blocked');
       }
     }
   } finally {

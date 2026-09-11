@@ -779,6 +779,75 @@ test('finalizes due station jobs with invalid reconstructed evidence', async () 
   }
 });
 
+test('backs off policy-blocked jobs so a later eligible retry can run', async () => {
+  const staleAt = new Date(0).toISOString();
+  const createdAt = new Date().toISOString();
+  const blocked = [
+    { messageId: 'blocked-global-disabled', policy: { globalEnabled: false }, reason: 'disabled' },
+    { messageId: 'blocked-agent-disabled', policy: { agentEnabled: false }, reason: 'disabled' },
+    { messageId: 'blocked-investigator-disabled', policy: { investigatorEnabled: false }, reason: 'disabled' },
+    { messageId: 'blocked-conversation', policy: { allowed: false }, reason: 'conversation_not_allowed' },
+    { messageId: 'blocked-kill-switch', policy: { killSwitch: true }, reason: 'send_disabled' },
+  ];
+  const eligible = { messageId: 'eligible-after-policy-blockers', policy: {} };
+  for (const [index, item] of [...blocked, eligible].entries()) {
+    const brandId = `${item.messageId}-brand`;
+    const itemCreatedAt = new Date(Date.parse(createdAt) + index * 1_000).toISOString();
+    db.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body, external_message_id,
+       provider_timestamp, mentioned_jids_json, is_forwarded, forwarding_score,
+       sender_id, sender_name, created_at)
+      VALUES (?, 'conv-pilot', ?, 'inbound', 'evolution', ?, ?, ?, ?, ?, 0, 0, ?, 'Luan', ?)`)
+      .run(
+        `${item.messageId}-local`, brandId,
+        '[Luan]: @Turbo Station Suporte Habibs caiu?', '@Turbo Station Suporte Habibs caiu?',
+        item.messageId, staleAt, JSON.stringify(['support-bot@s.whatsapp.net']),
+        '5511999999999@s.whatsapp.net', staleAt,
+      );
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 1, ?, ?, ?)`)
+      .run(item.messageId, brandId, staleAt, itemCreatedAt, staleAt);
+  }
+  const policyByBrand = new Map([...blocked, eligible].map((item) => [`${item.messageId}-brand`, item.policy]));
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async (brandId) => {
+      const policy = policyByBrand.get(brandId) || {};
+      const loaded = config({
+        killSwitch: policy.killSwitch === true,
+        allowedConversationIds: policy.allowed === false ? ['another-conversation'] : ['conv-pilot'],
+      });
+      loaded.enabled = policy.globalEnabled !== false;
+      loaded.agents.stationSupport = policy.agentEnabled !== false;
+      loaded.stationInvestigator.enabled = policy.investigatorEnabled !== false;
+      return loaded;
+    },
+    buildContext: (_conversationId, messageId) => context(messageId),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] });
+    },
+  };
+
+  await deliverDueStationInvestigations(deps);
+  assert.equal(requestCount, 0, 'the first batch contains only the five oldest blocked jobs');
+  const afterFirstBatch = blocked.map((item) => db.prepare(
+    'SELECT status, next_attempt_at, last_error FROM station_investigation_jobs WHERE message_id = ?',
+  ).get(item.messageId));
+  for (const [index, job] of afterFirstBatch.entries()) {
+    assert.equal(job.status, 'retry');
+    assert.ok(Date.parse(job.next_attempt_at) > Date.now());
+    assert.equal(job.last_error, blocked[index].reason);
+  }
+
+  await deliverDueStationInvestigations(deps);
+  assert.equal(requestCount, 1, 'the eligible sixth job must run on the next worker pass');
+  assert.equal(db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?')
+    .get(eligible.messageId).status, 'review');
+});
+
 test('does not overwrite a concurrent station transition while finalizing stale context', async () => {
   const messageId = 'context-finalization-cas';
   const brandId = `${messageId}-brand`;
