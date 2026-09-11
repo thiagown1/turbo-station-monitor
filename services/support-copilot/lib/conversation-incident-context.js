@@ -141,6 +141,7 @@ function stateFirstStationName(raw) {
     previous = name;
     name = name
       .replace(leadingPredicate, '')
+      .replace(/^(?:ao\s+normal|ao\s+ar)(?:\s+(?:o|a))?\s+/i, '')
       .replace(/^(?:no|na)\s+/i, '')
       .replace(leadingStationNouns, '')
       .replace(trailingPredicate, '')
