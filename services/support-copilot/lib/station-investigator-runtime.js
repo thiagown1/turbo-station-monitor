@@ -161,14 +161,6 @@ async function prepareStationInvestigation(input, deps = {}) {
       return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
     }
     reservedDailySlot = true;
-  } else if ((prior.status === 'retry' || resumableInFlight) && quotaReservationExpired(prior)) {
-    const reservation = reacquireDailySlot(prior, input.brandId, Number(policy.dailyLimit ?? 20));
-    if (!reservation.acquired) {
-      if (!reservation.limitReached) {
-        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
-      }
-      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
-    }
   }
   let context;
   try {
@@ -180,6 +172,15 @@ async function prepareStationInvestigation(input, deps = {}) {
   if (context.contextConfidence === 'low') {
     if (reservedDailySlot) releaseDailySlot(input.messageId);
     return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
+  }
+  if ((prior?.status === 'retry' || resumableInFlight) && quotaReservationExpired(prior)) {
+    const reservation = reacquireDailySlot(prior, input.brandId, Number(policy.dailyLimit ?? 20));
+    if (!reservation.acquired) {
+      if (!reservation.limitReached) {
+        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
+      }
+      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+    }
   }
   return { claimed, ready: true, policy, mentionedJid, context };
 }
