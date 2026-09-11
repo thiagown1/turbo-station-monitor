@@ -186,6 +186,16 @@ async function prepareStationInvestigation(input, deps = {}) {
       result: { skipped: true, reason: 'config_unavailable' },
     };
   }
+  if (!config) {
+    if (prior?.status === 'claimed') {
+      queueClaimedRetry(input.messageId, 'config_unavailable: empty_config');
+    }
+    return {
+      claimed: claimedByPriorJob,
+      ready: false,
+      result: { skipped: true, reason: 'config_unavailable' },
+    };
+  }
   const policy = config?.stationInvestigator;
   if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) {
     return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'disabled' } };

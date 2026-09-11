@@ -306,6 +306,29 @@ test('queues a crash-gap claim when configuration loading fails', async () => {
   );
 });
 
+test('queues a crash-gap claim when configuration loading returns no config', async () => {
+  const messageId = 'claimed-with-empty-config';
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO station_investigation_jobs
+    (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'claimed', 0, ?, ?, ?)`)
+    .run(messageId, 'conv-pilot', 'turbo_station', '120363000000000000@g.us', 'turbostation', now, now, now);
+
+  const prepared = await prepareStationInvestigation(input(messageId), {
+    loadConfig: async () => null,
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: true,
+    ready: false,
+    result: { skipped: true, reason: 'config_unavailable' },
+  });
+  assert.deepEqual(
+    db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?').get(messageId),
+    { status: 'retry', last_error: 'config_unavailable: empty_config' },
+  );
+});
+
 test('keeps a retry job claimed when the investigator is currently disabled', async () => {
   const messageId = 'retry-owned-while-disabled';
   const now = new Date().toISOString();

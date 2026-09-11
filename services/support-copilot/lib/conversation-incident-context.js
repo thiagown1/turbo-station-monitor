@@ -23,7 +23,7 @@ const STATION_NON_NAME_FRAGMENT_PATTERN = [
   'com\\s+(?:falha|problema|erro)',
   'dando\\s+(?:falha|problema|erro)', 'de\\s+comunicar', 'comunica[cç][aã]o',
   'funcionar', 'de\\s+funcionar', 'sem\\s+funcionar',
-  'por\\s+(?:causa|conta)(?:\\s+d[aeo])?(?:\\s+.+)?',
+  'por\\s+(?:causa|conta|falta|motivo)(?:\\s+d[aeo])?(?:\\s+.+)?',
   'porque(?:\\s+.+)?',
   'devido\\s+(?:[àa]|ao|aos|[àa]s)(?:\\s+.+)?',
   'durante(?:\\s+.+)?', 'ap[oó]s(?:\\s+.+)?',
@@ -143,7 +143,7 @@ function stateFirstStationName(raw) {
   const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i');
   const leadingStationNouns = new RegExp(`^${STATION_NOUN_SEQUENCE_PATTERN}`, 'i');
   let name = String(raw || '').trim();
-  if (/^(?:por\s+(?:causa|conta)\b|porque\b|devido\s+(?:[àa]|ao|aos|[àa]s)(?=\s|$)|durante\b|ap[oó]s\b|(?:depois|antes)\s+d[aeo]\b|desde\b)/i.test(name)) return '';
+  if (/^(?:(?:por|porque|devido|durante|ap[oó]s|depois|antes|desde|quando|enquanto)\b|at[eé](?=\s|$))/i.test(name)) return '';
   let previous;
   do {
     previous = name;
