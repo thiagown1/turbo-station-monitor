@@ -124,6 +124,8 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Consegue verificar pra gente se a Livebox voltou?', 'Livebox'],
     ['BIG BOX voltou ao normal?', 'BIG BOX'],
     ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
+    ['Acho que o Habibs caiu?', 'Habibs'],
+    ['Parece que o Habibs caiu?', 'Habibs'],
     ['Habibs ainda está offline?', 'Habibs'],
     ['Habibs já voltou?', 'Habibs'],
     ['Habibs não voltou?', 'Habibs'],
