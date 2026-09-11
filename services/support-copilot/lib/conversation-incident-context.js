@@ -147,9 +147,11 @@ function stateFirstStationName(raw) {
   if (/^(?:(?:de|pela?|na)\s+(?:madrugada|manh[aã]|tarde|noite)|[àa]\s+(?:tarde|noite))\b/i.test(name)) return '';
   if (/^(?:[àa]s?\s+)?\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?(?=\s|$)/i.test(name)) return '';
   if (/^(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)\b/i.test(name)) return '';
+  if (/^(?:h[aá]|faz)\s+(?:pouco|instantes?|algum\s+tempo)\b/i.test(name)) return '';
   name = name
     .replace(/\s+(?:(?:[àa]s\s+\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?)|(?:\d{1,2}(?::\d{2}|\s*h(?:oras?)?)))$/i, '')
     .replace(/\s+(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)$/i, '')
+    .replace(/\s+(?:h[aá]|faz)\s+(?:pouco|instantes?|algum\s+tempo)$/i, '')
     .trim();
   let previous;
   do {
@@ -206,7 +208,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
         .replace(/^(?:pessoal|gente|por\s+(?:favor|gentileza))[\s,.;:!?…\-–—]+/i, '')
         .replace(/^(?:eu\s+)?(?:acho|parece)\s+que\s+/i, '')
-        .replace(/^(?:algu[eé]m\s+sabe|queria\s+saber)\s+se\s+/i, '')
+        .replace(/^(?:algu[eé]m\s+sabe|(?:eu\s+)?queria\s+saber|(?:eu\s+)?gostaria\s+de\s+saber)\s+se\s+/i, '')
         .replace(/^(?:por\s+(?:favor|gentileza)[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como|qual(?:is)?)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
         .replace(new RegExp(`^(?:ess[ae]|aquel[ae])\\s+(?=(?:${STATION_NOUN_PREFIX_PATTERN})\\b)`, 'i'), '')
