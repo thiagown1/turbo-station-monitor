@@ -35,7 +35,7 @@ const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const {
   enqueueContadorMessage,
   canRouteContadorEvent,
-  isQuotedContadorDraftReply,
+  hasQuotedContadorDraftReply,
   sendReply,
 } = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
@@ -399,7 +399,7 @@ router.post('/', async (req, res) => {
           try {
             await (async () => {
               const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
-              const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
+              const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
               const sharedAgentConfig = quotedContadorReply
                 ? await loadConfig(brandId, { fresh: true })
                 : await loadConfig(brandId).catch(() => null);
@@ -560,7 +560,7 @@ router.post('/', async (req, res) => {
         }
       }
       const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
-      const quotedContadorReply = isQuotedContadorDraftReply(contadorEvent);
+      const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
       const sharedAgentConfig = quotedContadorReply
         ? await loadConfig(brandId, { fresh: true })
         : await loadConfig(brandId).catch(() => null);

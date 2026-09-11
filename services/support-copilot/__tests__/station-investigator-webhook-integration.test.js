@@ -11,6 +11,8 @@ const { spawn } = require('node:child_process');
 const SERVICE_DIR = path.join(__dirname, '..');
 const GROUP_JID = '120363-habibs-pilot@g.us';
 const CONVERSATION_ID = 'conv-habibs-pilot';
+const CENTRAL_ACCOUNTING_GROUP_JID = '120363-central-accounting@g.us';
+const CENTRAL_ACCOUNTING_CONVERSATION_ID = 'conv-central-accounting';
 const BOT_JID = 'support-bot@s.whatsapp.net';
 const MESSAGE_ID = `wamid-habibs-${process.pid}-${Date.now()}`;
 const DB_PATH = path.join(os.tmpdir(), `station-investigator-webhook-${process.pid}-${Date.now()}.sqlite`);
@@ -78,13 +80,13 @@ function webhookPayload(messageId, structuredMention = true, withMedia = false) 
   };
 }
 
-function quotedContadorPayload(messageId, quotedMessageId) {
+function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID) {
   return {
     event: 'messages.upsert',
     instance: 'turbostation',
     data: {
       key: {
-        remoteJid: GROUP_JID,
+        remoteJid: groupJid,
         fromMe: false,
         id: messageId,
         participant: '5561999999999@s.whatsapp.net',
@@ -137,7 +139,9 @@ function quotedContadorPayload(messageId, quotedMessageId) {
         config: {
           enabled: true,
           agents: { stationSupport: true, accounting: false },
-          accountingGroupConversationIds: accountingGroupAllowed ? [CONVERSATION_ID] : [],
+          accountingGroupConversationIds: accountingGroupAllowed
+            ? [CONVERSATION_ID, CENTRAL_ACCOUNTING_CONVERSATION_ID]
+            : [],
           stationInvestigator: {
             enabled: true,
             autoSend: false,
@@ -449,6 +453,49 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(disabledContadorCount, 0, 'current Agent Center false must override the legacy accounting group fallback');
     assert.equal(disabledStationCount, 0, 'a quoted Contador continuation must not fall through to station ownership');
     accountingGroupAllowed = true;
+
+    const centralDraftId = `${MESSAGE_ID}-central-contador-draft`;
+    const centralReplyId = `${MESSAGE_ID}-central-contador-reply`;
+    const centralSetup = new Database(DB_PATH);
+    centralSetup.transaction(() => {
+      centralSetup.prepare(`INSERT INTO conversations
+        (id, brand_id, channel, external_conversation_id, customer_phone, customer_name,
+         status, created_at, updated_at)
+        VALUES (?, 'turbo_station', 'whatsapp-group', ?, ?, 'Central Accounting', 'open', ?, ?)`).run(
+        CENTRAL_ACCOUNTING_CONVERSATION_ID, CENTRAL_ACCOUNTING_GROUP_JID,
+        CENTRAL_ACCOUNTING_GROUP_JID, new Date().toISOString(), new Date().toISOString(),
+      );
+      centralSetup.prepare(`INSERT INTO messages
+        (id, conversation_id, brand_id, direction, source, body, raw_body,
+         external_message_id, media_json, delivery_status, created_at)
+        VALUES (?, ?, 'turbo_station', 'outbound', 'contador', ?, ?, ?, ?, 'sent', ?)`).run(
+        `${centralDraftId}-local`, CENTRAL_ACCOUNTING_CONVERSATION_ID,
+        'Qual estação devo considerar?', 'Qual estação devo considerar?', centralDraftId,
+        JSON.stringify({ contador: { kind: 'draft_prompt', draftId: 'draft-central' } }),
+        new Date().toISOString(),
+      );
+      centralSetup.prepare(`INSERT INTO messages
+        (id, conversation_id, brand_id, direction, source, body, raw_body,
+         external_message_id, created_at)
+        VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, ?, ?, ?)`).run(
+        `${centralReplyId}-local`, CENTRAL_ACCOUNTING_CONVERSATION_ID,
+        '[Luan]: é do Habibs', 'é do Habibs', centralReplyId, new Date().toISOString(),
+      );
+    })();
+    centralSetup.close();
+    const centralReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(centralReplyId, centralDraftId, CENTRAL_ACCOUNTING_GROUP_JID)),
+    });
+    assert.equal(centralReplay.status, 200);
+    assert.equal((await centralReplay.json()).duplicate, true);
+    const centralProbe = new Database(DB_PATH, { readonly: true });
+    assert.equal(centralProbe.prepare('SELECT COUNT(*) count FROM contador_jobs WHERE message_id = ?')
+      .get(centralReplyId).count, 1, 'central-only accounting groups must recover quoted replies');
+    assert.equal(centralProbe.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?')
+      .get(centralReplyId).count, 0, 'central-only Contador replies must not fall through to station routing');
+    centralProbe.close();
 
     const crashGapReplayId = `${MESSAGE_ID}-crash-gap-media`;
     const crashGapLocalId = `${crashGapReplayId}-local`;

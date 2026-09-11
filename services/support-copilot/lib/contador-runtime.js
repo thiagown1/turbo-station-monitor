@@ -59,13 +59,17 @@ function canRouteContadorEvent(event) {
   return Boolean(configured() && event?.direction === 'inbound' && event?.groupJid === config.groupConversationId);
 }
 
-function isQuotedContadorDraftReply(event) {
+function hasQuotedContadorDraftReply(event) {
   return Boolean(
-    canRouteContadorEvent(event)
+    event?.direction === 'inbound'
     && event?.replyToContador
     && typeof event?.quotedContadorDraftId === 'string'
     && event.quotedContadorDraftId.trim()
   );
+}
+
+function isQuotedContadorDraftReply(event) {
+  return Boolean(canRouteContadorEvent(event) && hasQuotedContadorDraftReply(event));
 }
 
 async function postNext(route, body) {
@@ -806,6 +810,7 @@ module.exports = {
   config,
   configured,
   canRouteContadorEvent,
+  hasQuotedContadorDraftReply,
   isQuotedContadorDraftReply,
   enqueueContadorMessage,
   processPendingJobs,
