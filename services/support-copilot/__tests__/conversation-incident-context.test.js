@@ -126,6 +126,10 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['Será que o Primor QNM 33 desarmou?', 'Primor QNM 33'],
     ['Acho que o Habibs caiu?', 'Habibs'],
     ['Parece que o Habibs caiu?', 'Habibs'],
+    ['Eu acho que o Habibs caiu?', 'Habibs'],
+    ['Por gentileza, o Habibs caiu?', 'Habibs'],
+    ['Habibs deu erro?', 'Habibs'],
+    ['O Habibs apresentou erro?', 'Habibs'],
     ['Habibs ainda está offline?', 'Habibs'],
     ['Habibs já voltou?', 'Habibs'],
     ['Habibs não voltou?', 'Habibs'],
@@ -195,6 +199,8 @@ test('parses every supported station state before the venue', async (t) => {
     'desarmou', 'caiu', 'parou', 'voltou', 'está', 'esta', 'tá', 'ta',
     'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
     'perdeu', 'falhou', 'funciona', 'comunicou', 'anda',
+    'deu erro', 'deu falha', 'deu problema',
+    'apresentou erro', 'apresentou falha', 'apresentou problema',
   ];
 
   for (const [index, state] of states.entries()) {
