@@ -111,6 +111,7 @@ function quotedContadorPayload(messageId, quotedMessageId) {
   let outageConversationId = null;
   let accountingGroupAllowed = true;
   let forceConfigUnavailable = false;
+  let returnNullConfig = false;
   let child;
   let childOutput = '';
 
@@ -120,6 +121,10 @@ function quotedContadorPayload(messageId, quotedMessageId) {
       if (forceConfigUnavailable) {
         res.writeHead(503, { 'Content-Type': 'application/json' });
         return res.end(JSON.stringify({ error: 'temporarily_unavailable' }));
+      }
+      if (returnNullConfig) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        return res.end(JSON.stringify({ config: null }));
       }
       const requestedBrand = new URL(req.url, 'http://central.test').searchParams.get('brandId');
       if (requestedBrand === 'unavailable_brand' && !outageConfigAvailable) {
@@ -415,6 +420,16 @@ function quotedContadorPayload(messageId, quotedMessageId) {
     assert.equal(unavailableQuotedReplay.status, 503, 'quoted Contador replay must fail closed without fresh authority');
     assert.equal((await unavailableQuotedReplay.json()).error, 'duplicate_recovery_failed');
     forceConfigUnavailable = false;
+
+    returnNullConfig = true;
+    const nullConfigQuotedReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(quotedContadorPayload(quotedReplyId, quotedDraftExternalId)),
+    });
+    assert.equal(nullConfigQuotedReplay.status, 503, 'quoted Contador replay must reject a null fresh config');
+    assert.equal((await nullConfigQuotedReplay.json()).error, 'duplicate_recovery_failed');
+    returnNullConfig = false;
 
     accountingGroupAllowed = false;
     const disabledQuotedReplyId = `${MESSAGE_ID}-contador-disabled-reply`;

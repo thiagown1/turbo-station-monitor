@@ -189,6 +189,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
         .replace(/^(?:pessoal|gente|por\s+favor)[\s,.;:!?…\-–—]+/i, '')
         .replace(/^(?:acho|parece)\s+que\s+/i, '')
+        .replace(/^(?:algu[eé]m\s+sabe|queria\s+saber)\s+se\s+/i, '')
         .replace(/^(?:por\s+favor[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
         .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
         .replace(new RegExp(`^(?:ess[ae]|aquel[ae])\\s+(?=(?:${STATION_NOUN_PREFIX_PATTERN})\\b)`, 'i'), '')
