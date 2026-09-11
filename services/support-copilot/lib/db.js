@@ -622,6 +622,16 @@ try {
   console.warn(`${LOG_TAG} station investigator migration:`, err.message);
 }
 safeAddColumn('station_investigation_jobs', 'quota_reserved_at', 'TEXT DEFAULT NULL');
+try {
+  const backfilled = db.prepare(`UPDATE station_investigation_jobs
+    SET quota_reserved_at = created_at
+    WHERE quota_reserved_at IS NULL AND status <> 'claimed'`).run();
+  if (backfilled.changes > 0) {
+    console.log(`${LOG_TAG} Migration: backfilled ${backfilled.changes} station quota reservation(s)`);
+  }
+} catch (err) {
+  console.warn(`${LOG_TAG} station investigator quota migration:`, err.message);
+}
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
