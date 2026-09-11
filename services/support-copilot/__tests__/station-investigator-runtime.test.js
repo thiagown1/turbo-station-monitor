@@ -932,6 +932,36 @@ test('does not renew daily quota age while backing off a policy-blocked retry', 
   assert.equal(dailyLimitReached(brandId, 1), true);
 });
 
+test('atomically re-reserves expired retry quota before resuming investigation', async () => {
+  const brandId = 'expired-retry-quota-brand';
+  const oldReservation = new Date(Date.now() - 25 * 60 * 60 * 1_000).toISOString();
+  for (const messageId of ['expired-retry-a', 'expired-retry-b']) {
+    db.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, quota_reserved_at, created_at, updated_at)
+      VALUES (?, 'conv-pilot', ?, '120363000000000000@g.us', 'turbostation', 'retry', 1, ?, ?, ?, ?)`)
+      .run(messageId, brandId, new Date(0).toISOString(), oldReservation, oldReservation, oldReservation);
+  }
+
+  let requestCount = 0;
+  const deps = {
+    loadConfig: async () => config({ dailyLimit: 1 }),
+    buildContext: (_conversationId, messageId) => context(messageId),
+    request: async () => {
+      requestCount++;
+      return jsonResponse({ decision: 'review', confidence: 'medium', stationIds: ['DFAR2606180001'] });
+    },
+  };
+  const results = await Promise.all([
+    routeStationInvestigation({ ...input('expired-retry-a'), brandId }, deps),
+    routeStationInvestigation({ ...input('expired-retry-b'), brandId }, deps),
+  ]);
+
+  assert.equal(requestCount, 1);
+  assert.deepEqual(results.map((result) => result.status || result.reason).sort(), ['daily_limit', 'review']);
+  assert.equal(dailyLimitReached(brandId, 1), true);
+});
+
 test('does not overwrite a concurrent station transition while finalizing stale context', async () => {
   const messageId = 'context-finalization-cas';
   const brandId = `${messageId}-brand`;

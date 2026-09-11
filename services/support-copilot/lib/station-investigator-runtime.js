@@ -7,6 +7,7 @@ const { sendText } = require('./evolution-client');
 const PROCESSING_LEASE_MS = 120_000;
 const STATION_JOB_MAX_ATTEMPTS = 5;
 const STATION_POLICY_RETRY_MS = 5 * 60_000;
+const DAILY_QUOTA_WINDOW_MS = 86_400_000;
 let deliveringStationInvestigations = false;
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
@@ -14,7 +15,7 @@ function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
 
 function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
-  const since = new Date(Date.now() - 86_400_000).toISOString();
+  const since = new Date(Date.now() - DAILY_QUOTA_WINDOW_MS).toISOString();
   const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
     WHERE brand_id = ? AND COALESCE(quota_reserved_at, created_at) >= ?
       AND status <> 'claimed' AND message_id <> ?`)
@@ -57,6 +58,31 @@ function reserveDailySlot(messageId, brandId, limit) {
     const acquired = db.prepare("UPDATE station_investigation_jobs SET status='reserved', quota_reserved_at=?, updated_at=? WHERE message_id=? AND status='claimed'")
       .run(reservedAt, reservedAt, messageId);
     return { acquired: acquired.changes === 1, status: acquired.changes === 1 ? 'reserved' : 'unknown', limitReached: false };
+  })();
+}
+
+function quotaReservationExpired(job, now = Date.now()) {
+  const reservedAt = Date.parse(job?.quota_reserved_at || job?.created_at || '');
+  return !Number.isFinite(reservedAt) || reservedAt < now - DAILY_QUOTA_WINDOW_MS;
+}
+
+function reacquireDailySlot(job, brandId, limit) {
+  return db.transaction(() => {
+    const current = db.prepare(`SELECT status, updated_at, quota_reserved_at, created_at
+      FROM station_investigation_jobs WHERE message_id = ?`).get(job.message_id);
+    if (!current || current.status !== job.status || current.updated_at !== job.updated_at) {
+      return { acquired: false, status: current?.status || 'unknown', limitReached: false };
+    }
+    if (!quotaReservationExpired(current)) {
+      return { acquired: true, status: current.status, limitReached: false };
+    }
+    if (dailyLimitReached(brandId, limit, job.message_id)) {
+      return { acquired: false, status: current.status, limitReached: true };
+    }
+    const acquired = db.prepare(`UPDATE station_investigation_jobs SET quota_reserved_at=?
+      WHERE message_id=? AND status=? AND updated_at=?`)
+      .run(nowIso(), job.message_id, job.status, job.updated_at);
+    return { acquired: acquired.changes === 1, status: job.status, limitReached: false };
   })();
 }
 
@@ -135,6 +161,14 @@ async function prepareStationInvestigation(input, deps = {}) {
       return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
     }
     reservedDailySlot = true;
+  } else if ((prior.status === 'retry' || resumableInFlight) && quotaReservationExpired(prior)) {
+    const reservation = reacquireDailySlot(prior, input.brandId, Number(policy.dailyLimit ?? 20));
+    if (!reservation.acquired) {
+      if (!reservation.limitReached) {
+        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
+      }
+      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+    }
   }
   let context;
   try {
