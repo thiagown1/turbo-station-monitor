@@ -105,7 +105,12 @@ function leaseExpired(job, now = Date.now()) {
 
 function isDefinitiveDeliveryRejection(error) {
   const statusCode = Number(error?.statusCode);
-  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599;
+  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 499;
+}
+
+function retryDue(job, now = Date.now()) {
+  const nextAttemptAt = Date.parse(job?.next_attempt_at || '');
+  return !Number.isFinite(nextAttemptAt) || nextAttemptAt <= now;
 }
 
 async function prepareStationInvestigation(input, deps = {}) {
@@ -113,6 +118,9 @@ async function prepareStationInvestigation(input, deps = {}) {
   const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
   if (['sent', 'review', 'sending', 'delivery_unknown', 'failed'].includes(prior?.status)
       || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
+    return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+  if (prior?.status === 'retry' && !retryDue(prior)) {
     return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
   }
   if ((prior?.status === 'retry' || resumableInFlight)
@@ -201,7 +209,8 @@ async function routeStationInvestigation(input, deps = {}) {
   const acquired = db.prepare(`UPDATE station_investigation_jobs
     SET status='processing', attempts=attempts+1, context_fingerprint=?, context_message_ids_json=?, updated_at=?
     WHERE message_id=? AND (
-      status IN ('reserved', 'retry')
+      status = 'reserved'
+      OR (status='retry' AND datetime(next_attempt_at) <= datetime(?))
       OR (status='processing' AND updated_at <= ?)
     ) AND attempts < ?`)
     .run(
@@ -209,6 +218,7 @@ async function routeStationInvestigation(input, deps = {}) {
       JSON.stringify(context.messageRefs.map(x => x.id)),
       now,
       input.messageId,
+      now,
       staleBefore,
       STATION_JOB_MAX_ATTEMPTS,
     );

@@ -192,6 +192,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
         .replace(new RegExp(`^(?:ess[ae]|aquel[ae])\\s+(?=(?:${STATION_NOUN_PREFIX_PATTERN})\\b)`, 'i'), '')
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
+        .replace(/^(?:acho|parece)\s+que\s+/i, '')
         .replace(/^(?:(?:agora|hoje|ontem|de\s+manh[aã]|pela\s+manh[aã]|[àa]\s+tarde|de\s+tarde|[àa]\s+noite|ainda|j[aá]|atualmente|novamente|de\s+novo|no\s+momento)\s+)+/i, '')
         .trim();
       const stateFirst = new RegExp(

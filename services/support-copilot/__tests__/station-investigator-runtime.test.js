@@ -633,6 +633,31 @@ test('treats a successful WhatsApp response without a message id as ambiguous', 
   assert.deepEqual(job, { status: 'delivery_unknown', response_external_message_id: null });
 });
 
+test('treats a gateway 5xx after send starts as ambiguous and never retries', async () => {
+  const gatewayInput = { ...input('gateway-5xx-send'), brandId: 'gateway-5xx-send-brand' };
+  let sendCount = 0;
+  const deps = {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('gateway-5xx-send'),
+    request: async () => jsonResponse({
+      decision: 'send', confidence: 'high', stationIds: ['AR2608200012'], reply: 'Resposta possivelmente entregue.',
+    }),
+    sendText: async () => {
+      sendCount++;
+      const failure = new Error('Evolution API sendText failed: 502');
+      failure.statusCode = 502;
+      throw failure;
+    },
+  };
+
+  const first = await routeStationInvestigation(gatewayInput, deps);
+  const replay = await routeStationInvestigation(gatewayInput, deps);
+
+  assert.equal(first.status, 'delivery_unknown');
+  assert.deepEqual(replay, { duplicate: true, status: 'delivery_unknown' });
+  assert.equal(sendCount, 1);
+});
+
 test('retries a WhatsApp send that the gateway explicitly rejected', async () => {
   const rejectedInput = { ...input('rejected-send'), brandId: 'rejected-send-brand' };
   let requestCount = 0;
@@ -669,7 +694,14 @@ test('retries a WhatsApp send that the gateway explicitly rejected', async () =>
   assert.equal(retryJob.status, 'retry');
   assert.ok(retryJob.next_attempt_at);
   assert.match(retryJob.last_error, /401/);
-  assert.equal(replay.status, 'sent');
+  assert.deepEqual(replay, { duplicate: true, status: 'retry' });
+  assert.equal(requestCount, 1);
+  assert.equal(sendCount, 1);
+
+  db.prepare('UPDATE station_investigation_jobs SET next_attempt_at = ? WHERE message_id = ?')
+    .run(new Date(0).toISOString(), rejectedInput.messageId);
+  const dueRetry = await routeStationInvestigation(rejectedInput, deps);
+  assert.equal(dueRetry.status, 'sent');
   assert.equal(requestCount, 2);
   assert.equal(sendCount, 2);
 });
