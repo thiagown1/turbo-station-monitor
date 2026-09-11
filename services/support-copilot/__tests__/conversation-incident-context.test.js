@@ -204,6 +204,9 @@ test('strips leading status predicates between a state verb and the venue', asyn
     'Segue fora do ar o Habibs?',
     'Ficou sem energia o Habibs?',
     'Está ainda offline o Habibs?',
+    'Está com falha o Habibs?',
+    'Continua com problema o Habibs?',
+    'Ficou com erro o Habibs?',
   ];
 
   for (const [index, body] of scenarios.entries()) {
@@ -264,6 +267,9 @@ test('does not invent a station name when the natural question omits the venue',
     'Está offline?',
     'Está online?',
     'Ficou sem energia?',
+    'Está com falha?',
+    'Continua com problema?',
+    'Ficou com erro?',
     'Como está agora?',
     'Ainda não voltou?',
     'Ainda está offline?',
