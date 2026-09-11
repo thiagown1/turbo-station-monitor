@@ -35,9 +35,9 @@ class AgentConfigUnavailableError extends Error {
   }
 }
 
-async function loadConfig(brandId) {
+async function loadConfig(brandId, options = {}) {
   const cached = configCache.get(brandId);
-  if (cached && cached.expiresAt > Date.now()) return cached.value;
+  if (!options.fresh && cached && cached.expiresAt > Date.now()) return cached.value;
   if (!baseUrl() || !secret()) return null;
   try {
     const res = await fetch(`${baseUrl()}/api/agents/config?brandId=${encodeURIComponent(brandId)}`, {
@@ -52,6 +52,11 @@ async function loadConfig(brandId) {
   }
 }
 
+function accountingGroupFromConfig(config, conversationId) {
+  if (!config) return undefined;
+  return (config.accountingGroupConversationIds || []).includes(conversationId);
+}
+
 /**
  * Resolve group -> accounting agent from the Agent Center, the single place an
  * operator edits which agent serves which group.
@@ -62,8 +67,7 @@ async function loadConfig(brandId) {
 async function isAccountingGroup(brandId, conversationId) {
   try {
     const config = await loadConfig(brandId);
-    if (!config) return undefined;
-    return (config.accountingGroupConversationIds || []).includes(conversationId);
+    return accountingGroupFromConfig(config, conversationId);
   } catch (_) {
     return undefined;
   }
@@ -302,11 +306,19 @@ async function routeInboundMessage(input) {
 }
 
 function persistMediaJob(input) {
-  const now = nowIso();
-  db.prepare(`INSERT OR IGNORE INTO agent_media_jobs
-    (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
-    .run(input.messageId, JSON.stringify(input), now, now, now);
+  return db.transaction(() => {
+    const existing = db.prepare('SELECT status FROM agent_media_jobs WHERE message_id = ?').get(input.messageId);
+    if (existing) return true;
+    const stationMessageId = input.externalMessageId || input.messageId;
+    const stationJob = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(stationMessageId);
+    if (stationJob) return false;
+    const now = nowIso();
+    db.prepare(`INSERT INTO agent_media_jobs
+      (message_id, payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, 'pending', 0, ?, ?, ?)`)
+      .run(input.messageId, JSON.stringify(input), now, now, now);
+    return true;
+  })();
 }
 
 async function deliverSkippedMediaFallback(input) {
@@ -452,8 +464,11 @@ async function processMediaJob(messageId) {
   }
 }
 
-function routeInboundMessageDurably(input) {
-  persistMediaJob(input);
+function routeInboundMessageDurably(input, options = {}) {
+  if (!persistMediaJob(input)) {
+    return Promise.resolve({ skipped: true, reason: 'station_pipeline_owned', fallbackHandled: true });
+  }
+  if (options.enqueueOnly) return Promise.resolve({ queued: true });
   if (Date.now() < mediaModelUnavailableUntil) {
     return Promise.resolve({ queued: true, waitingForModel: true });
   }
@@ -586,11 +601,13 @@ function startAgentEventWorker() {
   worker = setInterval(() => {
     void deliverDueEvents();
     void deliverDueMediaJobs();
+    void require('./station-investigator-runtime').deliverDueStationInvestigations();
     void processFinancialApprovalWork();
   }, 30_000);
   worker.unref?.();
   void deliverDueEvents();
   void deliverDueMediaJobs();
+  void require('./station-investigator-runtime').deliverDueStationInvestigations();
   void processFinancialApprovalWork();
 }
 
@@ -603,6 +620,7 @@ module.exports = {
   deliverDueMediaJobs,
   startAgentEventWorker,
   loadConfig,
+  accountingGroupFromConfig,
   isAccountingGroup,
   shouldDeferEnergyInvoice,
   isPdfInput,

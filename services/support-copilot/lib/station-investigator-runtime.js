@@ -4,36 +4,286 @@ const { buildConversationIncidentContext } = require('./conversation-incident-co
 const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
 
+const PROCESSING_LEASE_MS = 120_000;
+const STATION_JOB_MAX_ATTEMPTS = 5;
+const STATION_POLICY_RETRY_MS = 5 * 60_000;
+const DAILY_QUOTA_WINDOW_MS = 86_400_000;
+let deliveringStationInvestigations = false;
+
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.AGENT_EVENT_SECRET || ''; }
 
-function dailyLimitReached(brandId, limit) {
+function dailyLimitReached(brandId, limit, excludeMessageId = '') {
   if (limit <= 0) return true;
-  const since = new Date(Date.now() - 86_400_000).toISOString();
-  const row = db.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE brand_id = ? AND created_at >= ?').get(brandId, since);
+  const since = new Date(Date.now() - DAILY_QUOTA_WINDOW_MS).toISOString();
+  const row = db.prepare(`SELECT COUNT(*) count FROM station_investigation_jobs
+    WHERE brand_id = ? AND quota_reserved_at >= ?
+      AND status <> 'claimed'
+      AND message_id <> ?`)
+    .get(brandId, since, excludeMessageId);
   return Number(row?.count || 0) >= limit;
 }
 
-async function routeStationInvestigation(input, deps = {}) {
-  const config = await (deps.loadConfig || loadConfig)(input.brandId).catch(() => null);
-  const policy = config?.stationInvestigator;
-  if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) return { skipped: true, reason: 'disabled' };
-  if (policy.killSwitch) return { skipped: true, reason: 'send_disabled' };
-  if (!policy.allowedConversationIds?.includes(input.conversationId)) return { skipped: true, reason: 'conversation_not_allowed' };
-  const mentionedJid = findAllowedStructuredMention(input.whatsappContext, policy.mentionJids || []);
-  if (!mentionedJid) return { skipped: true, reason: 'structured_mention_required' };
-  if (!baseUrl() || !secret()) return { skipped: true, reason: 'central_unavailable' };
-  const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
-  if (prior?.status === 'sent' || prior?.status === 'review') return { duplicate: true, status: prior.status };
-  if (!prior && dailyLimitReached(input.brandId, Number(policy.dailyLimit || 20))) return { skipped: true, reason: 'daily_limit' };
-  const context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
-  if (context.contextConfidence === 'low') return { skipped: true, reason: 'low_context_confidence' };
+function genericPipelineJob(input) {
+  return db.prepare(`SELECT jobs.status
+    FROM agent_media_jobs jobs
+    JOIN messages message ON message.id = jobs.message_id
+    WHERE message.conversation_id = ? AND message.brand_id = ?
+      AND (message.external_message_id = ? OR message.id = ?)
+    UNION ALL
+    SELECT jobs.status
+    FROM contador_jobs jobs
+    WHERE jobs.conversation_id = ? AND jobs.brand_id = ? AND jobs.message_id = ?
+    LIMIT 1`)
+    .get(
+      input.conversationId, input.brandId, input.messageId, input.messageId,
+      input.conversationId, input.brandId, input.messageId,
+    );
+}
+
+function persistStationOwnership(input) {
+  return db.transaction(() => {
+    if (genericPipelineJob(input)) return false;
+    const now = nowIso();
+    db.prepare(`INSERT OR IGNORE INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts, next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, 'claimed', 0, ?, ?, ?)`)
+      .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, now, now, now);
+    return true;
+  })();
+}
+
+function reserveDailySlot(messageId, brandId, limit) {
+  return db.transaction(() => {
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(messageId);
+    if (current?.status !== 'claimed') {
+      return { acquired: false, status: current?.status || 'unknown', limitReached: false };
+    }
+    if (dailyLimitReached(brandId, limit, messageId)) {
+      return { acquired: false, status: 'claimed', limitReached: true };
+    }
+    const reservedAt = nowIso();
+    const acquired = db.prepare("UPDATE station_investigation_jobs SET status='reserved', quota_reserved_at=?, updated_at=? WHERE message_id=? AND status='claimed'")
+      .run(reservedAt, reservedAt, messageId);
+    return { acquired: acquired.changes === 1, status: acquired.changes === 1 ? 'reserved' : 'unknown', limitReached: false };
+  })();
+}
+
+function quotaReservationExpired(job, now = Date.now()) {
+  const reservedAt = Date.parse(job?.quota_reserved_at || '');
+  return !Number.isFinite(reservedAt) || reservedAt < now - DAILY_QUOTA_WINDOW_MS;
+}
+
+function reacquireDailySlot(job, brandId, limit) {
+  return db.transaction(() => {
+    const current = db.prepare(`SELECT status, updated_at, quota_reserved_at, created_at
+      FROM station_investigation_jobs WHERE message_id = ?`).get(job.message_id);
+    if (!current || current.status !== job.status || current.updated_at !== job.updated_at) {
+      return { acquired: false, status: current?.status || 'unknown', limitReached: false };
+    }
+    if (!quotaReservationExpired(current)) {
+      return { acquired: true, status: current.status, limitReached: false };
+    }
+    if (dailyLimitReached(brandId, limit, job.message_id)) {
+      return { acquired: false, status: current.status, limitReached: true };
+    }
+    const acquired = db.prepare(`UPDATE station_investigation_jobs SET quota_reserved_at=?
+      WHERE message_id=? AND status=? AND updated_at=?`)
+      .run(nowIso(), job.message_id, job.status, job.updated_at);
+    return { acquired: acquired.changes === 1, status: job.status, limitReached: false };
+  })();
+}
+
+function releaseDailySlot(messageId) {
+  db.prepare("UPDATE station_investigation_jobs SET status='claimed', quota_reserved_at=NULL, updated_at=? WHERE message_id=? AND status='reserved'")
+    .run(nowIso(), messageId);
+}
+
+function queueClaimedRetry(messageId, reason) {
   const now = nowIso();
-  db.prepare(`INSERT INTO station_investigation_jobs
-    (message_id, conversation_id, brand_id, group_jid, instance, context_fingerprint, context_message_ids_json, status, attempts, next_attempt_at, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 'processing', 1, ?, ?, ?)
-    ON CONFLICT(message_id) DO UPDATE SET status='processing', attempts=attempts+1, updated_at=excluded.updated_at`)
-    .run(input.messageId, input.conversationId, input.brandId, input.groupJid, input.instance, context.contextFingerprint, JSON.stringify(context.messageRefs.map(x => x.id)), now, now, now);
+  db.prepare(`UPDATE station_investigation_jobs
+    SET status='retry', next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status='claimed'`)
+    .run(now, reason, now, messageId);
+}
+
+function failStaleReservedWithoutChargingQuota(job, reason) {
+  const failedAt = nowIso();
+  db.prepare(`UPDATE station_investigation_jobs
+    SET status='failed', quota_reserved_at=NULL, next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status='reserved' AND updated_at=?`)
+    .run(failedAt, reason, failedAt, job.message_id, job.updated_at);
+}
+
+function leaseExpired(job, now = Date.now()) {
+  const updatedAt = Date.parse(job?.updated_at || '');
+  return Number.isFinite(updatedAt) && updatedAt <= now - PROCESSING_LEASE_MS;
+}
+
+function reconcileStaleSending(job) {
+  const updatedAt = nowIso();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='delivery_unknown', last_error='stale_sending_reconciled', updated_at=?
+    WHERE message_id=? AND status='sending' AND updated_at=?`)
+    .run(updatedAt, job.message_id, job.updated_at);
+}
+
+function isDefinitiveDeliveryRejection(error) {
+  const statusCode = Number(error?.statusCode);
+  return Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 499;
+}
+
+function retryDue(job, now = Date.now()) {
+  const nextAttemptAt = Date.parse(job?.next_attempt_at || '');
+  return !Number.isFinite(nextAttemptAt) || nextAttemptAt <= now;
+}
+
+async function prepareStationInvestigation(input, deps = {}) {
+  const prior = db.prepare('SELECT * FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+  if (prior?.status === 'sending' && leaseExpired(prior)) {
+    reconcileStaleSending(prior);
+    return { claimed: true, ready: false, result: { duplicate: true, status: 'delivery_unknown' } };
+  }
+  const resumableInFlight = ['reserved', 'processing'].includes(prior?.status) && leaseExpired(prior);
+  if (['sent', 'review', 'sending', 'delivery_unknown', 'failed'].includes(prior?.status)
+      || (['reserved', 'processing'].includes(prior?.status) && !resumableInFlight)) {
+    return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+  if (prior?.status === 'retry' && !retryDue(prior)) {
+    return { claimed: true, ready: false, result: { duplicate: true, status: prior.status } };
+  }
+  if ((prior?.status === 'retry' || resumableInFlight)
+      && Number(prior?.attempts || 0) >= STATION_JOB_MAX_ATTEMPTS) {
+    const failedAt = nowIso();
+    const failed = db.prepare(`UPDATE station_investigation_jobs
+      SET status='failed', next_attempt_at=?, last_error='attempt_limit_reached', updated_at=?
+      WHERE message_id=? AND status=? AND attempts>=? AND updated_at=?`)
+      .run(failedAt, failedAt, input.messageId, prior.status, STATION_JOB_MAX_ATTEMPTS, prior.updated_at);
+    if (failed.changes === 1) {
+      return { claimed: true, ready: false, result: { status: 'failed', reason: 'attempt_limit_reached' } };
+    }
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+    return { claimed: true, ready: false, result: { duplicate: true, status: current?.status || 'unknown' } };
+  }
+  if (!prior && genericPipelineJob(input)) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
+  }
+
+  // Persisted jobs keep ownership across provider replays even when the
+  // current config is temporarily unavailable or has since been tightened.
+  // Otherwise the same attachment can fall through to the generic router.
+  const claimedByPriorJob = Boolean(prior);
+  let config;
+  try {
+    config = await (deps.loadConfig || loadConfig)(input.brandId);
+  } catch (error) {
+    if (prior?.status === 'claimed') {
+      queueClaimedRetry(input.messageId, `config_unavailable: ${error?.message || 'load_failed'}`);
+    }
+    return {
+      claimed: claimedByPriorJob,
+      ready: false,
+      result: { skipped: true, reason: 'config_unavailable' },
+    };
+  }
+  if (!config) {
+    if (prior?.status === 'claimed') {
+      queueClaimedRetry(input.messageId, 'config_unavailable: empty_config');
+    }
+    return {
+      claimed: claimedByPriorJob,
+      ready: false,
+      result: { skipped: true, reason: 'config_unavailable' },
+    };
+  }
+  const policy = config?.stationInvestigator;
+  if (!config?.enabled || !config?.agents?.stationSupport || !policy?.enabled) {
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'disabled' } };
+  }
+  if (!policy.allowedConversationIds?.includes(input.conversationId)) {
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'conversation_not_allowed' } };
+  }
+  const mentionedJid = findAllowedStructuredMention(input.whatsappContext, policy.mentionJids || []);
+  if (!mentionedJid) {
+    return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'structured_mention_required' } };
+  }
+
+  // Once an explicitly allowlisted bot mention is present in an allowlisted
+  // group, this workflow owns the message. Any later failure must stay silent
+  // and fail closed instead of falling through to a second, generic responder.
+  const claimed = true;
+  if (!prior && !persistStationOwnership(input)) {
+    return { claimed: false, ready: false, result: { skipped: true, reason: 'generic_pipeline_owned' } };
+  }
+  if (policy.killSwitch) return { claimed, ready: false, result: { skipped: true, reason: 'send_disabled' } };
+  if (!baseUrl() || !secret()) {
+    queueClaimedRetry(input.messageId, 'central_unavailable');
+    return { claimed, ready: false, result: { skipped: true, reason: 'central_unavailable' } };
+  }
+  const staleReserved = prior?.status === 'reserved' && resumableInFlight;
+  let reservedDailySlot = false;
+  if (!prior || prior.status === 'claimed') {
+    const reservation = reserveDailySlot(input.messageId, input.brandId, Number(policy.dailyLimit ?? 20));
+    if (!reservation.acquired) {
+      if (!reservation.limitReached) {
+        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
+      }
+      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+    }
+    reservedDailySlot = true;
+  }
+  let context;
+  try {
+    context = (deps.buildContext || buildConversationIncidentContext)(input.conversationId, input.messageId, { contextHours: policy.contextHours, maxMessages: policy.maxContextMessages });
+  } catch {
+    if (reservedDailySlot) releaseDailySlot(input.messageId);
+    else if (staleReserved) failStaleReservedWithoutChargingQuota(prior, 'context_failed');
+    return { claimed, ready: false, result: { skipped: true, reason: 'context_failed' } };
+  }
+  if (context.contextConfidence === 'low') {
+    if (reservedDailySlot) releaseDailySlot(input.messageId);
+    else if (staleReserved) failStaleReservedWithoutChargingQuota(prior, 'low_context_confidence');
+    return { claimed, ready: false, result: { skipped: true, reason: 'low_context_confidence' } };
+  }
+  if ((prior?.status === 'retry' || resumableInFlight) && quotaReservationExpired(prior)) {
+    const reservation = reacquireDailySlot(prior, input.brandId, Number(policy.dailyLimit ?? 20));
+    if (!reservation.acquired) {
+      if (!reservation.limitReached) {
+        return { claimed, ready: false, result: { duplicate: true, status: reservation.status } };
+      }
+      return { claimed, ready: false, result: { skipped: true, reason: 'daily_limit' } };
+    }
+  }
+  return { claimed, ready: true, policy, mentionedJid, context };
+}
+
+async function routeStationInvestigation(input, deps = {}) {
+  const preparation = deps.prepared || await prepareStationInvestigation(input, deps);
+  if (!preparation.ready) return preparation.result;
+  const { policy, mentionedJid, context } = preparation;
+  const now = nowIso();
+  const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
+  const acquired = db.prepare(`UPDATE station_investigation_jobs
+    SET status='processing', attempts=attempts+1, context_fingerprint=?, context_message_ids_json=?, updated_at=?
+    WHERE message_id=? AND (
+      status = 'reserved'
+      OR (status='retry' AND datetime(next_attempt_at) <= datetime(?))
+      OR (status='processing' AND updated_at <= ?)
+    ) AND attempts < ?`)
+    .run(
+      context.contextFingerprint,
+      JSON.stringify(context.messageRefs.map(x => x.id)),
+      now,
+      input.messageId,
+      now,
+      staleBefore,
+      STATION_JOB_MAX_ATTEMPTS,
+    );
+  if (acquired.changes !== 1) {
+    const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+    return { duplicate: true, status: current?.status || 'unknown' };
+  }
+  let sendStarted = false;
   try {
     const response = await (deps.request || fetch)(`${baseUrl()}/api/agents/station-investigations`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${secret()}` },
@@ -43,27 +293,134 @@ async function routeStationInvestigation(input, deps = {}) {
     const result = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(`investigator_http_${response.status}`);
     if (!policy.autoSend || result.decision !== 'send' || !result.reply) {
-      db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, updated_at=? WHERE message_id=?")
+      db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=? WHERE message_id=?")
         .run(result.decision || 'review', result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
       return { status: 'review', result };
     }
+    const sending = db.prepare(`UPDATE station_investigation_jobs
+      SET status='sending', decision='send', confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=?
+      WHERE message_id=? AND status='processing'`)
+      .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
+    if (sending.changes !== 1) {
+      const current = db.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId);
+      return { duplicate: true, status: current?.status || 'unknown' };
+    }
+    sendStarted = true;
     const sent = await (deps.sendText || sendText)(input.instance, input.groupJid, result.reply);
     const externalId = sent?.key?.id || null;
+    if (!externalId) throw new Error('station_delivery_id_missing');
     const sentAt = nowIso();
     db.transaction(() => {
       db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, created_at)
         VALUES (?, ?, ?, 'outbound', 'station-investigator', ?, ?, 'sent', ?)`)
         .run(randomId('msg'), input.conversationId, input.brandId, result.reply, externalId, sentAt);
-      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, response_sent_at=?, response_external_message_id=?, updated_at=? WHERE message_id=?")
+      db.prepare("UPDATE station_investigation_jobs SET status='sent', decision='send', confidence=?, station_ids_json=?, result_json=?, last_error=NULL, response_sent_at=?, response_external_message_id=?, updated_at=? WHERE message_id=?")
         .run(result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), sentAt, externalId, sentAt, input.messageId);
     })();
     return { status: 'sent', result };
   } catch (error) {
-    const next = new Date(Date.now() + 60_000).toISOString();
-    db.prepare("UPDATE station_investigation_jobs SET status='retry', next_attempt_at=?, last_error=?, updated_at=? WHERE message_id=?")
-      .run(next, String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
-    return { status: 'retry', error: String(error?.message || error) };
+    if (sendStarted && !isDefinitiveDeliveryRejection(error)) {
+      db.prepare("UPDATE station_investigation_jobs SET status='delivery_unknown', last_error=?, updated_at=? WHERE message_id=? AND status='sending'")
+        .run(String(error?.message || error).slice(0, 500), nowIso(), input.messageId);
+      return { status: 'delivery_unknown', error: String(error?.message || error) };
+    }
+    const attempts = Number(db.prepare('SELECT attempts FROM station_investigation_jobs WHERE message_id = ?').get(input.messageId)?.attempts || 1);
+    const retryable = attempts < STATION_JOB_MAX_ATTEMPTS;
+    const updatedAt = nowIso();
+    const next = retryable ? new Date(Date.now() + 60_000).toISOString() : updatedAt;
+    db.prepare("UPDATE station_investigation_jobs SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE message_id=?")
+      .run(retryable ? 'retry' : 'failed', next, String(error?.message || error).slice(0, 500), updatedAt, input.messageId);
+    return { status: retryable ? 'retry' : 'failed', error: String(error?.message || error) };
   }
 }
 
-module.exports = { routeStationInvestigation, dailyLimitReached };
+function sourceMessageFor(job) {
+  return db.prepare(`SELECT * FROM messages
+    WHERE conversation_id = ? AND brand_id = ?
+      AND (external_message_id = ? OR id = ?)
+    ORDER BY CASE WHEN external_message_id = ? THEN 0 ELSE 1 END
+    LIMIT 1`)
+    .get(job.conversation_id, job.brand_id, job.message_id, job.message_id, job.message_id);
+}
+
+function parsedMentionedJids(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function failDueJobIfUnchanged(job, reason, options = {}) {
+  const updatedAt = nowIso();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='failed',
+        quota_reserved_at=CASE WHEN ? THEN NULL ELSE quota_reserved_at END,
+        next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status=? AND updated_at=?`)
+    .run(options.releaseQuota ? 1 : 0, updatedAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
+}
+
+function rescheduleDueJobIfUnchanged(job, reason) {
+  const updatedAt = nowIso();
+  const nextAttemptAt = new Date(Date.now() + STATION_POLICY_RETRY_MS).toISOString();
+  return db.prepare(`UPDATE station_investigation_jobs
+    SET status='retry', next_attempt_at=?, last_error=?, updated_at=?
+    WHERE message_id=? AND status=? AND updated_at=?`)
+    .run(nextAttemptAt, reason, updatedAt, job.message_id, job.status, job.updated_at);
+}
+
+async function deliverDueStationInvestigations(deps = {}) {
+  if (deliveringStationInvestigations) return;
+  deliveringStationInvestigations = true;
+  try {
+    const staleBefore = new Date(Date.now() - PROCESSING_LEASE_MS).toISOString();
+    const due = db.prepare(`SELECT * FROM station_investigation_jobs
+      WHERE (status = 'retry' AND datetime(next_attempt_at) <= datetime('now'))
+         OR (status IN ('reserved', 'processing', 'sending') AND updated_at <= ?)
+      ORDER BY datetime(created_at) ASC LIMIT 5`).all(staleBefore);
+    for (const job of due) {
+      if (job.status === 'sending') {
+        reconcileStaleSending(job);
+        continue;
+      }
+      const source = sourceMessageFor(job);
+      if (!source) {
+        failDueJobIfUnchanged(job, 'source_message_missing', { releaseQuota: job.status === 'reserved' });
+        continue;
+      }
+      const result = await routeStationInvestigation({
+        messageId: job.message_id,
+        conversationId: job.conversation_id,
+        brandId: job.brand_id,
+        groupJid: job.group_jid,
+        instance: job.instance,
+        senderId: source.sender_id,
+        receivedAt: source.provider_timestamp || source.created_at,
+        whatsappContext: {
+          providerTimestamp: source.provider_timestamp || source.created_at,
+          quotedMessageId: source.quoted_message_id || null,
+          quotedSenderId: source.quoted_sender_id || null,
+          mentionedJids: parsedMentionedJids(source.mentioned_jids_json),
+          isForwarded: Boolean(source.is_forwarded),
+          forwardingScore: Number(source.forwarding_score || 0),
+        },
+      }, deps);
+      if (['context_failed', 'low_context_confidence', 'structured_mention_required'].includes(result?.reason)) {
+        failDueJobIfUnchanged(job, result.reason);
+      } else if (result?.skipped) {
+        rescheduleDueJobIfUnchanged(job, result.reason || 'policy_blocked');
+      }
+    }
+  } finally {
+    deliveringStationInvestigations = false;
+  }
+}
+
+module.exports = {
+  deliverDueStationInvestigations,
+  prepareStationInvestigation,
+  routeStationInvestigation,
+  dailyLimitReached,
+};

@@ -19,7 +19,7 @@ const memoriaDir = path.join(os.tmpdir(), `contador-memoria-${process.pid}-${Dat
 
 try {
   const output = execFileSync(process.execPath, ['-e', `
-    const { enqueueContadorMessage, configured, isQuotedContadorDraftReply, _recordOutboundForTest } = require('./lib/contador-runtime');
+    const { enqueueContadorMessage, configured, hasQuotedContadorDraftReply, isQuotedContadorDraftReply, _recordOutboundForTest } = require('./lib/contador-runtime');
     const { db } = require('./lib/db');
     if (!configured()) throw new Error('test runtime should be configured');
     const base = {
@@ -44,12 +44,16 @@ try {
       ...base, groupJid: 'other@g.us', media: null, replyToContador: true,
       quotedContadorDraftId: 'rcpt_open',
     });
+    const centrallyAssignedQuote = hasQuotedContadorDraftReply({
+      ...base, groupJid: 'central-only@g.us', media: null, replyToContador: true,
+      quotedContadorDraftId: 'rcpt_open',
+    });
     _recordOutboundForTest('De qual estação é essa conta?', {
       conversationId: 'conv-1', brandId: 'turbo_station', contadorDraftId: 'rcpt_open',
     }, 'wamid-draft-prompt');
     const jobs = db.prepare('SELECT message_id, kind, status FROM contador_jobs ORDER BY created_at').all();
     const prompt = db.prepare("SELECT media_json FROM messages WHERE external_message_id = 'wamid-draft-prompt'").get();
-    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, quotedDraftStationReply, untrustedQuote, jobs, prompt }));
+    process.stdout.write(JSON.stringify({ first, replay, chatter, wrongGroup, quotedDraftStationReply, untrustedQuote, centrallyAssignedQuote, jobs, prompt }));
     db.close();
   `], {
     cwd: path.join(__dirname, '..'),
@@ -72,6 +76,7 @@ try {
   assert.equal(result.wrongGroup.reason, 'group_not_allowed');
   assert.equal(result.quotedDraftStationReply, true);
   assert.equal(result.untrustedQuote, false);
+  assert.equal(result.centrallyAssignedQuote, true);
   assert.deepEqual(result.jobs, [{ message_id: 'wamid-queue-1', kind: 'pdf', status: 'pending' }]);
   assert.equal(JSON.parse(result.prompt.media_json).contador.draftId, 'rcpt_open');
   console.log('PASS Contador runtime outbox is group-scoped and idempotent');
