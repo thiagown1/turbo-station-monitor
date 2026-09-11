@@ -280,6 +280,43 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
     assert.equal(genericStationJobs, 0, 'a durable generic job must retain ownership after config recovery');
     assert.equal(investigationCount, 0, 'generic ownership must block a second station investigation');
 
+    const claimedOutageId = `${MESSAGE_ID}-claimed-config-outage`;
+    const claimedOutageLocalId = `${claimedOutageId}-local`;
+    const claimedOutageSetup = new Database(DB_PATH);
+    const claimedOutageAt = new Date().toISOString();
+    claimedOutageSetup.prepare(`INSERT INTO messages
+      (id, conversation_id, brand_id, direction, source, body, raw_body,
+       external_message_id, created_at)
+      VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, ?, ?, ?)`)
+      .run(
+        claimedOutageLocalId, CONVERSATION_ID,
+        '[Luan]: @Turbo Station Suporte Habibs caiu?',
+        '@Turbo Station Suporte Habibs caiu?', claimedOutageId, claimedOutageAt,
+      );
+    claimedOutageSetup.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status, attempts,
+       next_attempt_at, created_at, updated_at)
+      VALUES (?, ?, 'turbo_station', ?, 'turbostation', 'claimed', 0, ?, ?, ?)`)
+      .run(claimedOutageId, CONVERSATION_ID, GROUP_JID, claimedOutageAt, claimedOutageAt, claimedOutageAt);
+    claimedOutageSetup.close();
+
+    forceConfigUnavailable = true;
+    const claimedOutageReplay = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(webhookPayload(claimedOutageId, true)),
+    });
+    assert.equal(claimedOutageReplay.status, 200);
+    assert.equal((await claimedOutageReplay.json()).duplicate, true);
+    forceConfigUnavailable = false;
+    const claimedOutageProbe = new Database(DB_PATH, { readonly: true });
+    assert.equal(
+      claimedOutageProbe.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(claimedOutageId).status,
+      'retry',
+      'a claimed duplicate must remain drainable after configuration recovers',
+    );
+    claimedOutageProbe.close();
+
     const first = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },

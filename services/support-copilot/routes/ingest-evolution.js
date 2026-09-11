@@ -415,9 +415,14 @@ router.post('/', async (req, res) => {
             await (async () => {
               const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
               const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
-              const sharedAgentConfig = quotedContadorReply
-                ? await loadConfig(brandId, { fresh: true })
-                : await loadConfig(brandId).catch(() => null);
+              let sharedAgentConfig = null;
+              let sharedAgentConfigError = null;
+              try {
+                sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : undefined);
+              } catch (error) {
+                sharedAgentConfigError = error;
+              }
+              if (quotedContadorReply && sharedAgentConfigError) throw sharedAgentConfigError;
               if (quotedContadorReply && !sharedAgentConfig) {
                 throw new Error('fresh_agent_config_required');
               }
@@ -427,7 +432,10 @@ router.post('/', async (req, res) => {
                 return;
               }
               const prepared = await prepareStationInvestigation(stationInput, {
-                loadConfig: async () => sharedAgentConfig,
+                loadConfig: async () => {
+                  if (sharedAgentConfigError) throw sharedAgentConfigError;
+                  return sharedAgentConfig;
+                },
               });
               if (prepared?.claimed) {
                 void routeStationInvestigation(stationInput, { prepared })
