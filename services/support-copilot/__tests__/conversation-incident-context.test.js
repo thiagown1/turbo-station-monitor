@@ -141,6 +141,7 @@ test('recognizes common natural station-name phrasings', async (t) => {
     ['O carregador nº 2 do Habibs caiu?', 'Habibs'],
     ['O disjuntor da estação do Habibs desarmou?', 'Habibs'],
     ['A energia da estação do Habibs caiu?', 'Habibs'],
+    ['A unidade do Habibs caiu?', 'Habibs'],
     ['Estação: Lago Norte caiu?', 'Lago Norte'],
     ['Estação Lago Norte caiu?', 'Lago Norte'],
     ['Bom dia, pessoal. O Habibs caiu?', 'Habibs'],
@@ -194,6 +195,26 @@ test('parses every supported station state before the venue', async (t) => {
       const questionId = `state-first-${index}`;
       const context = reconstructIncidentContext([
         message(questionId, '2026-09-10T15:30:00.000Z', 'luan', `Como ${state} o Habibs?`),
+      ], questionId);
+
+      assert.equal(context.contextConfidence, 'medium');
+      assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }]);
+    });
+  }
+});
+
+test('accepts modifiers before state-first station questions', async (t) => {
+  const scenarios = [
+    'Já voltou o Habibs?',
+    'Ainda está o Habibs offline?',
+    'Hoje caiu o Habibs?',
+  ];
+
+  for (const [index, body] of scenarios.entries()) {
+    await t.test(body, () => {
+      const questionId = `modified-state-first-${index}`;
+      const context = reconstructIncidentContext([
+        message(questionId, '2026-09-10T15:30:00.000Z', 'luan', body),
       ], questionId);
 
       assert.equal(context.contextConfidence, 'medium');
@@ -325,6 +346,7 @@ test('does not invent a station name when the natural question omits the venue',
     'Lá voltou?',
     'O carregador aqui caiu?',
     'A estação ali parou?',
+    'Essa unidade caiu?',
   ];
 
   for (const [index, body] of scenarios.entries()) {

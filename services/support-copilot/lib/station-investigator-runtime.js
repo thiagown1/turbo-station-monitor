@@ -29,8 +29,15 @@ function genericPipelineJob(input) {
     JOIN messages message ON message.id = jobs.message_id
     WHERE message.conversation_id = ? AND message.brand_id = ?
       AND (message.external_message_id = ? OR message.id = ?)
+    UNION ALL
+    SELECT jobs.status
+    FROM contador_jobs jobs
+    WHERE jobs.conversation_id = ? AND jobs.brand_id = ? AND jobs.message_id = ?
     LIMIT 1`)
-    .get(input.conversationId, input.brandId, input.messageId, input.messageId);
+    .get(
+      input.conversationId, input.brandId, input.messageId, input.messageId,
+      input.conversationId, input.brandId, input.messageId,
+    );
 }
 
 function persistStationOwnership(input) {

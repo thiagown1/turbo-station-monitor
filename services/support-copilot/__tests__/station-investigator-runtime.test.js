@@ -1101,6 +1101,36 @@ test('keeps a durable generic media job from being claimed after config recovery
   assert.equal(db.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?').get(externalId).count, 0);
 });
 
+test('keeps a durable Contador job from being claimed after config recovery', async () => {
+  const messageId = 'contador-owned-message';
+  const contadorInput = { ...input(messageId), brandId: 'contador-owned-brand' };
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO contador_jobs
+    (id, message_id, conversation_id, brand_id, group_jid, instance, kind,
+     payload_json, status, attempts, next_attempt_at, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'message', '{}', 'pending', 0, ?, ?, ?)`)
+    .run(
+      'contador-owned-job', messageId, contadorInput.conversationId, contadorInput.brandId,
+      contadorInput.groupJid, contadorInput.instance, now, now, now,
+    );
+
+  let configLoads = 0;
+  const prepared = await prepareStationInvestigation(contadorInput, {
+    loadConfig: async () => {
+      configLoads++;
+      return config();
+    },
+  });
+
+  assert.deepEqual(prepared, {
+    claimed: false,
+    ready: false,
+    result: { skipped: true, reason: 'generic_pipeline_owned' },
+  });
+  assert.equal(configLoads, 0, 'persisted Contador ownership should win before current config');
+  assert.equal(db.prepare('SELECT COUNT(*) count FROM station_investigation_jobs WHERE message_id = ?').get(messageId).count, 0);
+});
+
 test('keeps a durable station claim from being acquired by the generic pipeline', async () => {
   const externalId = 'station-owned-external';
   const localId = 'station-owned-local';

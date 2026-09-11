@@ -32,6 +32,7 @@ const GENERIC_STATION_NOUNS = [
   ['fornecimento', 'fornecimento'], ['internet', 'internet'], ['local', 'local'],
   ['luz', 'luz'], ['posto', 'posto'], ['rede', 'rede'], ['servidor', 'servidor'],
   ['sinal', 'sinal'], ['sistema', 'sistema'], ['transformador', 'transformador'],
+  ['unidade', 'unidade'],
 ];
 const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
 const STATION_EQUIPMENT_IDENTIFIER_PATTERN = '(?:n(?:[.º°o])?\\s*)?(?:#?\\d{1,3}|[a-z])';
@@ -192,7 +193,7 @@ function stationNamesFrom(text, options = {}) {
         .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
         .trim();
       const stateFirst = new RegExp(
-        `^(?:como\\s+)?(?:${STATION_STATE_PATTERN}|anda)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
+        `^(?:como\\s+)?(?:(?:${STATION_NON_NAME_FRAGMENT_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN}|anda)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
         'i',
       ).exec(conversational);
       if (stateFirst) {
