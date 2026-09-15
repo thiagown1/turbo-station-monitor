@@ -60,10 +60,13 @@ const { db, stmts } = require('../lib/db');
 const { parseLocation, deriveSeverity, buildBrandFilter, DEFAULT_BRAND_ID } = require('../lib/utils');
 const { deleteOlderThan, sweep, CHUNK_SIZE } = require('../lib/retention');
 const { HEATMAP_TIME_INDEX, buildHeatmapQuery } = require('../lib/heatmap-query');
+const { HeatmapQueryCache } = require('../lib/heatmap-query-cache');
 const {
     HEATMAP_QUERY_TIMEOUT_CODE,
     HeatmapQueryRunner,
 } = require('../lib/heatmap-query-runner');
+const { ONLINE_USERS_TIME_INDEX, buildOnlineUsersQuery } = require('../lib/presence-query');
+const { EVENTS_TIME_INDEX, buildEventsQuery } = require('../lib/events-query');
 
 const SECRET = 'test-secret-12345';
 const TELEMETRY_KEY = 'test-telemetry-key-not-real';
@@ -185,6 +188,65 @@ test('heatmap query forces the existing timestamp index and keeps tenant paramet
     assert.ok(!detail.includes('idx_mobile_events_event_type'), detail);
 });
 
+test('online-users query uses the bounded timestamp index and tenant scope', () => {
+    const cutoff = Date.now() - 90_000;
+    const query = buildOnlineUsersQuery({ cutoff, brandId: 'zev' });
+
+    assert.ok(query.sql.includes(`INDEXED BY ${ONLINE_USERS_TIME_INDEX}`));
+    assert.deepStrictEqual(query.params, [cutoff, 'zev', 'zev']);
+
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...query.params);
+    const detail = plan.map((row) => row.detail).join('\n');
+    assert.ok(detail.includes(ONLINE_USERS_TIME_INDEX), detail);
+    assert.ok(!detail.includes('idx_mobile_events_event_type'), detail);
+});
+
+test('events query uses the timestamp index for bounded dashboard windows', () => {
+    const query = buildEventsQuery({ eventTypeCount: 2, brandId: 'turbo_station' });
+    const params = [Date.now() - 60_000, Date.now(), 'payment_succeeded', 'payment_failed', 'turbo_station', 'turbo_station', 101];
+
+    assert.ok(query.sql.includes(`INDEXED BY ${EVENTS_TIME_INDEX}`));
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${query.sql}`).all(...params);
+    const detail = plan.map((row) => row.detail).join('\n');
+    assert.ok(detail.includes(EVENTS_TIME_INDEX), detail);
+    assert.ok(!detail.includes('idx_mobile_events_event_type'), detail);
+});
+
+test('heatmap cache coalesces identical work and reuses the private result until expiry', async () => {
+    let calls = 0;
+    let release;
+    let now = 1_000;
+    const runner = {
+        run: () => {
+            calls += 1;
+            return new Promise((resolve) => { release = resolve; });
+        },
+    };
+    const cache = new HeatmapQueryCache({ runner, ttlMs: 5_000, now: () => now });
+    const input = { periodMs: 86_400_000, brandId: 'zev', excludeUserIds: ['b', 'a'] };
+
+    const first = cache.run(input);
+    const concurrent = cache.run({ ...input, excludeUserIds: ['a', 'b'] });
+    await Promise.resolve();
+    assert.strictEqual(calls, 1, 'identical requests must share one worker query');
+
+    release({ count: 1, totalEvents: 1, points: [{ lat: -15.7, lng: -47.9, weight: 1 }] });
+    assert.strictEqual((await first).cacheStatus, 'MISS');
+    assert.strictEqual((await concurrent).cacheStatus, 'COALESCED');
+
+    const cached = await cache.run(input);
+    assert.strictEqual(cached.cacheStatus, 'HIT');
+    assert.strictEqual(calls, 1);
+
+    now += 5_001;
+    runner.run = async () => {
+        calls += 1;
+        return { count: 0, totalEvents: 0, points: [] };
+    };
+    assert.strictEqual((await cache.run(input)).cacheStatus, 'MISS');
+    assert.strictEqual(calls, 2);
+});
+
 test('heatmap worker keeps the main event loop responsive during blocking SQLite work', async () => {
     const runner = new HeatmapQueryRunner({
         workerPath: path.join(__dirname, 'fixtures', 'slow-heatmap-worker.js'),
@@ -301,11 +363,49 @@ test('POST /api/telemetry/user-logs without telemetry key → 401', async () => 
 
 test('GET /api/telemetry/online-users with valid secret → 200', async () => {
     const res = await request(app)
-        .get('/api/telemetry/online-users')
+        .get('/api/telemetry/online-users?brandId=turbo_station')
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(res.status, 200);
     assert.ok(typeof res.body.count === 'number');
     assert.ok(Array.isArray(res.body.users));
+});
+
+test('GET /api/telemetry/online-users requires tenant scope', async () => {
+    const res = await request(app)
+        .get('/api/telemetry/online-users')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.error, 'brandId is required');
+});
+
+test('GET /api/telemetry/online-users isolates current users by brand', async () => {
+    const tag = `online-brand-${Date.now()}`;
+    const now = Date.now();
+    for (const brandId of ['zev', 'turbo_station']) {
+        stmts.insertEvent.run({
+            raw_id: null,
+            received_at: now,
+            event_timestamp: now,
+            session_id: `${tag}-${brandId}`,
+            device_id: `${tag}-${brandId}`,
+            app_version: 'test',
+            platform: 'android',
+            user_id: `${tag}-${brandId}-user`,
+            event_type: 'app_presence_heartbeat',
+            station_id: null,
+            brand_id: brandId,
+            severity: null,
+            message: null,
+            data_json: JSON.stringify({ lat: -15.7, lng: -47.9 }),
+        });
+    }
+
+    const res = await request(app)
+        .get('/api/telemetry/online-users?brandId=zev')
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(res.status, 200);
+    assert.ok(res.body.users.some((user) => user.device_id === `${tag}-zev`));
+    assert.ok(!res.body.users.some((user) => user.device_id === `${tag}-turbo_station`));
 });
 
 // ── Recent Locations ────────────────────────────────────────────────────────────
@@ -351,7 +451,7 @@ test('GET /api/telemetry/recent-locations includes a device outside the online-u
 
     // Confirms the exclusion: a 10-day-old heartbeat is well outside the 90s window.
     const online = await request(app)
-        .get('/api/telemetry/online-users')
+        .get('/api/telemetry/online-users?brandId=turbo_station')
         .set('X-Monitor-Secret', SECRET);
     assert.ok(
         !online.body.users.some((u) => u.device_id === `${tag}-d`),
@@ -486,13 +586,22 @@ test('GET /api/telemetry/recent-locations clamps a caller-supplied maxAgeMs abov
 // ── Heatmap Data ────────────────────────────────────────────────────────────────
 
 test('GET /api/telemetry/heatmap-data?period=24h → 200', async () => {
+    const cacheKey = `cache-probe-${Date.now()}`;
     const res = await request(app)
-        .get('/api/telemetry/heatmap-data?period=24h&brandId=turbo_station')
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=${cacheKey}`)
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(res.status, 200);
     assert.strictEqual(res.body.period, '24h');
     assert.ok(typeof res.body.count === 'number');
     assert.ok(Array.isArray(res.body.points));
+    assert.strictEqual(res.headers['x-telemetry-cache'], 'MISS');
+
+    const cached = await request(app)
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=${cacheKey}`)
+        .set('X-Monitor-Secret', SECRET);
+    assert.strictEqual(cached.status, 200);
+    assert.strictEqual(cached.headers['x-telemetry-cache'], 'HIT');
+    assert.strictEqual(cached.headers['cache-control'], 'private, no-store');
 });
 
 test('GET /api/telemetry/heatmap-data defaults to 7d', async () => {
@@ -552,14 +661,14 @@ test('GET /api/telemetry/heatmap-data isolates brands and assigns legacy rows on
     }
 
     const zev = await request(app)
-        .get('/api/telemetry/heatmap-data?period=24h&brandId=zev')
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=zev&excludeUserIds=cache-${runTag}`)
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(zev.status, 200);
     const zevSeeded = zev.body.points.filter((point) => rows.some((row) => row.lat === point.lat));
     assert.deepStrictEqual(zevSeeded.map((point) => point.lat), [rows[1].lat]);
 
     const turbo = await request(app)
-        .get('/api/telemetry/heatmap-data?period=24h&brandId=turbo_station')
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=cache-${runTag}`)
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(turbo.status, 200);
     const turboSeeded = turbo.body.points
@@ -609,7 +718,7 @@ test('GET /api/telemetry/heatmap-data?excludeUserIds=X → drops events from X',
     });
 
     const baseline = await request(app)
-        .get('/api/telemetry/heatmap-data?period=24h&brandId=turbo_station')
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=cache-${runTag}`)
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(baseline.status, 200);
     const seededPts = baseline.body.points.filter(
@@ -618,7 +727,7 @@ test('GET /api/telemetry/heatmap-data?excludeUserIds=X → drops events from X',
     assert.strictEqual(seededPts.length, 2, `expected both seeded points, got ${seededPts.length}`);
 
     const filtered = await request(app)
-        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=${excludeUid}`)
+        .get(`/api/telemetry/heatmap-data?period=24h&brandId=turbo_station&excludeUserIds=cache-${runTag},${excludeUid}`)
         .set('X-Monitor-Secret', SECRET);
     assert.strictEqual(filtered.status, 200);
     const filteredSeeded = filtered.body.points.filter(
@@ -1222,7 +1331,7 @@ test('GET /api/telemetry/health-summary with secret → 200 or graceful 503, nev
 // Clean up test data after all tests
 test._cleanup = () => {
     try {
-        db.prepare("DELETE FROM mobile_events WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%' OR session_id LIKE 'brand-env-%' OR session_id LIKE 'brand-evt-%' OR session_id LIKE 'brand-none-%' OR session_id LIKE 'heatmap-brand-%' OR session_id LIKE 'excl-%' OR session_id LIKE 'evtq-%' OR session_id LIKE 'evtbr-%' OR session_id LIKE 'evtany-%' OR session_id LIKE 'evtlim-%'").run();
+        db.prepare("DELETE FROM mobile_events WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%' OR session_id LIKE 'online-brand-%' OR session_id LIKE 'brand-env-%' OR session_id LIKE 'brand-evt-%' OR session_id LIKE 'brand-none-%' OR session_id LIKE 'heatmap-brand-%' OR session_id LIKE 'excl-%' OR session_id LIKE 'evtq-%' OR session_id LIKE 'evtbr-%' OR session_id LIKE 'evtany-%' OR session_id LIKE 'evtlim-%'").run();
         db.prepare("DELETE FROM mobile_raw WHERE session_id LIKE 'test-%' OR session_id LIKE 'gzip-test-%' OR session_id LIKE 'db-check-%' OR session_id LIKE 'presence-test-%' OR session_id LIKE 'brand-env-%' OR session_id LIKE 'brand-evt-%' OR session_id LIKE 'brand-none-%' OR session_id LIKE 'evtq-%' OR session_id LIKE 'evtbr-%' OR session_id LIKE 'evtany-%' OR session_id LIKE 'evtlim-%'").run();
         db.prepare("DELETE FROM user_log_dumps WHERE user_id LIKE 'test-%' OR user_id LIKE 'persist-test-%' OR user_id LIKE 'query-test-%' OR user_id LIKE 'purge-test-%'").run();
         console.log('\n🧹 Test data cleaned up');
