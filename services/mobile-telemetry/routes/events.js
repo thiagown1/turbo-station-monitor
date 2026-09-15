@@ -32,7 +32,7 @@
 const { Router } = require('express');
 const { db } = require('../lib/db');
 const { LOG_TAG } = require('../lib/constants');
-const { buildBrandFilter } = require('../lib/utils');
+const { buildEventsQuery } = require('../lib/events-query');
 
 const router = Router();
 
@@ -86,32 +86,8 @@ router.get('/', (req, res) => {
             ? Math.min(MAX_LIMIT, Math.floor(limitRaw))
             : DEFAULT_LIMIT;
 
-        // Build SQL with dynamic placeholders for IN clause.
-        const placeholders = eventTypes.map(() => '?').join(',');
-        // Brand filter. Tenant-less legacy rows are attributed to the DEFAULT
-        // brand only (see buildBrandFilter): they used to be included for every
-        // brand, which was the right stopgap while nothing stamped brand_id,
-        // but now leaks turbo_station's legacy traffic into a ZEV/PluGreen view.
-        const { clause: brandClause, cacheKeyPart } = buildBrandFilter(brandId);
-        const cacheKey = `${eventTypes.length}:${cacheKeyPart}`;
-        const stmt = cacheStmt(cacheKey, () => db.prepare(`
-            SELECT
-                event_timestamp AS timestamp,
-                event_type,
-                user_id,
-                device_id,
-                app_version,
-                station_id,
-                brand_id,
-                data_json
-            FROM mobile_events
-            WHERE event_timestamp >= ?
-              AND event_timestamp < ?
-              AND event_type IN (${placeholders})
-              ${brandClause}
-            ORDER BY event_timestamp DESC
-            LIMIT ?
-        `));
+        const query = buildEventsQuery({ eventTypeCount: eventTypes.length, brandId });
+        const stmt = cacheStmt(query.cacheKey, () => db.prepare(query.sql));
 
         const params = brandId
             ? [startMs, endMs, ...eventTypes, brandId, brandId, limit + 1]

@@ -135,16 +135,6 @@ const stmts = {
     )
   `),
 
-  /** Get currently online users (presence heartbeats within the window). */
-  onlineUsers: db.prepare(`
-    SELECT device_id, user_id, data_json, MAX(event_timestamp) AS last_seen
-    FROM mobile_events
-    WHERE event_type IN ('app_presence_start', 'app_presence_heartbeat')
-      AND event_timestamp > ?
-    GROUP BY device_id
-    ORDER BY last_seen DESC
-  `),
-
   /**
    * Get each device's most recent presence location within the given
    * cutoff. Unlike `onlineUsers` (fixed at PRESENCE_WINDOW_MS = "online
