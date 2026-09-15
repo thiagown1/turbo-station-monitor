@@ -18,8 +18,10 @@ The worker publishes only when all of these conditions hold:
 7. Health checks for affected HTTP services return 2xx.
 
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
-is `db/.monitor-deploy.lock`. Both are runtime state and remain outside Git.
-Logs are appended to `logs/monitor-deploy.log`.
+is `db/.monitor-deploy.lock`. Successfully applied dependency/install and
+per-service restart revisions are stored in
+`db/.monitor-deploy-progress.json`. These are runtime state and remain outside
+Git. Logs are appended to `logs/monitor-deploy.log`.
 
 The worker waits for CI before taking the deployment lock. If GitHub cancels an
 older CI run because a newer `main` commit contains that target, the older
@@ -35,15 +37,17 @@ Affected services are calculated from `git diff --name-only` between the last
 successfully deployed SHA and the requested SHA. The webhook payload's commit
 file list is not trusted as the deployment source of truth.
 
-Changes to `ecosystem.config.js`, root dependency manifests, or shared
-`services/lib/` code restart every managed monitor service. Service-specific
-changes restart only the corresponding PM2 process.
+Changes to `ecosystem.config.js`, the root lockfile or runtime dependency fields,
+or shared `services/lib/` code restart every managed monitor service.
+Script-only edits to the root `package.json` do not fan out to every service.
+Service-specific changes restart only the corresponding PM2 process.
 
 ## Dependency installation
 
-`npm ci` runs only when the release diff touches `package.json` or
-`package-lock.json` (root, or `services/support-copilot/`), or when the matching
-`node_modules/` is absent. A code-only release installs nothing.
+`npm ci` runs only when the release diff touches `package-lock.json`, changes a
+runtime-affecting `package.json` field (root or `services/support-copilot/`), or
+when the matching `node_modules/` is absent. Script-only and code-only releases
+install nothing.
 
 This is a safety gate, not an optimisation. `npm ci` deletes `node_modules`
 before reinstalling, and on the monitor box, with the CI runners loaded, the
@@ -58,10 +62,12 @@ When an install does run, the ceiling is 900 seconds and a timeout is reported
 as `npm ci (<scope>) timed out after <n>s`, so the notification names the real
 failure instead of the last line npm happened to print.
 
-Because the diff is taken from the deployed marker rather than from `HEAD`, a
-release that dies before the install is retried correctly: the marker still
-points at the previously installed SHA, so the manifest change stays inside the
-next diff.
+The global marker advances only after health verification, while the progress
+file advances after each successful install and service restart. A retry still
+health-checks every service affected by the pending global diff, but does not
+repeat an already applied install or restart. Per-service revisions also stop a
+later release from replaying old work merely because the global marker remained
+behind after a health failure.
 
 ## Failure behavior
 
@@ -71,8 +77,33 @@ health verification, and `pm2 save` succeed. Failures are logged and sent to the
 configured WhatsApp conversation through the authenticated support-copilot API.
 
 No automatic destructive rollback is performed. If a restart or health check
-fails, keep the deployed marker on the previous SHA and perform the documented
-manual recovery after inspecting logs and the exact release diff.
+fails, the deployed marker stays on the previous SHA while successful steps are
+recorded in the progress file. Inspect logs and the exact release diff before
+manual recovery; do not delete the progress file merely to force a replay.
+
+## Mobile telemetry retention migration
+
+The retention worker refuses to delete rows from an existing database until an
+index beginning with `mobile_events.raw_id` exists. This is intentional: with
+SQLite foreign keys enabled, deleting each `mobile_raw` parent otherwise scans
+the complete child table and can starve `/health` for minutes.
+
+Deploy the worker/index guard first. It is safe for the service to report
+`X-Retention-State: blocked-index`; ingestion and liveness remain available and
+no TTL rows are deleted. The database change is a separate production action:
+
+```bash
+node scripts/migrate-mobile-raw-id-index.js
+node scripts/migrate-mobile-raw-id-index.js --apply
+```
+
+The first command is read-only. Run `--apply` only in an explicitly authorized
+maintenance window after checking free disk space, database backup/restore
+readiness, and current write load. The script takes an exclusive migration lock,
+creates `idx_mobile_events_raw_id`, and verifies the foreign-key delete plan.
+Afterward, restart only `mobile-telemetry`, verify `/health`, confirm
+`X-Retention-State` advances to `ok` after a sweep, inspect logs, and reconcile
+`.monitor-deployed-sha` only after the exact deployed revision is healthy.
 
 ## Recovering a dirty production checkout
 

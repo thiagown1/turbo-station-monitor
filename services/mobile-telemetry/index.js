@@ -67,8 +67,6 @@ app.use((err, _req, res, _next) => {
 // ─── Server (only when run directly, not when imported by tests) ────────────
 
 if (require.main === module) {
-    require('./lib/retention').startRetentionSweeps();
-
     const server = app.listen(PORT, BIND_HOST, () => {
         console.log(`${LOG_TAG} Server listening on ${BIND_HOST}:${PORT}`);
         console.log(`${LOG_TAG} Routes:`);
@@ -80,9 +78,11 @@ if (require.main === module) {
         console.log(`${LOG_TAG}   GET  /api/telemetry/events`);
         console.log(`${LOG_TAG}   POST /api/telemetry/mobile`);
     });
+    const retentionSweeps = require('./lib/retention').startRetentionSweeps();
 
     process.on('SIGTERM', () => {
         console.log(`${LOG_TAG} SIGTERM received, closing server...`);
+        retentionSweeps.close();
         server.close(() => {
             require('./lib/heatmap-query-runner').heatmapQueryRunner.close();
             db.close();

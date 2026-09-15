@@ -18,6 +18,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const Database = require('better-sqlite3');
+const { spawnSync } = require('child_process');
 
 // ─── Test harness ───────────────────────────────────────────────────────────────
 
@@ -54,11 +55,23 @@ async function runAll() {
 // Set env var before requiring app so auth middleware works
 process.env.MONITOR_API_SECRET = 'test-secret-12345';
 process.env.TELEMETRY_API_KEY = 'test-telemetry-key-not-real';
+const testDatabaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mobile-telemetry-tests-'));
+process.env.MOBILE_DB_PATH = path.join(testDatabaseDir, 'mobile.db');
 
 const app = require('../index');
 const { db, stmts } = require('../lib/db');
 const { parseLocation, deriveSeverity, buildBrandFilter, DEFAULT_BRAND_ID } = require('../lib/utils');
-const { deleteOlderThan, sweep, CHUNK_SIZE } = require('../lib/retention');
+const {
+    deleteOlderThan,
+    sweep,
+    CHUNK_SIZE,
+    RetentionWorkerRunner,
+} = require('../lib/retention');
+const {
+    RAW_ID_INDEX,
+    hasRawIdIndex,
+} = require('../lib/retention-index');
+const { migrateRawIdIndex } = require('../../../scripts/migrate-mobile-raw-id-index');
 const { HEATMAP_TIME_INDEX, buildHeatmapQuery } = require('../lib/heatmap-query');
 const { HeatmapQueryCache } = require('../lib/heatmap-query-cache');
 const {
@@ -275,6 +288,21 @@ test('heatmap worker is terminated at its deadline instead of hanging the proxy'
     runner.close();
 });
 
+test('retention worker keeps the main event loop responsive during blocking SQLite work', async () => {
+    const runner = new RetentionWorkerRunner({
+        workerPath: path.join(__dirname, 'fixtures', 'slow-retention-worker.js'),
+        workerData: { delayMs: 120 },
+        timeoutMs: 1000,
+    });
+    let timerFired = false;
+    const pending = runner.run({ now: Date.now() });
+    setTimeout(() => { timerFired = true; }, 10);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    assert.strictEqual(timerFired, true, 'main event loop should not wait for retention CPU work');
+    assert.deepStrictEqual(await pending, { events: 2, raw: 1 });
+    runner.close();
+});
+
 // ─── 2. Integration Tests: Routes ───────────────────────────────────────────────
 
 // ── Health ───────────────────────────────────────────────────────────────────────
@@ -283,6 +311,7 @@ test('GET /health → 200 OK', async () => {
     const res = await request(app).get('/health');
     assert.strictEqual(res.status, 200);
     assert.ok(res.text.includes('OK'));
+    assert.strictEqual(res.headers['x-retention-state'], 'idle');
 });
 
 test('GET /ping → 200 OK', async () => {
@@ -332,9 +361,117 @@ test('retention deletes events before raw rows and chunks large deletes', async 
         },
     };
     assert.strictEqual(await deleteOlderThan('mobile_events', 123, fakeDb), CHUNK_SIZE + 2);
-    const result = await sweep({ database: fakeDb, now: Date.now(), log: { log() {}, error() {} } });
+    const result = await sweep({
+        database: fakeDb,
+        now: Date.now(),
+        log: { log() {}, error() {} },
+        validate: () => {},
+    });
     assert.deepStrictEqual(result, { events: 0, raw: 3 });
     assert.deepStrictEqual(order, ['mobile_events', 'mobile_events', 'mobile_raw']);
+});
+
+test('retention child lookup uses an index when foreign keys are enabled', () => {
+    assert.strictEqual(hasRawIdIndex(db), true, `${RAW_ID_INDEX} must exist on fresh databases`);
+    db.pragma('foreign_keys = ON');
+    const plan = db.prepare(`
+        EXPLAIN QUERY PLAN
+        DELETE FROM mobile_raw
+        WHERE rowid IN (
+            SELECT rowid FROM mobile_raw
+            WHERE received_at < ?
+            LIMIT ${CHUNK_SIZE}
+        )
+    `).all(0);
+    const detail = plan.map((row) => row.detail).join('\n');
+    assert.ok(detail.includes(RAW_ID_INDEX), detail);
+    assert.ok(!detail.includes('SCAN mobile_events'), detail);
+});
+
+test('service startup does not build the new index over an existing database', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mobile-retention-existing-'));
+    const dbPath = path.join(dir, 'mobile.db');
+    const database = new Database(dbPath);
+    database.exec(`
+        CREATE TABLE mobile_raw (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, received_at INTEGER NOT NULL,
+            session_id TEXT, device_id TEXT, app_version TEXT, platform TEXT,
+            user_id TEXT, payload_json TEXT NOT NULL
+        );
+        CREATE TABLE mobile_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, raw_id INTEGER,
+            received_at INTEGER NOT NULL, event_timestamp INTEGER,
+            session_id TEXT, device_id TEXT, app_version TEXT, platform TEXT,
+            user_id TEXT, event_type TEXT, station_id TEXT, brand_id TEXT,
+            severity TEXT, message TEXT, data_json TEXT,
+            FOREIGN KEY(raw_id) REFERENCES mobile_raw(id)
+        );
+    `);
+    database.close();
+
+    const result = spawnSync(process.execPath, [
+        '-e',
+        "require('./services/mobile-telemetry/lib/db').db.close()",
+    ], {
+        cwd: path.resolve(__dirname, '..', '..', '..'),
+        env: { ...process.env, MOBILE_DB_PATH: dbPath },
+        encoding: 'utf8',
+    });
+    assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+    const reopened = new Database(dbPath);
+    assert.strictEqual(hasRawIdIndex(reopened), false, 'existing DB migration must remain operator-controlled');
+    reopened.close();
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+});
+
+test('retention fails closed before deleting when the raw_id index is missing', async () => {
+    const database = new Database(':memory:');
+    database.pragma('foreign_keys = ON');
+    database.exec(`
+        CREATE TABLE mobile_raw (
+            id INTEGER PRIMARY KEY,
+            received_at INTEGER NOT NULL
+        );
+        CREATE TABLE mobile_events (
+            id INTEGER PRIMARY KEY,
+            raw_id INTEGER,
+            received_at INTEGER NOT NULL,
+            FOREIGN KEY(raw_id) REFERENCES mobile_raw(id)
+        );
+    `);
+    database.prepare('INSERT INTO mobile_raw (id, received_at) VALUES (?, ?)').run(1, 1);
+    const result = await sweep({
+        database,
+        now: Date.now(),
+        log: { log() {}, error() {} },
+    });
+    assert.ok(result.error);
+    assert.strictEqual(result.error.code, 'ERETENTIONINDEX');
+    assert.strictEqual(database.prepare('SELECT count(*) AS n FROM mobile_raw').get().n, 1);
+    database.close();
+});
+
+test('retention index migration is inspect-only unless --apply is explicit', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mobile-retention-migration-'));
+    const dbPath = path.join(dir, 'mobile.db');
+    const database = new Database(dbPath);
+    database.exec(`
+        CREATE TABLE mobile_raw (id INTEGER PRIMARY KEY, received_at INTEGER NOT NULL);
+        CREATE TABLE mobile_events (
+            id INTEGER PRIMARY KEY,
+            raw_id INTEGER,
+            received_at INTEGER NOT NULL,
+            FOREIGN KEY(raw_id) REFERENCES mobile_raw(id)
+        );
+    `);
+    database.close();
+
+    const dryRun = migrateRawIdIndex({ dbPath, log: () => {} });
+    assert.strictEqual(dryRun.ready, false);
+    const applied = migrateRawIdIndex({ dbPath, apply: true, log: () => {} });
+    assert.strictEqual(applied.ready, true);
+    assert.ok(applied.plan.some((detail) => detail.includes(RAW_ID_INDEX)), applied.plan.join('\n'));
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 });
 
 test('retention rejects arbitrary table names', async () => {
@@ -1338,6 +1475,9 @@ test._cleanup = () => {
     } catch (err) {
         console.error('Cleanup error:', err.message);
     }
+    try { require('../lib/heatmap-query-runner').heatmapQueryRunner.close(); } catch {}
+    try { db.close(); } catch {}
+    fs.rmSync(testDatabaseDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
 };
 
 runAll().then(() => {

@@ -12,6 +12,7 @@
 
 const Database = require('better-sqlite3');
 const { DB_PATH, LOG_TAG } = require('./constants');
+const { RAW_ID_INDEX } = require('./retention-index');
 
 // ─── Connection ─────────────────────────────────────────────────────────────────
 
@@ -29,6 +30,9 @@ try {
 // ─── Schema ─────────────────────────────────────────────────────────────────────
 
 try {
+  const hadEventsTable = Boolean(db.prepare(
+    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'mobile_events'"
+  ).get());
   db.exec(`
     -- Raw ingest: full payload kept for debugging and replay.
     CREATE TABLE IF NOT EXISTS mobile_raw (
@@ -86,6 +90,12 @@ try {
     CREATE INDEX IF NOT EXISTS idx_user_log_dumps_user_id     ON user_log_dumps(user_id);
     CREATE INDEX IF NOT EXISTS idx_user_log_dumps_received_at ON user_log_dumps(received_at);
   `);
+  // New databases are born with the FK support index. Existing databases use
+  // the explicit operational migration: creating it over a multi-GB table at
+  // process startup would make the liveness endpoint unavailable again.
+  if (!hadEventsTable) {
+    db.exec(`CREATE INDEX IF NOT EXISTS ${RAW_ID_INDEX} ON mobile_events(raw_id)`);
+  }
   console.log(`${LOG_TAG} Schema ready (mobile_raw, mobile_events, user_log_dumps)`);
 } catch (err) {
   console.error(`${LOG_TAG} Failed to initialise schema:`, err.message);
