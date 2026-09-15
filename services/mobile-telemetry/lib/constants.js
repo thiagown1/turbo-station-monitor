@@ -28,7 +28,7 @@ const MONITOR_API_SECRET = process.env.MONITOR_API_SECRET || '';
 // ─── Database ───────────────────────────────────────────────────────────────────
 
 /** Path to the dedicated mobile telemetry SQLite database. */
-const DB_PATH = path.join(__dirname, '..', '..', '..', 'db', 'mobile.db');
+const DB_PATH = process.env.MOBILE_DB_PATH || path.join(__dirname, '..', '..', '..', 'db', 'mobile.db');
 
 // ─── Ingestion ──────────────────────────────────────────────────────────────────
 

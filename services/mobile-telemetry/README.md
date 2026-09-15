@@ -28,6 +28,7 @@ mobile-telemetry/
     heatmap-query-cache.js ← private TTL cache + concurrent request coalescing
     heatmap-query-runner.js ← worker lifecycle + 25s deadline
     heatmap-query-worker.js ← isolated better-sqlite3 reader
+    retention-worker.js   ← isolated TTL deletes; never blocks HTTP liveness
     presence-query.js   ← tenant-scoped, timestamp-indexed presence SQL
     utils.js            ← parseLocation(), deriveSeverity()
   middleware/
@@ -66,6 +67,14 @@ table scans and a deployment-time index migration on the production database.
 A 25-second heatmap deadline terminates and recreates a stuck worker before the
 outer nginx/Vercel timeout.
 
+TTL deletion also runs in a worker thread, 30 seconds after HTTP startup and
+then every six hours. Deleting `mobile_raw` with foreign keys enabled requires
+an index whose first column is `mobile_events.raw_id`; otherwise SQLite probes
+the entire child table once per parent row. Retention therefore fails closed
+with `X-Retention-State: blocked-index` while `/health` remains responsive.
+Fresh databases include `idx_mobile_events_raw_id`. Existing databases require
+the explicit, separately authorized migration documented in `docs/AUTO_DEPLOY.md`.
+
 Heatmap aggregates are cached privately in-process for five minutes, with at
 most 64 tenant/period/exclusion variants. Concurrent requests for the same key
 share one worker query. Responses remain `private, no-store` because the result
@@ -93,6 +102,7 @@ falling back to a cross-brand presence query.
 | `PORT` | `3003` | HTTP port |
 | `TELEMETRY_API_KEY` | *(required)* | Mobile app ingestion key |
 | `MOBILE_TTL_DAYS` | `180` | Retention for `mobile_events` and `mobile_raw` |
+| `MOBILE_DB_PATH` | `db/mobile.db` | Optional explicit SQLite path (tests and maintenance tooling) |
 | `MONITOR_API_SECRET` | *(empty)* | Shared secret for dashboard endpoints |
 
 ## Local Development
