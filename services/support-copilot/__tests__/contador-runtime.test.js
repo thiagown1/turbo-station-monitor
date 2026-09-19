@@ -485,6 +485,94 @@ try {
   assert.equal(memoria.semEnv, false);
   console.log('PASS Contador projects facts and open questions into the workspace memory');
 }
+
+{
+  const receiptOutput = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      const seen = [];
+      const respond = (status, body) => async (url, init) => {
+        seen.push({ url: String(url), headers: init.headers, body: JSON.parse(init.body) });
+        return { ok: status < 400, status, json: async () => body };
+      };
+      const payload = {
+        kind: 'monthly_cost', sourceMessageId: 'wamid-r1', amountCents: 463932,
+        period: { year: 2026, month: 9 }, receiptRef: 'E60701TEST', receiptAt: '2026-09-05',
+        description: 'Equatorial sede', category: 'infra', stationId: undefined, supplier: null,
+      };
+      global.fetch = respond(201, { id: 'cost_1', kind: 'monthly_cost' });
+      const created = await runtime._registerReceiptForTest(payload);
+      global.fetch = respond(409, { error: 'already_registered' });
+      const duplicate = await runtime._registerReceiptForTest(payload);
+      global.fetch = respond(503, {});
+      let retryable = null;
+      try { await runtime._registerReceiptForTest(payload); } catch (error) { retryable = error.retryable; }
+      global.fetch = respond(400, {});
+      let permanent = null;
+      try { await runtime._registerReceiptForTest(payload); } catch (error) { permanent = error.retryable; }
+      process.stdout.write(JSON.stringify({ created, duplicate, retryable, permanent, seen: seen[0] }));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: dbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_RECEIPTS_API_KEY: 'tsk_test_key',
+    },
+    encoding: 'utf8',
+  });
+
+  const receipt = JSON.parse(receiptOutput.slice(receiptOutput.lastIndexOf(String.fromCharCode(10)) + 1));
+  assert.equal(receipt.created.outcome, 'registered');
+  assert.match(receipt.created.replyMessage, /R\$ 4\.639,32/);
+  assert.match(receipt.created.replyMessage, /compet.ncia 9\/2026/);
+  assert.equal(receipt.duplicate.outcome, 'duplicate');
+  // Reprocessar nao pode virar um segundo custo: 409 e a resposta esperada.
+  assert.match(receipt.duplicate.replyMessage, /j. estava registrado/);
+  assert.equal(receipt.retryable, true);
+  assert.equal(receipt.permanent, false);
+  // A rota de comprovantes usa a API key com escopo, nunca o bearer compartilhado.
+  assert.equal(receipt.seen.url, 'http://localhost:9999/api/accounting/bill-receipts');
+  assert.equal(receipt.seen.headers['x-api-key'], 'tsk_test_key');
+  assert.equal(receipt.seen.headers.Authorization, undefined);
+  // Campos vazios nao chegam ao schema da rota.
+  assert.equal('stationId' in receipt.seen.body, false);
+  assert.equal('supplier' in receipt.seen.body, false);
+  console.log('PASS Contador registra comprovante com API key escopada e trata duplicata');
+}
+
+{
+  const semKey = execFileSync(process.execPath, ['-e', `
+    (async () => {
+      const runtime = require('./lib/contador-runtime');
+      const { db } = require('./lib/db');
+      global.fetch = async () => { throw new Error('sem API key nao pode haver chamada'); };
+      const result = await runtime._registerReceiptForTest({ kind: 'monthly_cost', amountCents: 1, period: { year: 2026, month: 9 } });
+      process.stdout.write(JSON.stringify(result));
+      db.close();
+    })().catch(error => { console.error(error); process.exit(1); });
+  `], {
+    cwd: path.join(__dirname, '..'),
+    env: {
+      ...process.env,
+      SUPPORT_COPILOT_DB_PATH: dbPath,
+      CONTADOR_ENABLED: 'true',
+      CONTADOR_GROUP_CONVERSATION_ID: 'contas@g.us',
+      CONTADOR_NEXT_BASE_URL: 'http://localhost:9999',
+      CONTADOR_NEXT_SECRET: 'test-secret',
+      CONTADOR_RECEIPTS_API_KEY: '',
+    },
+    encoding: 'utf8',
+  });
+  assert.deepEqual(JSON.parse(semKey.slice(semKey.lastIndexOf(String.fromCharCode(10)) + 1)), { outcome: 'unavailable', replyMessage: null });
+  console.log('PASS sem CONTADOR_RECEIPTS_API_KEY o registro fica indisponivel em vez de falhar aberto');
+}
 } finally {
   fs.rmSync(memoriaDir, { recursive: true, force: true });
   for (const target of [dbPath, backfillDbPath, baselineDbPath, retryDbPath, sendFailureDbPath, deliveryDbPath, replyDbPath, memoriaDbPath]) {

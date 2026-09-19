@@ -55,6 +55,12 @@ const CONTADOR_GROUP_CONVERSATION_ID = (process.env.CONTADOR_GROUP_CONVERSATION_
 const CONTADOR_OPEN_CONVERSATION = process.env.CONTADOR_OPEN_CONVERSATION === 'true';
 const CONTADOR_NEXT_BASE_URL = (process.env.CONTADOR_NEXT_BASE_URL || '').replace(/\/$/, '');
 const CONTADOR_NEXT_SECRET = process.env.CONTADOR_NEXT_SECRET || process.env.ENERGY_BILL_INTAKE_SECRET || '';
+// Scoped Turbo Station API key (accounting:receipts:read + :write) used only by
+// POST /api/accounting/bill-receipts. It is NOT interchangeable with
+// CONTADOR_NEXT_SECRET: the bill-receipts route authenticates with the x-api-key
+// header so every write is attributed to `apikey:<prefix>` in the audit trail.
+// Unset means the Contador answers receipts but never registers them.
+const CONTADOR_RECEIPTS_API_KEY = process.env.CONTADOR_RECEIPTS_API_KEY || '';
 const CONTADOR_INSTANCE = process.env.CONTADOR_INSTANCE || process.env.GATEWAY_INSTANCE_NAME || 'turbostation';
 const CONTADOR_OPENCLAW_AGENT = process.env.CONTADOR_OPENCLAW_AGENT || 'contador';
 const CONTADOR_OPENCLAW_MODEL = process.env.CONTADOR_OPENCLAW_MODEL || 'claude-cli/claude-opus-4-8';
@@ -109,6 +115,7 @@ module.exports = {
   CONTADOR_OPEN_CONVERSATION,
   CONTADOR_NEXT_BASE_URL,
   CONTADOR_NEXT_SECRET,
+  CONTADOR_RECEIPTS_API_KEY,
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,

@@ -248,6 +248,45 @@ test('defers an energy invoice to Contador with structured fields and no duplica
   }
 });
 
+test('defers a supplier expense receipt to Contador as a registrable receipt job', () => {
+  const dbPath = path.join(os.tmpdir(), `agent-router-receipt-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    const output = execFileSync(process.execPath, ['-e', `
+      (async () => {
+        process.env.SUPPORT_COPILOT_DB_PATH = ${JSON.stringify(dbPath)};
+        process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
+        process.env.AGENT_EVENT_SECRET = 'test-secret';
+        process.env.OPENROUTER_API_KEY = 'test-openrouter';
+        let eventCalls = 0;
+        global.fetch = async (url) => {
+          if (String(url).includes('/api/agents/config')) return { ok: true, json: async () => ({ config: { enabled: true, model: 'openai/gpt-4o-mini', accountingGroupConversationIds: ['conv1'], agents: { accounting: true } } }) };
+          if (String(url).includes('openrouter.ai')) return { ok: true, json: async () => ({ choices: [{ message: { content: JSON.stringify({ kind: 'expense_receipt', summary: 'PIX Equatorial', confidence: 0.97, needs_attention: false, amount: 'R$ 4.639,32', settled_brl_amount: null, currency: 'BRL', transaction_date: '2026-09-05', competency: { year: 2026, month: 9 }, transaction_id: 'E60701TEST', payee: 'Equatorial', payee_document: '12.345.678/0001-90', suggested_category: null }) } }], usage: {} }) };
+          if (String(url).includes('/api/agents/events')) { eventCalls++; return { ok: true, status: 202, text: async () => '{}' }; }
+          throw new Error('unexpected URL ' + url);
+        };
+        const { db, nowIso } = require('./lib/db');
+        const router = require('./lib/agent-router');
+        const input = { messageId: 'receipt-1', conversationId: 'conv1', brandId: 'turbo_station', groupJid: 'contas@g.us', instance: 'turbostation', senderId: '5511999999999', body: 'paguei a conta', media: { media_type: 'image', mimetype: 'image/jpeg' }, receivedAt: nowIso(), deferEnergyInvoiceEvent: true };
+        const result = await router.routeInboundMessageDurably(input);
+        await router.deliverDueEvents();
+        const job = db.prepare('SELECT kind, status, payload_json FROM contador_jobs WHERE message_id = ?').get('receipt-1');
+        const payload = JSON.parse(job?.payload_json || '{}');
+        const outbox = db.prepare('SELECT COUNT(*) count FROM agent_event_outbox').get();
+        if (!result.eventDeferred || !result.contadorJobPersisted) throw new Error('expense receipt was not deferred to the Contador');
+        if (job?.kind !== 'receipt' || job?.status !== 'pending') throw new Error('expected a pending receipt job, got ' + JSON.stringify(job));
+        if (payload.receiptExtraction?.amountCents !== 463932) throw new Error('trusted amount missing: ' + JSON.stringify(payload.receiptExtraction));
+        if (payload.receiptExtraction?.receiptRef !== 'E60701TEST') throw new Error('receipt ref missing');
+        if (payload.visionExtraction) throw new Error('receipt jobs must not carry an energy-bill extraction');
+        if (outbox.count !== 0 || eventCalls !== 0) throw new Error('receipt was duplicated as a generic approval event');
+        console.log('receipt-deferred-ok');
+      })().catch(e => { console.error(e); process.exit(1); });
+    `], { cwd: path.join(__dirname, '..'), env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    assert.ok(output.includes('receipt-deferred-ok'));
+  } finally {
+    for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+  }
+});
+
 test('retries a temporary config failure without reserving the Contador message id', () => {
   const dbPath = path.join(os.tmpdir(), `agent-router-config-retry-${process.pid}-${Date.now()}.sqlite`);
   try {

@@ -16,6 +16,7 @@ const {
   CONTADOR_OPEN_CONVERSATION,
   CONTADOR_NEXT_BASE_URL,
   CONTADOR_NEXT_SECRET,
+  CONTADOR_RECEIPTS_API_KEY,
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,
@@ -42,6 +43,7 @@ const config = {
   openConversation: CONTADOR_OPEN_CONVERSATION,
   nextBaseUrl: CONTADOR_NEXT_BASE_URL,
   secret: CONTADOR_NEXT_SECRET,
+  receiptsApiKey: CONTADOR_RECEIPTS_API_KEY,
   instance: CONTADOR_INSTANCE,
   agent: CONTADOR_OPENCLAW_AGENT,
   model: CONTADOR_OPENCLAW_MODEL,
@@ -91,6 +93,50 @@ async function postNext(route, body) {
     throw err;
   }
   return data;
+}
+
+function formatBRL(cents) {
+  return `R$ ${(cents / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+// Unlike postNext, this route is authenticated with a scoped API key, not the
+// shared bearer secret: the Turbo Station side attributes the write to
+// `apikey:<prefix>`, so the key must never be swapped for config.secret.
+// 409 is the idempotency answer (deterministic doc id from sourceMessageId) and
+// is a normal outcome on reprocessing, not an error.
+async function registerReceipt(payload) {
+  if (!configured()) throw new Error('Contador is enabled but required configuration is incomplete');
+  if (!config.receiptsApiKey) return { outcome: 'unavailable', replyMessage: null };
+  const body = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (value !== undefined && value !== null) body[key] = value;
+  }
+  const route = '/api/accounting/bill-receipts';
+  const response = await fetch(`${config.nextBaseUrl}${route}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-api-key': config.receiptsApiKey },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(120_000),
+  });
+  const data = await response.json().catch(() => null);
+  const amount = formatBRL(payload.amountCents);
+  const what = payload.kind === 'station_energy'
+    ? `energia da estação ${payload.stationId} (${payload.supplier})`
+    : `custo ${payload.category}: ${payload.description}`;
+  if (response.status === 409) {
+    return { outcome: 'duplicate', replyMessage: `Esse comprovante de ${amount} já estava registrado, não dupliquei.` };
+  }
+  if (!response.ok) {
+    const err = new Error(`Next ${route} failed with HTTP ${response.status}`);
+    err.statusCode = response.status;
+    err.retryable = response.status >= 500 || response.status === 429;
+    throw err;
+  }
+  return {
+    outcome: 'registered',
+    replyMessage: `Registrei ${amount} como ${what}, competência ${payload.period.month}/${payload.period.year}.`,
+    id: data?.id || null,
+  };
 }
 
 // The OpenClaw gateway spends most of a Contador call on session load and
@@ -393,6 +439,7 @@ let contador = buildContador({
   config,
   readMedia,
   intake: (payload) => postNext('/api/accounting/energy-bill-intake', payload),
+  registerReceipt,
   queryTool: async (tool, params) => {
     const response = await postNext('/api/accounting/energy-agent/query', { tool, params });
     if (!response || response.data == null) throw new Error(`Next query ${tool} returned no data`);
@@ -826,6 +873,7 @@ module.exports = {
   resolveMediaPath,
   sendReply,
   _setContadorForTest,
+  _registerReceiptForTest: registerReceipt,
   _recordOutboundForTest: recordOutbound,
   _recoverInterruptedContadorWorkForTest: recoverInterruptedContadorWork,
 };

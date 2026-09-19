@@ -791,6 +791,146 @@ test('analise sem valor ainda entrega o resumo', () => {
   assert.equal(describeMediaAnalysis(semValor), '[energy_invoice] Fatura Equatorial');
 });
 
+
+// --- register_receipt (comprovante de despesa registrado sozinho) ------------
+
+const receiptEvent = {
+  kind: 'receipt',
+  messageId: 'wamid-receipt-1',
+  groupJid: config.groupConversationId,
+  sender: 'Financeiro',
+  body: 'paguei a Equatorial',
+  receiptExtraction: {
+    amountCents: 463932,
+    receiptRef: 'E60701TEST',
+    transactionDate: '2026-09-05',
+    suggestedPeriod: { year: 2026, month: 9 },
+    payee: 'Equatorial',
+  },
+};
+
+function receiptContador(overrides) {
+  return buildContador({
+    config,
+    readMedia: async () => { throw new Error('receipt jobs must not read media bytes'); },
+    intake: async () => { throw new Error('receipt jobs must not use the energy intake'); },
+    loadContext: async () => [],
+    listarFatos: async () => [],
+    listarPerguntasAbertas: async () => [],
+    sendReply: async () => {},
+    queryTool: async () => ({}),
+    ...overrides,
+  });
+}
+
+test('register_receipt aceita apenas os buckets e categorias reais', () => {
+  assert.deepEqual(
+    parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'monthly_cost', category: 'infra', description: 'Conta de energia da sede' })),
+    { action: 'register_receipt', bucket: 'monthly_cost', category: 'infra', description: 'Conta de energia da sede' },
+  );
+  // "energia" nao existe na lista de categorias de custo mensal.
+  assert.equal(parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'monthly_cost', category: 'energia', description: 'Equatorial' })).action, 'invalid');
+  assert.equal(parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'monthly_cost', category: 'infra' })).action, 'invalid');
+  assert.equal(parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'station_energy', supplier: 'Equatorial' })).action, 'invalid');
+  assert.equal(parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'qualquer_coisa' })).action, 'invalid');
+  assert.deepEqual(
+    parseAgentInstruction(JSON.stringify({ action: 'register_receipt', bucket: 'station_energy', stationId: 'st-1', supplier: 'Equatorial' })),
+    { action: 'register_receipt', bucket: 'station_energy', stationId: 'st-1', supplier: 'Equatorial', description: undefined },
+  );
+});
+
+test('o dinheiro vem da extracao, nunca do modelo', async () => {
+  const sent = [];
+  let payload = null;
+  const contador = receiptContador({
+    // O modelo tenta injetar outro valor: ele deve ser ignorado.
+    runAgent: async () => JSON.stringify({ action: 'register_receipt', bucket: 'monthly_cost', category: 'infra', description: 'Equatorial sede', amountCents: 1, period: { year: 1999, month: 1 } }),
+    registerReceipt: async (body) => { payload = body; return { outcome: 'registered', replyMessage: 'Registrei R$ 4.639,32.' }; },
+    sendReply: async (text) => sent.push(text),
+  });
+
+  const result = await contador.handle(receiptEvent);
+  assert.equal(result.status, 'sent');
+  assert.equal(result.outcome, 'registered');
+  assert.equal(payload.amountCents, 463932);
+  assert.equal(payload.sourceMessageId, 'wamid-receipt-1');
+  assert.equal(payload.kind, 'monthly_cost');
+  assert.equal(payload.category, 'infra');
+  assert.equal(payload.receiptRef, 'E60701TEST');
+  assert.deepEqual(payload.period, { year: 2026, month: 9 });
+  assert.equal(payload.stationId, undefined);
+  assert.deepEqual(sent, ['Registrei R$ 4.639,32.']);
+});
+
+test('sem extracao confiavel nao registra nada', async () => {
+  const contador = receiptContador({
+    runAgent: async () => { throw new Error('o modelo nao deve rodar sem valor lido'); },
+    registerReceipt: async () => { throw new Error('nao deve registrar'); },
+  });
+  const semValor = await contador.handle({ ...receiptEvent, receiptExtraction: { amountCents: 0 } });
+  assert.deepEqual(semValor, { status: 'blocked', reason: 'receipt_extraction_missing' });
+  const semExtracao = await contador.handle({ ...receiptEvent, receiptExtraction: undefined });
+  assert.deepEqual(semExtracao, { status: 'blocked', reason: 'receipt_extraction_missing' });
+});
+
+test('station_energy exige uma estacao vinda da ferramenta estacoes', async () => {
+  const sent = [];
+  const contador = receiptContador({
+    runAgent: async () => JSON.stringify({ action: 'register_receipt', bucket: 'station_energy', stationId: 'st-inventada', supplier: 'Equatorial' }),
+    registerReceipt: async () => { throw new Error('estacao nao verificada nao pode ser registrada'); },
+    sendReply: async (text) => sent.push(text),
+  });
+  const result = await contador.handle(receiptEvent);
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'receipt_station_not_verified');
+  assert.equal(sent.length, 1);
+});
+
+test('station_energy passa quando a estacao veio da consulta', async () => {
+  let payload = null;
+  let turn = 0;
+  const contador = receiptContador({
+    queryTool: async () => ({ stations: [{ id: 'st-1', name: 'Posto Centro' }] }),
+    runAgent: async () => {
+      turn += 1;
+      return turn === 1
+        ? JSON.stringify({ action: 'tool', tool: 'estacoes', params: {} })
+        : JSON.stringify({ action: 'register_receipt', bucket: 'station_energy', stationId: 'st-1', supplier: 'Equatorial' });
+    },
+    registerReceipt: async (body) => { payload = body; return { outcome: 'registered', replyMessage: 'ok' }; },
+  });
+  const result = await contador.handle(receiptEvent);
+  assert.equal(result.status, 'sent');
+  assert.equal(payload.kind, 'station_energy');
+  assert.equal(payload.stationId, 'st-1');
+  assert.equal(payload.supplier, 'Equatorial');
+  assert.equal(payload.amountCents, 463932);
+});
+
+test('sem a API key o Contador bloqueia em vez de fingir que registrou', async () => {
+  const contador = receiptContador({
+    runAgent: async () => JSON.stringify({ action: 'register_receipt', bucket: 'monthly_cost', category: 'infra', description: 'Equatorial sede' }),
+    registerReceipt: async () => ({ outcome: 'unavailable', replyMessage: null }),
+    sendReply: async () => { throw new Error('nao deve responder como se tivesse registrado'); },
+  });
+  const result = await contador.handle(receiptEvent);
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.reason, 'register_receipt_unavailable');
+});
+
+test('o Contador pode perguntar em vez de registrar no escuro', async () => {
+  const sent = [];
+  const contador = receiptContador({
+    runAgent: async () => JSON.stringify({ action: 'reply', text: 'Esse PIX foi de qual estação?' }),
+    registerReceipt: async () => { throw new Error('nao deve registrar ao perguntar'); },
+    sendReply: async (text) => sent.push(text),
+  });
+  const result = await contador.handle(receiptEvent);
+  assert.equal(result.status, 'sent');
+  assert.equal(result.outcome, 'question');
+  assert.deepEqual(sent, ['Esse PIX foi de qual estação?']);
+});
+
 (async () => {
   let failed = 0;
   for (const { name, fn } of tests) {

@@ -148,10 +148,51 @@ function shouldDeferEnergyInvoice(input, result) {
     && (isPdf || Number(result.confidence || 0) >= 0.85);
 }
 
+/**
+ * Comprovante de despesa que o Contador pode registrar sozinho.
+ *
+ * Só vale no grupo de Contas (o mesmo gate do energy_invoice) e só quando a
+ * visão leu um valor: sem amountCents não existe lançamento a fazer, e o
+ * caminho antigo (proposta de aprovação financeira) continua sendo o certo.
+ * O limite de confiança é alto de propósito — daqui sai um registro contábil
+ * sem revisão humana, então uma leitura duvidosa deve cair na proposta.
+ */
+function shouldDeferExpenseReceipt(input, result) {
+  return input.deferEnergyInvoiceEvent === true
+    && result.kind === 'expense_receipt'
+    && Number.isInteger(result.amountCents)
+    && result.amountCents > 0
+    && Number(result.confidence || 0) >= 0.85;
+}
+
+function shouldDeferToContador(input, result) {
+  return shouldDeferEnergyInvoice(input, result) || shouldDeferExpenseReceipt(input, result);
+}
+
+/**
+ * O que o Contador recebe como verdade sobre o dinheiro. O agente escolhe
+ * apenas o balde (custo mensal + categoria, ou energia de estação); valor,
+ * referência e data vêm daqui, da extração de visão, e nunca do texto do
+ * modelo.
+ */
+function receiptExtractionFor(result) {
+  return {
+    amountCents: result.amountCents,
+    receiptRef: result.receiptRef || undefined,
+    transactionDate: result.transactionDate || undefined,
+    suggestedPeriod: result.suggestedPeriod || undefined,
+    suggestedCategory: result.suggestedCategory || undefined,
+    payee: result.payee || undefined,
+    summary: result.summary || undefined,
+    currency: result.currency || undefined,
+  };
+}
+
 function deferredContadorJob(input, result) {
   const isPdf = isPdfInput(input);
   const messageId = input.externalMessageId || input.messageId;
-  const kind = isPdf ? 'pdf' : 'image';
+  const isExpenseReceipt = result.kind === 'expense_receipt';
+  const kind = isExpenseReceipt ? 'receipt' : (isPdf ? 'pdf' : 'image');
   const payload = {
     messageId,
     conversationId: input.conversationId,
@@ -164,7 +205,8 @@ function deferredContadorJob(input, result) {
     body: input.body,
     media: input.media,
     receivedAt: input.receivedAt,
-    visionExtraction: isPdf ? undefined : result.energyBill,
+    visionExtraction: isExpenseReceipt || isPdf ? undefined : result.energyBill,
+    receiptExtraction: isExpenseReceipt ? receiptExtractionFor(result) : undefined,
     kind,
   };
   const now = nowIso();
@@ -178,7 +220,7 @@ function deferredContadorJob(input, result) {
       attempts = 0,
       next_attempt_at = excluded.next_attempt_at,
       updated_at = excluded.updated_at
-    WHERE contador_jobs.status = 'blocked' AND excluded.kind = 'image'
+    WHERE contador_jobs.status = 'blocked' AND excluded.kind IN ('image', 'receipt')
   `).run(
     randomId('contador_job'), messageId, input.conversationId, input.brandId,
     input.groupJid, input.instance || '', kind, JSON.stringify(payload), now, now, now,
@@ -190,7 +232,7 @@ async function routeInboundMessage(input) {
   if (existing && existing.status !== 'error') {
     let cached = {};
     try { cached = JSON.parse(existing.result_json || '{}'); } catch (_) { cached = {}; }
-    const eventDeferred = shouldDeferEnergyInvoice(input, cached);
+    const eventDeferred = shouldDeferToContador(input, cached);
     if (eventDeferred) deferredContadorJob(input, cached);
     return { ...cached, duplicate: true, eventDeferred, contadorJobPersisted: eventDeferred };
   }
@@ -241,7 +283,7 @@ async function routeInboundMessage(input) {
   }
   const now = nowIso();
   const attempts = Number(existing?.attempts || 0) + 1;
-  const eventDeferred = shouldDeferEnergyInvoice(input, result);
+  const eventDeferred = shouldDeferToContador(input, result);
   const partnerId = resolvePartnerId(partnerLinks, result);
   const eventPayload = result.status === 'ok' ? {
     brandId: input.brandId,
@@ -623,5 +665,7 @@ module.exports = {
   accountingGroupFromConfig,
   isAccountingGroup,
   shouldDeferEnergyInvoice,
+  shouldDeferExpenseReceipt,
+  shouldDeferToContador,
   isPdfInput,
 };
