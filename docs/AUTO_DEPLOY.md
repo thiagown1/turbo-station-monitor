@@ -17,6 +17,12 @@ The worker publishes only when all of these conditions hold:
 6. Every affected PM2 restart succeeds.
 7. Health checks for affected HTTP services return 2xx.
 
+The required `Require-resolution audit` PR check also inspects the production
+checkout on the monitor VPS. It rejects uncommitted changes and a local HEAD
+that cannot fast-forward to `origin/main`, before a PR can merge. It fetches the
+remote ref but does not stash or discard local changes. Once drift is reviewed and
+resolved, rerun the PR check against its current head before merging.
+
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock
 is `db/.monitor-deploy.lock`. Successfully applied dependency/install and
 per-service restart revisions are stored in
