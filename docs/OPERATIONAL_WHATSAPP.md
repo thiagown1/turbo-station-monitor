@@ -33,3 +33,13 @@ The GitHub webhook's legacy `short_trader` MoneyMan hook is now disabled unless
 `SHORT_TRADER_OPENCLAW_HOOK_ENABLED=true` is explicitly configured. Leave it
 disabled during retirement. Support-copilot still has other agent paths; audit
 and remove those separately before disabling the gateway.
+
+## Group handoff at the gateway
+
+`GATEWAY_IGNORED_GROUP_JIDS` is an optional comma-separated list of group JIDs
+whose inbound messages must not be forwarded to support-copilot. The gateway
+checks it before downloading media. Sending messages to those groups is
+unaffected. During the support-copilot retirement, the gateway falls back to
+the existing `SUPPORT_COPILOT_IGNORED_GROUP_JIDS` setting if its own setting is
+unset, so removing the support-copilot ingest filter does not reopen the group.
+Verify the JID and the new owner before changing either setting in production.
