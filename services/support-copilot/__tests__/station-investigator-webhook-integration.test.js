@@ -10,6 +10,7 @@ const { spawn } = require('node:child_process');
 
 const SERVICE_DIR = path.join(__dirname, '..');
 const GROUP_JID = '120363-habibs-pilot@g.us';
+const IGNORED_GROUP_JID = '120363-handed-over@g.us';
 const CONVERSATION_ID = 'conv-habibs-pilot';
 const CENTRAL_ACCOUNTING_GROUP_JID = '120363-central-accounting@g.us';
 const CENTRAL_ACCOUNTING_CONVERSATION_ID = 'conv-central-accounting';
@@ -209,6 +210,7 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
         EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
         EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station,outage:unavailable_brand,retryoutage:retryable_brand',
         CONTADOR_ENABLED: 'true',
+        SUPPORT_COPILOT_IGNORED_GROUP_JIDS: IGNORED_GROUP_JID,
         CONTADOR_GROUP_CONVERSATION_ID: GROUP_JID,
         CONTADOR_NEXT_BASE_URL: `http://127.0.0.1:${centralPort}`,
         CONTADOR_NEXT_SECRET: AGENT_SECRET,
@@ -243,6 +245,23 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
       body: JSON.stringify(webhookPayload(`${MESSAGE_ID}-unauthenticated`)),
     });
     assert.equal(unauthenticated.status, 401);
+
+    const ignoredId = `${MESSAGE_ID}-handed-over`;
+    const ignoredPayload = webhookPayload(ignoredId, false, true);
+    ignoredPayload.data.key.remoteJid = IGNORED_GROUP_JID;
+    ignoredPayload.data.mediaBase64 = Buffer.from('test-image').toString('base64');
+    ignoredPayload.data.mediaMimetype = 'image/jpeg';
+    const ignored = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+      body: JSON.stringify(ignoredPayload),
+    });
+    assert.equal(ignored.status, 200);
+    assert.equal((await ignored.json()).reason, 'group_handed_over');
+    assert.equal(fs.existsSync(path.join(MEDIA_DIR, `${ignoredId}.jpg`)), false);
+    const ignoredDb = new Database(DB_PATH, { readonly: true });
+    assert.equal(ignoredDb.prepare('SELECT COUNT(*) AS n FROM messages WHERE external_message_id = ?').get(ignoredId).n, 0);
+    ignoredDb.close();
 
     const unavailableId = `${MESSAGE_ID}-config-unavailable`;
     const unavailablePayload = webhookPayload(unavailableId, false);

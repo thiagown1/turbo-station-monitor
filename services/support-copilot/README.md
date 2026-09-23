@@ -43,6 +43,12 @@ WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:
 
 ## WhatsApp / Baileys integration
 
+`SUPPORT_COPILOT_IGNORED_GROUP_JIDS` is an optional comma-separated list of
+group JIDs handed to another handler. Authenticated inbound events for those
+groups return `group_handed_over` before media, message, conversation or agent
+work is created. An empty value keeps normal ingestion. Confirm the new owner
+and group identity before enabling this setting in production.
+
 ### Flow
 
 ```

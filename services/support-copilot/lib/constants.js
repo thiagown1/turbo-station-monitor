@@ -44,6 +44,10 @@ const GROUP_AGENT = process.env.GROUP_AGENT || process.env.OPENCLAW_GROUP_AGENT 
 // ─── Contador (internal accounting group agent) ─────────────────────────────
 // Fail closed: code can be deployed without enabling WhatsApp writes or reads.
 const CONTADOR_ENABLED = process.env.CONTADOR_ENABLED === 'true';
+// Groups that have been handed to another handler. Ingest remains read-only for
+// these group JIDs; an empty value leaves existing behavior unchanged.
+const IGNORED_GROUP_JIDS = String(process.env.SUPPORT_COPILOT_IGNORED_GROUP_JIDS || '')
+  .split(',').map((value) => value.trim()).filter(Boolean);
 const CONTADOR_GROUP_CONVERSATION_ID = (process.env.CONTADOR_GROUP_CONVERSATION_ID || '').trim();
 // Open conversation in the Contador's own group: forward every message and let
 // the agent decide (reply vs silent) instead of gating on accounting keywords.
@@ -105,6 +109,7 @@ module.exports = {
   EVOLUTION_INSTANCE_BRAND_MAP,
   GROUP_AGENT,
   CONTADOR_ENABLED,
+  IGNORED_GROUP_JIDS,
   CONTADOR_GROUP_CONVERSATION_ID,
   CONTADOR_OPEN_CONVERSATION,
   CONTADOR_NEXT_BASE_URL,

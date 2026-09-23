@@ -29,7 +29,7 @@ const { Router } = require('express');
 const fs = require('fs');
 const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
-const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
+const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL, IGNORED_GROUP_JIDS } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const {
@@ -284,6 +284,12 @@ router.post('/', async (req, res) => {
   const isGroup = isGroupMessage(key.remoteJid);
   const channel = isGroup ? 'whatsapp-group' : 'whatsapp';
 
+  // This group is owned elsewhere. Exit before text/media extraction, file
+  // writes, conversation creation or any downstream agent work.
+  if (isGroup && IGNORED_GROUP_JIDS.includes(key.remoteJid)) {
+    return res.json({ ignored: true, reason: 'group_handed_over' });
+  }
+
   // Extract phone from JID (for 1:1) or group JID (for groups)
   const phone = phoneFromJid(key.remoteJid);
   if (!phone) {
@@ -328,6 +334,7 @@ router.post('/', async (req, res) => {
     // For groups: use the group JID as the conversation key
     // The sender is tracked via pushName in the message body prefix
     const groupJid = key.remoteJid;
+
     const senderName = pushName || (key.participant ? phoneFromJid(key.participant) : null) || 'Unknown';
     const senderId = key.participant ? normalizePhone(phoneFromJid(key.participant)) : null;
 
