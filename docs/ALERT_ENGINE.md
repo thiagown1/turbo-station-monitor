@@ -115,7 +115,7 @@ fires async and the message's `delivery_status` can still flip to `failed`
 This mirrors `confirmDelivery` in the Next.js `whatsapp-notifier` and closes
 the silent-loss window found in the 2026-07-16 cable-theft investigation.
 
-### Cable-theft alert: burst-then-silence (added 2026-07-18)
+### Cable-theft alert: one message, then silence (2026-07-18, single-message since 2026-09-05)
 
 A cut DC cable severs the connector's temperature sensor, so the charger
 reports `Faulted / HighTemperature / DC OverTemp Connector` (recognized by
@@ -129,24 +129,30 @@ Cable-theft faults are therefore taken **off the escalating backoff** and gated
 by `shouldAlertCableTheft(chargerId, connectorId)` instead:
 
 1. **Fresh incident** (no prior record, OR the connector has recovered since the
-   last alert) → send a **burst** of `CABLE_THEFT_BURST_COUNT` messages
-   (default 5) `CABLE_THEFT_BURST_INTERVAL_MS` apart (default 10s) to the
-   URGENTE group. Each is numbered (`Aviso N/5`); the last states no further
-   alerts fire until the station normalizes. The burst is fire-and-forget so
-   its spacing never blocks the detection tick.
-2. **Ongoing incident** (still faulted, no recovery) → **silent**. No re-burst,
+   last alert) → send **ONE** message to the URGENTE group
+   (`CABLE_THEFT_BURST_COUNT`, default **1**), stating that no further alerts
+   fire until the connector is available again. Sending stays fire-and-forget
+   because a burst can still be configured (`CABLE_THEFT_BURST_COUNT` > 1,
+   spaced by `CABLE_THEFT_BURST_INTERVAL_MS`, default 10s) and its spacing must
+   never block the detection tick; the `Aviso N/M` counter only appears then.
+
+   The default was 5 until **2026-09-05**, when Metrópole 3 got five identical
+   URGENTE cards at 08:20/08:21 for one already-known fault. The repeats read as
+   a second bug rather than as urgency, which is the opposite of what the burst
+   was for.
+2. **Ongoing incident** (still faulted, no recovery) → **silent**. No repeat,
    no re-ping.
 3. **Recovery** = the connector reports an OPERATIONAL status again
    (`hasConnectorRecoveredSince`, per-connector so a healthy connector 1 never
    masks a stolen connector 2). A later theft after a recovery is a fresh
-   incident and bursts again.
+   incident and alerts again.
 
 Incident state persists in `history/cable_theft_incidents.json` (survives
 restarts). A record is pruned only after **both** 30 days have passed since it
 was last touched (`lastSeenAt`, refreshed on every suppressed tick) **and** the
 connector has actually recovered. An incident that is still open therefore never
 ages out — expiring it would make the next tick read the same unresolved theft
-as a brand-new one and re-burst. That is exactly what happened on
+as a brand-new one and alert again. That is exactly what happened on
 **2026-08-18 02:00 UTC**: Metrópole 3 connector 2 had been faulted since 18/07,
 the record hit the flat 30-day GC, and the URGENTE group was re-paged for a
 theft the team had already handled. Env overrides:
