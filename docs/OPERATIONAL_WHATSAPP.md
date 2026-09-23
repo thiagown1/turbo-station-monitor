@@ -4,7 +4,10 @@
 Support WhatsApp relay instead of using `openclaw message send` for Telegram.
 This does not change the webhook acknowledgement or start the Hermes migration.
 
-The path is inert until a separate operator activation:
+The path is inert until a separate operator activation. Merging into `main`
+triggers the monitor's automatic production deploy after its CI and clean
+checkout gates; merge is therefore a release action, even though message
+submission remains disabled by default.
 
 - `OPERATIONAL_WHATSAPP_ENABLED=true` enables submission. Missing or invalid
   values leave it disabled.
