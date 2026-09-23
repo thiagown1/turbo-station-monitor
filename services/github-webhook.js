@@ -8,7 +8,7 @@
  * - Verify GitHub signature (optional but enabled by default)
  * - Extract relevant fields
  * - Append to github-webhook-queue.jsonl
- * - Send instant ACK to Thiago on Telegram (DM)
+ * - Send operational notices to the configured WhatsApp group
  * - Record PR/CI evidence without auto-dispatching a code writer
  */
 
@@ -18,13 +18,14 @@ const crypto = require('crypto');
 const fs = require('fs');
 const { exec, execFile, spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
+const { sendOperationalWhatsApp } = require('./lib/operational-whatsapp');
+const { isLegacyOpenClawHookEnabled } = require('./lib/legacy-openclaw-hook-policy');
 
 const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
 
 const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
 const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '';
-const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
 
 const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
@@ -32,16 +33,10 @@ const ACK_DEBOUNCE_PATH = path.join(__dirname, '..', 'github-ack-debounce.json')
 
 const MAX_PAYLOAD_SIZE = 2 * 1024 * 1024; // 2MB (comments and webhook payloads are small)
 
-function sendTelegramNotification(text, target = 'telegram:-5103508388') {
-  execFile(
-    OPENCLAW_CLI,
-    ['message', 'send', '--channel', 'telegram', '--target', target, '--message', String(text)],
-    { timeout: 10000 },
-    (err) => {
-      if (err) console.error(`[telegram-notify] CLI failed: ${err.message}`);
-      else console.log(`[telegram-notify] Sent to ${target}: ${text.substring(0, 80)}`);
-    }
-  );
+function notifyOperations(text) {
+  void sendOperationalWhatsApp(text, 'github-webhook').then((result) => {
+    console.log(`[github-webhook] operational WhatsApp: ${result.status}${result.reason ? ` (${result.reason})` : ''}`);
+  });
 }
 
 /**
@@ -301,7 +296,6 @@ function handleWebhook(req, res) {
 
       const shortTraderRepos = new Set(['thiagown1/short_trader', 'thiagown1/short-trader']);
       const isShortTrader = shortTraderRepos.has(webhookEvent.repository);
-      const shortTraderGroup = 'telegram:-5128168391';
 
 
       // Extract relevant info
@@ -460,9 +454,8 @@ function handleWebhook(req, res) {
         console.log(`[github-webhook] PR #${prNumber} merged — running auto-cleanup for branch ${prBranch}`);
         cleanupMergedTurboWorktree(prBranch, prNumber);
 
-        sendTelegramNotification(
-          `✅ PR #${prNumber} merged! Worktree cleanup running.\n${webhookEvent.pr_title || ''}`,
-          'telegram:-5103508388'
+        notifyOperations(
+          `✅ PR #${prNumber} merged! Worktree cleanup running.\n${webhookEvent.pr_title || ''}`
         );
       }
 
@@ -556,13 +549,11 @@ function handleWebhook(req, res) {
           const title = webhookEvent.pr_title ? ` — ${webhookEvent.pr_title}` : '';
 
           // Keep ACK short but actionable: PR number + link.
-          const ackTarget = isShortTrader ? shortTraderGroup : 'telegram:-5103508388';
-          sendTelegramNotification(
-            `🔔 ${author} comentou (${webhookEvent.action}) na PR #${webhookEvent.pr_number}${title}\n${link || ''}\n"${preview}"\n⚡ Processando...`,
-            ackTarget
+          notifyOperations(
+            `🔔 ${author} comentou (${webhookEvent.action}) na PR #${webhookEvent.pr_number}${title}\n${link || ''}\n"${preview}"\n⚡ Processando...`
           );
 
-          if (isShortTrader) {
+          if (isShortTrader && isLegacyOpenClawHookEnabled()) {
             // Trigger MoneyMan automatically for short_trader events.
             sendOpenClawAgentRequest({
               agentId: 'moneyman',
@@ -598,12 +589,11 @@ function handleWebhook(req, res) {
         const count = attempts[runKey]?.count || 1;
 
         const runUrl = webhookEvent.workflow_run_url;
-        sendTelegramNotification(
-          `🔴 CI falhou: "${webhookEvent.workflow_name}" (${webhookEvent.head_branch})\n${runUrl || ''}\n⚡ Analisando... (tentativa ${count}/${maxFixAttempts})`,
-          isShortTrader ? shortTraderGroup : 'telegram:-5103508388'
+        notifyOperations(
+          `🔴 CI falhou: "${webhookEvent.workflow_name}" (${webhookEvent.head_branch})\n${runUrl || ''}\n⚡ Analisando... (tentativa ${count}/${maxFixAttempts})`
         );
 
-        if (isShortTrader) {
+        if (isShortTrader && isLegacyOpenClawHookEnabled()) {
           sendOpenClawAgentRequest({
             agentId: 'moneyman',
             name: 'GitHub short_trader CI',
@@ -628,7 +618,7 @@ function handleWebhook(req, res) {
           );
         }
       } else if (webhookEvent.fix_limit_reached) {
-        sendTelegramNotification(
+        notifyOperations(
           `⚠️ CI fix limit reached: "${webhookEvent.workflow_name}" on ${webhookEvent.head_branch} failed ${process.env.CI_FIX_MAX_ATTEMPTS || '3'} times. ` +
             `Automatic repair is disabled; manual diagnosis is required.`
         );

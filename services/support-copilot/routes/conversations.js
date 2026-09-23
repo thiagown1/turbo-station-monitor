@@ -24,6 +24,7 @@ const { generateSuggestion, injectIntoSession, buildContextPreview, compactSessi
 const { formatSuggestOutcome } = require('../lib/suggest-outcome');
 const { readSessionTail, countSessionLines, sessionFileSize, needsRecompaction } = require('../lib/session-file');
 const { classifyConversationOutcome } = require('../lib/outcome-classifier');
+const { shouldInjectOutboundIntoAgent } = require('../lib/agent-injection-policy');
 
 const router = Router();
 
@@ -211,9 +212,11 @@ router.post('/:id/messages', async (req, res) => {
     db.prepare('UPDATE messages SET delivery_status = ? WHERE id = ?').run('sent', id);
   }
 
-  // Inject outbound message into agent session (fire-and-forget)
-  // So the agent sees what was actually sent to the customer
-  injectIntoSession(conv.id, `[Operador enviou ao cliente]: ${msgBody}`, conv.brand_id).catch(() => {});
+  // Operational alerts do not belong in a customer-agent session. This also
+  // keeps their delivery independent of the retiring OpenClaw gateway.
+  if (shouldInjectOutboundIntoAgent(source)) {
+    injectIntoSession(conv.id, `[Operador enviou ao cliente]: ${msgBody}`, conv.brand_id).catch(() => {});
+  }
 
   // SSE: notify connected dashboards (with full message payload + conversation metadata for in-place sidebar update)
   const updatedConv = stmts.getConversation.get(conv.id);
