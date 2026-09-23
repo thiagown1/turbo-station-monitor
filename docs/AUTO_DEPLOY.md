@@ -18,9 +18,9 @@ The worker publishes only when all of these conditions hold:
 7. Health checks for affected HTTP services return 2xx.
 
 The required `Require-resolution audit` PR check also inspects the production
-checkout on the monitor VPS. A dirty checkout fails the PR before merge, rather
-than waiting for auto-deploy to refuse the release. The check is read-only and
-does not stash or discard local changes. Once the drift has been reviewed and
+checkout on the monitor VPS. It rejects uncommitted changes and a local HEAD
+that cannot fast-forward to `origin/main`, before a PR can merge. It fetches the
+remote ref but does not stash or discard local changes. Once drift is reviewed and
 resolved, rerun the PR check against its current head before merging.
 
 The deployed marker is stored in `db/.monitor-deployed-sha`; the deployment lock

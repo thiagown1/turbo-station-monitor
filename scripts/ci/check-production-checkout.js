@@ -20,6 +20,12 @@ function checkProductionCheckout(repoDir = PRODUCTION_DIR, runGit = execFileSync
     const paths = dirty.split(/\r?\n/).slice(0, 10).join(', ');
     throw new Error(`production checkout is dirty; move reviewed changes into Git before merging: ${paths}`);
   }
+  run(['fetch', '--quiet', 'origin', 'main']);
+  try {
+    run(['merge-base', '--is-ancestor', 'HEAD', 'refs/remotes/origin/main']);
+  } catch {
+    throw new Error('production HEAD diverges from origin/main; review local commits before merging');
+  }
   return root;
 }
 
