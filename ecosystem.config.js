@@ -287,7 +287,9 @@ module.exports = {
       out_file: './logs/cleanup-vercel-db-out.log',
       log_date_format: 'YYYY-MM-DD HH:mm:ss',
       merge_logs: true,
-      env: { ...dotenv }
+      // Keep raw Vercel requests for 3 days; daily aggregates are written
+      // before pruning. The 7-day window grew vercel.db to 7.24 GB.
+      env: { ...dotenv, VERCEL_RETENTION_DAYS: '3' }
     }
   ]
 };

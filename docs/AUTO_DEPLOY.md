@@ -81,6 +81,13 @@ fails, the deployed marker stays on the previous SHA while successful steps are
 recorded in the progress file. Inspect logs and the exact release diff before
 manual recovery; do not delete the progress file merely to force a replay.
 
+## Vercel raw log retention
+
+The `cleanup-vercel-db` PM2 worker uses `VERCEL_RETENTION_DAYS=3` to bound raw
+Vercel request storage. It writes daily aggregates before deleting raw rows;
+the code default remains seven days when the override is absent. Check the
+aggregate and cleanup logs when changing this window.
+
 ## Mobile telemetry retention migration
 
 The retention worker refuses to delete rows from an existing database until an
