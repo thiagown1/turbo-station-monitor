@@ -26,6 +26,9 @@ jobs:
       # Catches "recovered from prod but never committed" files before merge —
       # the exact class of bug fixed in PR #19 (7 missing support-copilot modules).
       - run: node scripts/ci/check-requires.js
+      # This required check runs on the monitor VPS. Catch edits to the live
+      # checkout before a PR can merge and trigger auto-deploy.
+      - run: node scripts/ci/check-production-checkout.js
 
   syntax-check:
     name: Syntax check
