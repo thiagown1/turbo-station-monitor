@@ -43,6 +43,18 @@ WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:
 
 ## WhatsApp / Baileys integration
 
+### Contador expense receipts
+
+The Contador can classify a supplier payment image as an `expense_receipt` and
+create a `receipt` job. The model selects the category and description; amount,
+reference and date come from media extraction. Station attribution requires a
+verified station lookup in the same turn. Registration calls
+`POST /api/accounting/bill-receipts` with the scoped
+`CONTADOR_RECEIPTS_API_KEY`. With that key unset, registration is blocked and
+the agent must not claim the receipt was recorded. A 409 response is treated as
+the route's idempotent duplicate result. Enabling this key and any production
+financial write requires a separate release and activation review.
+
 ### Flow
 
 ```
