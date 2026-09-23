@@ -93,11 +93,41 @@ function normalizeEndpoint(endpoint) {
     return raw.split(/[?#]/, 1)[0] || null;
 }
 
+/**
+ * Collapse path segments that are record identifiers, not routes.
+ *
+ * Without this, /api/stations/AR2510070008/pricing-impact and
+ * /api/stations/TSAC2606080001/pricing-impact are two debounce keys for one
+ * problem, so the 1h window never closes and each station raises its own
+ * critical. Measured over 30 days of 5xx traffic this collapsed 18 keys to 12.
+ *
+ * Deliberately conservative: it only matches shapes observed as identifiers in
+ * real traffic (station codes, numeric ids, Firebase uids, prefixed tokens,
+ * uuids). Merging two genuinely different routes would hide an incident, so an
+ * unrecognised segment is left alone and simply keeps today's behaviour.
+ */
+function collapseOpaqueIds(endpoint) {
+    return String(endpoint || '')
+        .split('/')
+        .map((seg) => {
+            if (!seg) return seg;
+            if (/^[A-Z]{2,6}\d{6,}$/.test(seg)) return ':id';                 // AR2510070008
+            if (/^\d{8,}$/.test(seg)) return ':id';                            // 124030001957
+            if (/^[a-z]{2,6}_[A-Za-z0-9]{16,}$/.test(seg)) return ':id';       // pk_…, or_…, ch_…
+            if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(seg)) return ':id';
+            // Long opaque token: needs digits and both cases to avoid eating a route name.
+            if (seg.length >= 20 && /^[A-Za-z0-9]+$/.test(seg)
+                && /\d/.test(seg) && /[a-z]/.test(seg) && /[A-Z]/.test(seg)) return ':id';
+            return seg;
+        })
+        .join('/');
+}
+
 function getVercel5xxGroupKey(endpoint) {
     if (/^\/api\/monitor\/(?:heatmap-data|online-users|recent-locations)$/.test(endpoint || '')) {
         return '/api/monitor/mobile-telemetry';
     }
-    return endpoint;
+    return collapseOpaqueIds(endpoint);
 }
 
 function groupByNormalizedEndpoint(rows) {
@@ -2004,5 +2034,6 @@ module.exports.deliveryPollScheduleMs = deliveryPollScheduleMs;
 module.exports.UNSENT_RETRY_WINDOW_MS = UNSENT_RETRY_WINDOW_MS;
 module.exports.getLatestOcppIngestTimestamp = getLatestOcppIngestTimestamp;
 module.exports.normalizeEndpoint = normalizeEndpoint;
+module.exports.collapseOpaqueIds = collapseOpaqueIds;
 module.exports.groupByNormalizedEndpoint = groupByNormalizedEndpoint;
 module.exports.getVercel5xxAlertPolicy = getVercel5xxAlertPolicy;
