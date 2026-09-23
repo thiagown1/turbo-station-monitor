@@ -34,6 +34,7 @@ const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const http = require('http');
+const { configuredIgnoredGroups, shouldForwardInbound } = require('./group-handoff-policy');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,9 @@ const BASE_AUTH_DIR = process.env.GATEWAY_AUTH_DIR || path.join(__dirname, 'auth
 const WEBHOOK_URL = process.env.GATEWAY_WEBHOOK_URL || 'http://localhost:3005/api/support/ingest/evolution';
 const WEBHOOK_SECRET = process.env.EVOLUTION_WEBHOOK_SECRET || '';
 const LOG_TAG = '[whatsapp-gw]';
+// The support-copilot group handoff setting remains a fallback during migration.
+// Only inbound webhook forwarding is affected; sending messages still works.
+const IGNORED_GROUPS = configuredIgnoredGroups(process.env);
 
 // ─── Instance store ────────────────────────────────────────────────────────
 
@@ -249,6 +253,8 @@ async function startInstance(name) {
 
     for (const msg of messages) {
       if (msg.key.remoteJid === 'status@broadcast') continue;
+      // Exit before media download and forwarding to support-copilot.
+      if (!shouldForwardInbound(msg.key.remoteJid, IGNORED_GROUPS)) continue;
 
       const webhookData = {
         key: {
