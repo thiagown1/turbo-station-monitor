@@ -11,8 +11,16 @@ const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const dbPath = path.join(__dirname, '..', 'db', 'vercel.db');
-const RETENTION_DAYS = 14;
+// Overridable so the retention window can be exercised end to end against a
+// throwaway database instead of the live one.
+const dbPath = process.env.VERCEL_DB_PATH || path.join(__dirname, '..', 'db', 'vercel.db');
+// 7 days, not 14. At 14 the drain's own steady state was 12 GB — measured on
+// 2026-09-10, when the box hit 97% disk and the Firebase emulator started
+// failing to boot, taking CI down with it. The window costs roughly 850 MB a
+// day, so 7 days holds the file near 6 GB. Daily per-endpoint aggregates are
+// written before every delete, so shortening the window loses the raw request
+// bodies, never the traffic history.
+const RETENTION_DAYS = Number(process.env.VERCEL_RETENTION_DAYS || 7);
 const MILLISECONDS_PER_DAY = 86400000;
 
 function log(message) {

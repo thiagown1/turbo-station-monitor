@@ -3,6 +3,53 @@ const crypto = require('crypto');
 const DEFAULT_CONTEXT_HOURS = 72;
 const DEFAULT_MAX_MESSAGES = 40;
 const PREFERRED_QUESTION_WINDOW_MS = 30 * 60 * 1000;
+const STATION_STATE_WORDS = [
+  'desarmou', 'caiu', 'parou', 'voltou', 'está', 'esta', 'tá', 'ta',
+  'ficou', 'segue', 'continua', 'sumiu', 'travou', 'desligou', 'reiniciou',
+  'perdeu', 'falhou', 'funciona', 'comunicou',
+  'deu\\s+(?:erro|falha|problema)', 'teve\\s+(?:erro|falha|problema)',
+  'apresentou\\s+(?:erro|falha|problema)',
+];
+const STATION_STATE_PATTERN = STATION_STATE_WORDS.join('|');
+const STATION_STATE_MODIFIER_PATTERN = 'ainda|j[aá]|n[aã]o|se';
+const STATION_INTERROGATIVE_PATTERN = 'qual|quais|algum(?:a|as)?|onde|que|por\\s+qu[eê]|como|quando|quem';
+const STATION_INTERROGATIVE_PREFIX_PATTERN = new RegExp(`^(?:${STATION_INTERROGATIVE_PATTERN})\\b`, 'i');
+const STATION_NON_NAME_FRAGMENT_PATTERN = [
+  STATION_STATE_PATTERN,
+  'agora', 'hoje', 'ontem', 'de\\s+manh[aã]', 'pela\\s+manh[aã]',
+  '[àa]\\s+tarde', 'de\\s+tarde', '[àa]\\s+noite',
+  'ainda', 'j[aá]', 'n[aã]o', 'atualmente', 'novamente', 'de\\s+novo',
+  'no\\s+momento', 'offline', 'online', 'normal', 'funcionando', 'operacional',
+  'com\\s+(?:falha|problema|erro)',
+  'dando\\s+(?:falha|problema|erro)', 'de\\s+comunicar', 'comunica[cç][aã]o',
+  'funcionar', 'de\\s+funcionar', 'sem\\s+funcionar',
+  'por\\s+(?:causa|conta|falta|motivo)(?:\\s+d[aeo])?(?:\\s+.+)?',
+  'porque(?:\\s+.+)?',
+  'devido\\s+(?:[àa]|ao|aos|[àa]s)(?:\\s+.+)?',
+  'durante(?:\\s+.+)?', 'ap[oó]s(?:\\s+.+)?',
+  '(?:depois|antes)\\s+d[aeo](?:\\s+.+)?', 'desde\\s+.+',
+  'fora\\s+do\\s+ar', 'sem\\s+(?:energia|sinal|internet|comunica[cç][aã]o)',
+  'tudo', 'todos?', 'todas?', 'algo', 'nada', 'todo\\s+mundo',
+  'ess(?:e|a|es|as)', 'aquel(?:e|a|es|as)', 'isto', 'isso', 'aquilo',
+  'aqui', 'ali', 'acol[aá]', 'l[aá]', 'a[ií]',
+].join('|');
+const GENERIC_STATION_NOUNS = [
+  ['alimenta[cç][aã]o', 'alimentacao'], ['carregador', 'carregador'],
+  ['conector', 'conector'], ['disjuntor', 'disjuntor'], ['energia', 'energia'],
+  ['equipamento', 'equipamento'], ['esta[cç][aã]o', 'estacao'],
+  ['fornecimento', 'fornecimento'], ['internet', 'internet'], ['local', 'local'],
+  ['luz', 'luz'], ['posto', 'posto'], ['rede', 'rede'], ['servidor', 'servidor'],
+  ['sinal', 'sinal'], ['sistema', 'sistema'], ['transformador', 'transformador'],
+  ['unidade', 'unidade'],
+];
+const STATION_NOUN_PREFIX_PATTERN = GENERIC_STATION_NOUNS.map(([pattern]) => pattern).join('|');
+const STATION_EQUIPMENT_IDENTIFIER_PATTERN = '(?:n(?:[.º°o])?\\s*)?(?:#?\\d{1,3}|[a-z])';
+const STATION_NOUN_SEQUENCE_PATTERN = `(?:(?:esta[cç][aã]o\\s+de\\s+recarga|${STATION_NOUN_PREFIX_PATTERN})(?:\\s+(?:${STATION_EQUIPMENT_IDENTIFIER_PATTERN}))?\\s+(?:(?:do|da|de|no|na)\\s+)?)*`;
+const GENERIC_STATION_SUBJECTS = new Set([
+  ...GENERIC_STATION_NOUNS.map(([, normalized]) => normalized),
+  'normal', 'ele', 'ela',
+  'isso', 'ai', 'la',
+]);
 
 function cleanBody(message) {
   const raw = String(message.raw_body || message.body || '').trim();
@@ -30,7 +77,9 @@ function withoutMentions(text) {
 
 function looksLikeQuestion(text) {
   const value = withoutMentions(text);
-  return value.includes('?') || /\b(confirma|consegue|verifica|voltou|normal|vivo|sinal|aconteceu|houve|falha|erro|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
+  const hasStationState = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').test(value);
+  return value.includes('?') || hasStationState
+    || /\b(confirma|consegue|verifica|normal|vivo|sinal|aconteceu|houve|falha|erro|offline|online|pot[eê]ncia|carregador|esta[cç][aã]o)\b/i.test(value);
 }
 
 function isMentionOnly(message) {
@@ -54,16 +103,17 @@ function effectiveQuestion(messages, trigger) {
       && parseProviderTime(message).getTime() <= triggerAt
       && looksLikeQuestion(cleanBody(message)))
     .sort((a, b) => parseProviderTime(b).getTime() - parseProviderTime(a).getTime());
-  const preferred = prior.find((message) => triggerAt - parseProviderTime(message).getTime() <= PREFERRED_QUESTION_WINDOW_MS);
+  const unanswered = prior.filter((candidate) => !messages.some((message) =>
+    message.direction === 'outbound'
+    && parseProviderTime(message) > parseProviderTime(candidate)
+    && parseProviderTime(message) < parseProviderTime(trigger)));
+  const preferred = unanswered.find((message) => triggerAt - parseProviderTime(message).getTime() <= PREFERRED_QUESTION_WINDOW_MS);
   if (preferred) return preferred;
 
   // A real group can mention the agent well after asking (the Lago Norte case
   // waited ~67 minutes). Fall back only when no operator/bot outbound answer
   // exists after the candidate, so an old resolved issue is never reopened.
-  return prior.find((candidate) => !messages.some((message) =>
-    message.direction === 'outbound'
-    && parseProviderTime(message) > parseProviderTime(candidate)
-    && parseProviderTime(message) < parseProviderTime(trigger))) || trigger;
+  return unanswered[0] || trigger;
 }
 
 function stationIdsFrom(text) {
@@ -71,14 +121,117 @@ function stationIdsFrom(text) {
   return [...new Set(values.map((value) => value.toUpperCase()))];
 }
 
-function stationNamesFrom(text) {
+function normalizedStationName(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function uniqueStationNames(values) {
+  const seen = new Set();
+  return values.filter((value) => {
+    const normalized = normalizedStationName(value);
+    if (seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+function stateFirstStationName(raw) {
+  const leadingPredicate = new RegExp(`^(?:${STATION_NON_NAME_FRAGMENT_PATTERN})(?:\\s+(?:o|a))?\\s+`, 'i');
+  const trailingPredicate = new RegExp(`(?:^|\\s)(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i');
+  const leadingStationNouns = new RegExp(`^${STATION_NOUN_SEQUENCE_PATTERN}`, 'i');
+  let name = String(raw || '').trim();
+  if (/^(?:(?:por|porque|devido|durante|ap[oó]s|depois|antes|desde|quando|enquanto)\b|at[eé](?=\s|$))/i.test(name)) return '';
+  if (/^(?:(?:de|pela?|na)\s+(?:madrugada|manh[aã]|tarde|noite)|[àa]\s+(?:tarde|noite))\b/i.test(name)) return '';
+  if (/^(?:[àa]s?\s+)?\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?(?=\s|$)/i.test(name)) return '';
+  if (/^(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)\b/i.test(name)) return '';
+  if (/^(?:h[aá]|faz)\s+(?:pouco|instantes?|algum\s+tempo)\b/i.test(name)) return '';
+  name = name
+    .replace(/\s+(?:(?:[àa]s\s+\d{1,2}(?::\d{2})?(?:\s*h(?:oras?)?)?)|(?:\d{1,2}(?::\d{2}|\s*h(?:oras?)?)))$/i, '')
+    .replace(/\s+(?:h[aá]|faz)\s+(?:(?:cerca|mais|menos)\s+de\s+|(?:uns?|umas?)\s+)?(?:\d+|uma?|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|alguns?|algumas?)\s+(?:segundos?|minutos?|horas?|dias?|semanas?)$/i, '')
+    .replace(/\s+(?:h[aá]|faz)\s+(?:pouco|instantes?|algum\s+tempo)$/i, '')
+    .trim();
+  let previous;
+  do {
+    previous = name;
+    name = name
+      .replace(leadingPredicate, '')
+      .replace(/^(?:ao\s+normal|ao\s+ar)(?:(?:\s+(?:o|a))?\s+|$)/i, '')
+      .replace(/^(?:no|na|em)\s+/i, '')
+      .replace(leadingStationNouns, '')
+      .replace(trailingPredicate, '')
+      .trim();
+  } while (name !== previous);
+  return name;
+}
+
+function stationNamesFrom(text, options = {}) {
+  const includeExplicit = options.includeExplicit !== false;
+  const includeNatural = options.includeNatural !== false;
   const value = String(text || '');
   const candidates = [];
-  for (const match of value.matchAll(/(?:🏢|esta[cç][aã]o\s*[:\-]?|se\s+o\s+)([^\n,.!?]{3,80}?)(?=\s+voltou\b|\n|$|[,!?])/gi)) {
-    const name = match[1].replace(/\b(?:voltou|est[aá]|ficou|segue)\b.*$/i, '').trim();
-    if (name && !/^(carregador|normal)$/i.test(name)) candidates.push(name);
+
+  const addCandidate = (raw) => {
+    const name = String(raw || '')
+      .replace(/^[\s,.;:!?…–—-]+|[\s,.;:!?…–—-]+$/g, '')
+      .replace(/^(?:o|a)\s+/i, '')
+      .replace(/^(?:no|na|em)\s+/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const normalized = normalizedStationName(name);
+    if (name.length < 3) return;
+    if (STATION_INTERROGATIVE_PREFIX_PATTERN.test(name)) return;
+    if (GENERIC_STATION_SUBJECTS.has(normalized)) return;
+    if (new RegExp(`^(?:${STATION_NON_NAME_FRAGMENT_PATTERN})$`, 'i').test(name)) return;
+    candidates.push(name);
+  };
+
+  if (includeExplicit) {
+    // Explicit station labels remain useful throughout the incident context,
+    // including forwarded equipment alerts that precede the request.
+    for (const match of value.matchAll(/(?:🏢\s*|esta[cç][aã]o\s*(?::|-)\s*)([^\n,.!?]{0,80})/gi)) {
+      const tail = match[1].trim();
+      const state = new RegExp(`(?:^|\\s)(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`, 'i').exec(tail);
+      addCandidate(state ? tail.slice(0, state.index) : tail);
+    }
   }
-  return [...new Set(candidates.map((name) => name.replace(/\s+/g, ' ')))];
+
+  // Natural group-chat phrasing: “Habibs desarmou?”, “o carregador do
+  // Habibs está offline?”, “será que o Primor caiu?”. The state word is a
+  // delimiter, never part of the candidate station name. Natural names are
+  // only extracted from the effective question, never unrelated history.
+  if (includeNatural) {
+    for (const line of value.split(/\r?\n/)) {
+      const conversational = withoutMentions(line)
+        .replace(/^(?:bom\s+dia|boa\s+tarde|boa\s+noite|oi|ol[aá])(?:[\s,.;:!?…\-–—]+pessoal)?[\s,.;:!?…\-–—]*/i, '')
+        .replace(/^(?:pessoal|gente|por\s+(?:favor|gentileza))[\s,.;:!?…\-–—]+/i, '')
+        .replace(/^(?:eu\s+)?(?:acho|parece)\s+que\s+/i, '')
+        .replace(/^(?:algu[eé]m\s+sabe|(?:eu\s+)?queria\s+saber|(?:eu\s+)?gostaria\s+de\s+saber)\s+se\s+/i, '')
+        .replace(/^(?:por\s+(?:favor|gentileza)[\s,!:\-–—]*)?(?:(?:voc[eê]s?|vcs?)\s+)?(?:ser[aá]\s+que|sabe(?:m)?\s+(?:se|como|qual(?:is)?)|(?:consegue(?:m)?|pode(?:m)?)\s+(?:verificar|confirmar|ver)\b(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?|(?:confirma(?:m)?|verifica(?:m)?|v[eê](?:em)?)(?:\s+(?:pra|para)\s+(?:mim|(?:a\s+)?gente|n[oó]s))?(?:\s+se)?)[\s,!:\-–—]*/i, '')
+        .replace(/^[^?!\n]{0,80}?\bse\s+(?=(?:o|a)\s+)/i, '')
+        .replace(new RegExp(`^(?:ess[ae]|aquel[ae])\\s+(?=(?:${STATION_NOUN_PREFIX_PATTERN})\\b)`, 'i'), '')
+        .replace(/^esta[cç][aã]o\s*[:\-]\s*/i, '')
+        .replace(/^(?:eu\s+)?(?:acho|parece)\s+que\s+/i, '')
+        .replace(/^(?:(?:agora|hoje|ontem|de\s+manh[aã]|pela\s+manh[aã]|[àa]\s+tarde|de\s+tarde|[àa]\s+noite|ainda|j[aá]|atualmente|novamente|de\s+novo|no\s+momento)\s+)+/i, '')
+        .trim();
+      const stateFirst = new RegExp(
+        `^(?:como\\s+)?(?:(?:${STATION_NON_NAME_FRAGMENT_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN}|anda)\\s+(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)(?=\\s*[?!,.…]*$)`,
+        'i',
+      ).exec(conversational);
+      if (stateFirst) {
+        addCandidate(stateFirstStationName(stateFirst[1]));
+        continue;
+      }
+      const natural = new RegExp(
+        `^(?:(?:o|a)\\s+)?${STATION_NOUN_SEQUENCE_PATTERN}(.{2,80}?)\\s+(?:(?:${STATION_STATE_MODIFIER_PATTERN})\\s+)*(?:${STATION_STATE_PATTERN})(?=\\s|$|[?!,.])`,
+        'i',
+      ).exec(conversational);
+      if (natural) addCandidate(natural[1]);
+    }
+  }
+  return uniqueStationNames(candidates);
 }
 
 function firstMatch(text, patterns) {
@@ -144,7 +297,10 @@ function reconstructIncidentContext(messages, triggerMessageId, options = {}) {
   const relevant = ordered.filter((message) => parseProviderTime(message) <= parseProviderTime(trigger));
   const allText = relevant.map(cleanBody).join('\n');
   const stationIds = stationIdsFrom(allText);
-  const stationNames = stationNamesFrom([question, allText].join('\n'));
+  const stationNames = uniqueStationNames([
+    ...stationNamesFrom(allText, { includeNatural: false }),
+    ...stationNamesFrom(question, { includeExplicit: false }),
+  ]);
   const incidentSignals = relevant.map(incidentSignal).filter(Boolean);
   const participantClaims = relevant.map(participantClaim).filter(Boolean);
   const ambiguities = [];

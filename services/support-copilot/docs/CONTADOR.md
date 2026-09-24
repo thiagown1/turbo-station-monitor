@@ -155,10 +155,27 @@ monthly values into the workspace.
   its group has at least one active partner link. A group with one partner is
   bound directly; a group with multiple partners is bound only when the
   normalized payee extracted from the receipt exactly identifies one linked
-  `partner_name`. A missing or ambiguous match omits `partnerId`, remains in
-  human review and never settles a partner payment automatically;
+  `partner_name`. A missing or ambiguous match omits `partnerId` and instead
+  sends `candidatePartnerIds` with every partner in that group — the payee on a
+  PIX comprovante is the account holder, so it rarely equals the registered
+  partner name, and dropping those receipts is what left real settlements
+  unconfirmed. The backend picks by amount among the candidates and refuses when
+  two of them are owed the same value; the group↔payment binding it enforces
+  (the report for that settlement was delivered to that conversation) is what
+  keeps the widened search safe. Nothing is settled here either way;
 - deterministic gate for PDF, accounting questions, explicit mentions and
   replies to a prior Contador message;
+- every outbound text (heartbeat, monthly closing, regularização, tool-loop
+  reply) passes through `redactForModel` before delivery, but with the station
+  ids that came out of our own tools as an allowlist. Those ids are not PII and
+  must survive intact: without the allowlist the daily notice of 2026-09-08 sent
+  `[telefone oculto]57` and `GO[telefone oculto]` instead of the stations
+  `414030001957` and `GO2508130004`. The phone mask now requires a phone-shaped
+  token (parenthesised DDD, a separator, or `+55`) and a full digit token, so it
+  can no longer bite into an identifier. Nothing is relaxed for inbound text:
+  message bodies and history still go through the strict redaction with no
+  allowlist, and an id whose length matches an unpunctuated CPF (11) or CNPJ (14)
+  is never preserved;
 - ordinary group chatter is ignored without invoking Opus;
 - PDF bytes are read from the local media directory and forwarded to the Next
   intake; its `replyMessage` is sent verbatim;
@@ -311,6 +328,41 @@ month's number, never chatter. A wrong fact is corrected by setting
 
 Both `aprender` and `responde_perguntas` are optional in the reply contract, so
 an instruction that carries neither has exactly the shape it always had.
+
+## O que o modelo enxerga de uma foto
+
+O corpo de uma mensagem de midia no banco e so `[imagem]`: o conteudo foi
+extraido uma vez pela classificacao central e guardado em
+`agent_media_analyses`. Ate 09/2026 o historico entregue ao modelo vinha so de
+`messages.body`, entao tres comprovantes seguidos chegavam como tres
+placeholders vazios - o Contador respondia sobre pendencias como se nada
+tivesse sido enviado, e era impossivel pedir a ele que conferisse um
+comprovante.
+
+`loadContext` agora faz LEFT JOIN em `agent_media_analyses` e `contextBlock`
+anexa uma linha curta por midia: tipo, resumo, valor e data. Referencia do
+comprovante e documento do favorecido ficam de fora de proposito - nao ajudam a
+responder no grupo e sao dado pessoal atravessando para o modelo. Analise que
+falhou, JSON quebrado ou midia ainda na fila nao mudam o corpo da mensagem.
+
+## Memoria durante a sessao e entre sessoes
+
+Sao duas memorias, com alcances diferentes:
+
+- `contador_fatos` / `contador_perguntas_abertas` (SQLite): a fonte da verdade.
+  `blocoDeFatos()` injeta os fatos no prompt do fluxo de **pergunta**. O aviso
+  diario nao usa esse bloco.
+- `CONTADOR_MEMORY_DIR` (arquivos no workspace do agente): projecao reescrita
+  inteira a cada fato aprendido ou pergunta encerrada, em `fatos-do-grupo.md`.
+  O OpenClaw le a memoria do workspace no bootstrap de **toda** sessao e a
+  indexa para busca, entao esse caminho cobre o aviso diario e qualquer sessao
+  nova. Vazio = nao projeta nada; falha de escrita e best-effort e nunca derruba
+  o turno.
+
+Isso importa porque a sessao do OpenClaw reinicia sozinha: com
+`session.idleMinutes` em 6h e o heartbeat rodando de 24 em 24h, cada rodada
+nasce numa sessao nova. Sem a memoria em arquivo o agente comeca do zero todo
+dia.
 
 ## Expense receipts and recurrence
 

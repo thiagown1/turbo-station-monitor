@@ -19,18 +19,28 @@
  */
 
 const { Router } = require('express');
-const { stmts } = require('../lib/db');
+const { db } = require('../lib/db');
 const { parseLocation } = require('../lib/utils');
+const { executeOnlineUsersQuery } = require('../lib/presence-query');
 const { PRESENCE_WINDOW_MS, LOG_TAG } = require('../lib/constants');
 
 const router = Router();
 
 router.get('/', (req, res) => {
     try {
-        const cutoff = Date.now() - PRESENCE_WINDOW_MS;
+        const rawBrandId = typeof req.query.brandId === 'string'
+            ? req.query.brandId
+            : req.query.brand_id;
+        const brandId = typeof rawBrandId === 'string' ? rawBrandId.trim() : '';
+        if (!brandId) {
+            return res.status(400).json({ error: 'brandId is required' });
+        }
+        if (brandId.length > 128) {
+            return res.status(400).json({ error: 'brandId is too long' });
+        }
 
-        // TODO: Filter by brandId once mobile app sends it in telemetry payload.
-        const rows = stmts.onlineUsers.all(cutoff);
+        const cutoff = Date.now() - PRESENCE_WINDOW_MS;
+        const rows = executeOnlineUsersQuery(db, { cutoff, brandId });
 
         const users = rows.map((row) => {
             const { lat, lng } = parseLocation(row.data_json);

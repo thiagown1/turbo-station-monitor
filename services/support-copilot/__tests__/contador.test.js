@@ -5,6 +5,8 @@ const {
   buildContador,
   classifyInbound,
   parseAgentInstruction,
+  describeMediaAnalysis,
+  contextBlock,
 } = require('../lib/contador');
 
 const tests = [];
@@ -604,6 +606,79 @@ test('model context masks common PII formats', () => {
   assert.doesNotMatch(redacted, /123\.456|12\.345|99999|a@b/);
 });
 
+// Regressão do aviso diário de 08/09/2026: o grupo recebeu "Registro pendente
+// (ago/2026): [telefone oculto]57, Decathlon, ..., GO[telefone oculto], ...".
+// Os dois nomes mastigados eram ids reais de estação (414030001957 = Life Box,
+// GO2508130004 = Office 1524) comidos pelas máscaras de PII.
+test('redaction keeps station ids intact and still masks phone numbers', () => {
+  const { redactForModel } = require('../lib/contador');
+  const stationIds = new Set(['414030001957', 'GO2508130004']);
+  const redacted = redactForModel(
+    'Registro pendente (ago/2026): 414030001957, Decathlon, GO2508130004. Fone (62) 99999-9999.',
+    stationIds,
+  );
+  assert.match(redacted, /414030001957/);
+  assert.match(redacted, /GO2508130004/);
+  assert.doesNotMatch(redacted, /telefone oculto\]57|GO\[telefone oculto\]/);
+  assert.match(redacted, /Fone \[telefone oculto\]\.$/);
+});
+
+test('phone masking no longer chews digit runs that are not phone shaped', () => {
+  const { redactForModel } = require('../lib/contador');
+  // Sem allowlist nenhuma: o id alfanumérico já não pode ser tocado, porque a
+  // máscara de telefone agora exige token completo de dígitos.
+  assert.equal(redactForModel('estação GO2508130004 pendente'), 'estação GO2508130004 pendente');
+  assert.equal(redactForModel('ligue (62) 3223-1234'), 'ligue [telefone oculto]');
+  assert.equal(redactForModel('ligue +55 62 99999-9999'), 'ligue [telefone oculto]');
+  assert.equal(redactForModel('ligue 62999999999'), 'ligue [telefone oculto]');
+});
+
+test('allowlist never preserves a CPF or CNPJ shaped identifier', () => {
+  const { redactForModel, collectStationIds } = require('../lib/contador');
+  const ids = collectStationIds({
+    stations: [{ stationId: '12345678900' }, { stationId: '12345678000190' }, { stationId: '414030001957' }],
+  });
+  assert.deepEqual([...ids], ['414030001957']);
+  const redacted = redactForModel('ids 12345678900, 12345678000190 e 414030001957', ids);
+  assert.doesNotMatch(redacted, /12345678900|12345678000190/);
+  assert.match(redacted, /414030001957/);
+});
+
+test('daily notice keeps the station ids that came from the tools', async () => {
+  const replies = [];
+  const contador = buildContador({
+    config,
+    readMedia: async () => Buffer.alloc(0),
+    intake: async () => ({}),
+    sendReply: async (text) => replies.push(text),
+    loadContext: async () => [],
+    runAgent: async () => JSON.stringify({
+      action: 'reply',
+      text: 'Registro pendente (ago/2026): 414030001957, Decathlon, GO2508130004.',
+    }),
+    queryTool: async (tool) => {
+      if (tool === 'contas_a_vencer') {
+        return {
+          entries: [],
+          drafts: [],
+          pendingRegistration: {
+            period: { year: 2026, month: 8 },
+            stations: [
+              { stationId: '414030001957', stationName: '414030001957', pending: true },
+              { stationId: 'GO2508130004', stationName: 'GO2508130004', pending: true },
+            ],
+          },
+        };
+      }
+      if (tool === 'drafts_abertos') return { count: 0, drafts: [] };
+      return { pendingCount: 0, stations: [] };
+    },
+  });
+
+  assert.equal((await contador.heartbeat(new Date('2026-09-08T11:00:00Z'))).status, 'sent');
+  assert.deepEqual(replies, ['Registro pendente (ago/2026): 414030001957, Decathlon, GO2508130004.']);
+});
+
 test('open conversation lets the agent decide instead of a keyword gate', () => {
   const open = { ...config, openConversation: true };
 
@@ -664,6 +739,56 @@ test('Agent Center decides the group, env var is only the fallback', () => {
     accountingGroup: undefined,
     body: 'quais contas faltam?',
   }, open).kind, 'query');
+});
+
+
+// Payload real de agent_media_analyses: o comprovante da Neoenergia que o Yves
+// postou no grupo em 08/09/2026 e sobre o qual o Contador nao disse nada.
+const ANALISE_REAL = JSON.stringify({
+  status: 'ok',
+  kind: 'partner_payment_receipt',
+  summary: 'Pagamento para NEOENERGIA BRASILIA',
+  confidence: 1,
+  amountCents: 1580040,
+  currency: 'BRL',
+  transactionDate: '2026-09-08',
+  receiptRef: 'E607011190202609081803DY52WVCBNZ4',
+  payeeDocument: '07522669000192',
+});
+
+test('o conteudo da imagem chega ao modelo, em vez de um placeholder vazio', () => {
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: '[Y]: [imagem]', created_at: '2026-09-08T18:03:53Z', media_result: ANALISE_REAL },
+  ]);
+  assert.match(linha.body, /NEOENERGIA BRASILIA/);
+  assert.match(linha.body, /R$ 15800,40|15800,40/);
+  assert.match(linha.body, /2026-09-08/);
+  // o corpo original continua la: a linha ainda diz que veio uma imagem
+  assert.match(linha.body, /[Y]/);
+});
+
+test('referencia e documento do favorecido NAO atravessam para o modelo', () => {
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: '[imagem]', created_at: '2026-09-08T18:03:53Z', media_result: ANALISE_REAL },
+  ]);
+  assert.equal(linha.body.includes('E607011190202609081803DY52WVCBNZ4'), false);
+  assert.equal(linha.body.includes('07522669000192'), false);
+});
+
+test('analise que falhou, json quebrado ou mensagem sem midia nao mudam o corpo', () => {
+  const falhou = JSON.stringify({ status: 'error', summary: 'nao consegui ler' });
+  assert.equal(describeMediaAnalysis(falhou), null);
+  assert.equal(describeMediaAnalysis('{isso nao e json'), null);
+  assert.equal(describeMediaAnalysis(null), null);
+  const [linha] = contextBlock([
+    { direction: 'inbound', body: 'quais contas faltam?', created_at: '2026-09-08T18:03:53Z' },
+  ]);
+  assert.equal(linha.body, 'quais contas faltam?');
+});
+
+test('analise sem valor ainda entrega o resumo', () => {
+  const semValor = JSON.stringify({ status: 'ok', kind: 'energy_invoice', summary: 'Fatura Equatorial' });
+  assert.equal(describeMediaAnalysis(semValor), '[energy_invoice] Fatura Equatorial');
 });
 
 (async () => {

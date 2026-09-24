@@ -8,8 +8,9 @@ read-only query endpoints for the dashboard.
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` `/ping` | — | Liveness probe |
-| `GET` | `/api/telemetry/online-users` | `X-Monitor-Secret` | Currently active app users |
+| `GET` | `/api/telemetry/online-users?brandId=<tenant>` | `X-Monitor-Secret` | Tenant-scoped currently active app users |
 | `GET` | `/api/telemetry/heatmap-data?brandId=<tenant>` | `X-Monitor-Secret` | Tenant-scoped aggregated user demand density |
+| `GET` | `/api/telemetry/events` | `X-Monitor-Secret` | Bounded telemetry events for dashboard aggregations |
 | `POST` | `/api/telemetry/mobile` | `X-Telemetry-Key` | Event ingestion from mobile app |
 | `POST` | `/api/telemetry/user-logs` | `X-Telemetry-Key` | User-submitted diagnostic log dump |
 | `GET` | `/api/telemetry/user-logs` | `X-Monitor-Secret` | Query stored log dumps |
@@ -22,9 +23,13 @@ mobile-telemetry/
   lib/
     constants.js        ← env vars, limits, tunables
     db.js               ← SQLite connection, schema, prepared statements
+    events-query.js     ← timestamp-indexed bounded event SQL
     heatmap-query.js     ← tenant-scoped, timestamp-indexed SQL
+    heatmap-query-cache.js ← private TTL cache + concurrent request coalescing
     heatmap-query-runner.js ← worker lifecycle + 25s deadline
     heatmap-query-worker.js ← isolated better-sqlite3 reader
+    retention-worker.js   ← isolated TTL deletes; never blocks HTTP liveness
+    presence-query.js   ← tenant-scoped, timestamp-indexed presence SQL
     utils.js            ← parseLocation(), deriveSeverity()
   middleware/
     auth.js             ← requireSecret (X-Monitor-Secret validation)
@@ -55,10 +60,26 @@ Uses a dedicated SQLite database (`db/mobile.db`) with WAL mode. Two tables:
 Most prepared statements are created once at startup in `lib/db.js` and reused
 per request. The heatmap is deliberately different: `better-sqlite3` work runs
 in a dedicated worker so a large aggregation cannot block ingestion,
-`online-users`, or `/health`. Bounded heatmap periods force the existing
-`idx_mobile_events_event_timestamp` index; this avoids a deployment-time index
-migration on the production database. A 25-second deadline terminates and
-recreates a stuck worker before the outer nginx/Vercel timeout.
+`online-users`, or `/health`. Bounded event, presence, and heatmap reads force
+the existing `idx_mobile_events_event_timestamp` index so SQLite reads the
+small time slice before filtering event types. This avoids both historical
+table scans and a deployment-time index migration on the production database.
+A 25-second heatmap deadline terminates and recreates a stuck worker before the
+outer nginx/Vercel timeout.
+
+TTL deletion also runs in a worker thread, 30 seconds after HTTP startup and
+then every six hours. Deleting `mobile_raw` with foreign keys enabled requires
+an index whose first column is `mobile_events.raw_id`; otherwise SQLite probes
+the entire child table once per parent row. Retention therefore fails closed
+with `X-Retention-State: blocked-index` while `/health` remains responsive.
+Fresh databases include `idx_mobile_events_raw_id`. Existing databases require
+the explicit, separately authorized migration documented in `docs/AUTO_DEPLOY.md`.
+
+Heatmap aggregates are cached privately in-process for five minutes, with at
+most 64 tenant/period/exclusion variants. Concurrent requests for the same key
+share one worker query. Responses remain `private, no-store` because the result
+is tenant scoped; `X-Telemetry-Cache` reports `MISS`, `HIT`, or `COALESCED` for
+operational diagnosis without exposing a shared HTTP cache.
 
 ### Heatmap tenant contract
 
@@ -68,6 +89,12 @@ receive only their explicitly stamped rows. Missing tenant scope and unknown
 period values return HTTP 400 rather than falling back to a cross-brand or
 unbounded historical scan. Valid periods are `24h`, `7d`, `30d`, and `all`.
 
+### Online presence tenant contract
+
+`brandId` (or `brand_id`) is required and follows the same legacy-row ownership
+rule as heatmap reads. Requests without a tenant return HTTP 400 instead of
+falling back to a cross-brand presence query.
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -75,6 +102,7 @@ unbounded historical scan. Valid periods are `24h`, `7d`, `30d`, and `all`.
 | `PORT` | `3003` | HTTP port |
 | `TELEMETRY_API_KEY` | *(required)* | Mobile app ingestion key |
 | `MOBILE_TTL_DAYS` | `180` | Retention for `mobile_events` and `mobile_raw` |
+| `MOBILE_DB_PATH` | `db/mobile.db` | Optional explicit SQLite path (tests and maintenance tooling) |
 | `MONITOR_API_SECRET` | *(empty)* | Shared secret for dashboard endpoints |
 
 ## Local Development

@@ -269,6 +269,8 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
         for (const expected of ['fallback_applied_at', 'model_waits', 'last_model_wait_at']) {
           if (!mediaJobCols.includes(expected)) throw new Error('agent_media_jobs.' + expected + ' column missing');
         }
+        const stationJobCols = check.prepare("PRAGMA table_info('station_investigation_jobs')").all().map(r => r.name);
+        if (!stationJobCols.includes('quota_reserved_at')) throw new Error('station_investigation_jobs.quota_reserved_at column missing');
         const suggestionCols = check.prepare("PRAGMA table_info('suggestions')").all().map(r => r.name);
         if (!suggestionCols.includes('source_message_id')) throw new Error('suggestions.source_message_id column missing');
         const messageCols = check.prepare("PRAGMA table_info('messages')").all().map(r => r.name);
@@ -292,6 +294,52 @@ test('Contador outbox and daily-run ledger exist after a fresh load', () => {
       }
     );
   } finally {
+    cleanup(dbPath);
+  }
+});
+
+test('station quota migration backfills legacy charged jobs without charging claims', () => {
+  const dbPath = freshDbPath('station-quota-backfill');
+  const Database = require('better-sqlite3');
+  const legacy = new Database(dbPath);
+  const recent = new Date(Date.now() - 60_000).toISOString();
+  try {
+    legacy.exec(`CREATE TABLE station_investigation_jobs (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )`);
+    const insert = legacy.prepare(`INSERT INTO station_investigation_jobs
+      (message_id, conversation_id, brand_id, group_jid, instance, status,
+       next_attempt_at, created_at, updated_at)
+      VALUES (?, 'conversation', 'brand', 'group@g.us', 'instance', ?, ?, ?, ?)`);
+    insert.run('legacy-review', 'review', recent, recent, recent);
+    insert.run('legacy-claim', 'claimed', recent, recent, recent);
+    legacy.close();
+
+    execFileSync(process.execPath, ['-e', "require('./lib/db.js');"], {
+      cwd: path.join(__dirname, '..'),
+      env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath },
+      encoding: 'utf8',
+    });
+
+    const check = new Database(dbPath, { readonly: true });
+    const rows = check.prepare(`SELECT message_id, quota_reserved_at
+      FROM station_investigation_jobs ORDER BY message_id`).all();
+    check.close();
+    assert.deepEqual(rows, [
+      { message_id: 'legacy-claim', quota_reserved_at: null },
+      { message_id: 'legacy-review', quota_reserved_at: recent },
+    ]);
+  } finally {
+    if (legacy.open) legacy.close();
     cleanup(dbPath);
   }
 });

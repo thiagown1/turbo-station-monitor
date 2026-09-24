@@ -35,13 +35,13 @@ const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const {
   enqueueContadorMessage,
   canRouteContadorEvent,
-  isQuotedContadorDraftReply,
+  hasQuotedContadorDraftReply,
   sendReply,
 } = require('../lib/contador-runtime');
 const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
-const { routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
 const {
   handleFinancialApprovalReply,
   sendFinancialApprovalAcknowledgement,
@@ -228,6 +228,18 @@ function quotedOutboundMessage(message, conversationId) {
   return { ...row, draftId };
 }
 
+function durableReplayOwner(localMessageId, externalMessageId) {
+  return db.prepare(`
+    SELECT 'station' owner FROM station_investigation_jobs
+      WHERE message_id = ? AND status <> 'claimed'
+    UNION ALL
+    SELECT 'media' owner FROM agent_media_jobs WHERE message_id = ?
+    UNION ALL
+    SELECT 'contador' owner FROM contador_jobs WHERE message_id = ?
+    LIMIT 1
+  `).get(externalMessageId, localMessageId, externalMessageId) || null;
+}
+
 function recentConversationContext(conversationId) {
   try {
     const recentMsgs = db.prepare(
@@ -377,9 +389,13 @@ router.post('/', async (req, res) => {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
         if (direction === 'inbound') {
-          void routeStationInvestigation({ messageId: externalMessageId, conversationId, brandId, groupJid,
-            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext })
-            .catch(err => console.warn(`${LOG_TAG} duplicate investigator recovery failed for ${dup.id}:`, err.message));
+          if (durableReplayOwner(dup.id, externalMessageId)) {
+            return res.json({ id: dup.id, conversationId, duplicate: true });
+          }
+          const stationInput = {
+            messageId: externalMessageId, conversationId, brandId, groupJid,
+            instance, senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
+          };
           const quoted = quotedOutboundMessage(message, conversationId);
           const contadorEvent = {
             messageId: externalMessageId,
@@ -395,17 +411,60 @@ router.post('/', async (req, res) => {
             replyToContador: quoted?.source === 'contador',
             quotedContadorDraftId: quoted?.draftId || null,
           };
-          if (isQuotedContadorDraftReply(contadorEvent)) {
-            enqueueContadorMessage(contadorEvent);
-          } else if (media && ['image', 'document'].includes(media.media_type)) {
-            const { routeInboundMessageDurably } = require('../lib/agent-router');
-            routeInboundMessageDurably({
-              messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
-              instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
-              replyToContador: contadorEvent.replyToContador,
-              quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
-              deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
-            }).catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
+          try {
+            await (async () => {
+              const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+              const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
+              let sharedAgentConfig = null;
+              let sharedAgentConfigError = null;
+              try {
+                sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : undefined);
+              } catch (error) {
+                sharedAgentConfigError = error;
+              }
+              if (quotedContadorReply && sharedAgentConfigError) throw sharedAgentConfigError;
+              if (quotedContadorReply && !sharedAgentConfig) {
+                throw new Error('fresh_agent_config_required');
+              }
+              contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
+              if (quotedContadorReply) {
+                enqueueContadorMessage(contadorEvent);
+                return;
+              }
+              const prepared = await prepareStationInvestigation(stationInput, {
+                loadConfig: async () => {
+                  if (sharedAgentConfigError) throw sharedAgentConfigError;
+                  return sharedAgentConfig;
+                },
+              });
+              if (!prepared?.claimed
+                  && prepared?.result?.reason === 'config_unavailable'
+                  && !media
+                  && whatsappContext.mentionedJids.length > 0) {
+                throw new Error('station_config_unavailable');
+              }
+              if (prepared?.claimed) {
+                void routeStationInvestigation(stationInput, { prepared })
+                  .catch(err => console.warn(`${LOG_TAG} duplicate station recovery failed for ${dup.id}:`, err.message));
+                return;
+              }
+              if (media && ['image', 'document'].includes(media.media_type)) {
+                const { routeInboundMessageDurably } = require('../lib/agent-router');
+                const recoveryInput = {
+                  messageId: dup.id, externalMessageId, conversationId, brandId, groupJid,
+                  instance, sender: senderName, senderId, body: groupBody, media, receivedAt: now,
+                  replyToContador: contadorEvent.replyToContador,
+                  quotedContadorDraftId: contadorEvent.quotedContadorDraftId,
+                  deferEnergyInvoiceEvent: canRouteContadorEvent(contadorEvent),
+                };
+                await routeInboundMessageDurably(recoveryInput, { enqueueOnly: true });
+                void routeInboundMessageDurably(recoveryInput)
+                  .catch(err => console.warn(`${LOG_TAG} duplicate media recovery failed for ${dup.id}:`, err.message));
+              }
+            })();
+          } catch (err) {
+            console.warn(`${LOG_TAG} duplicate recovery failed for ${dup.id}:`, err.message);
+            return res.status(503).json({ error: 'duplicate_recovery_failed' });
           }
         }
         return res.json({ id: dup.id, conversationId, duplicate: true });
@@ -494,16 +553,14 @@ router.post('/', async (req, res) => {
     // Contador/group-suggestion behavior. A successful central classification
     // owns the message, so a PDF is never parsed twice during rollout.
     if (direction === 'inbound') {
-      void routeStationInvestigation({
+      const stationInput = {
         messageId: externalMessageId || msgId, conversationId, brandId, groupJid, instance,
         senderId, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
-      }).catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+      };
       const quoted = quotedOutboundMessage(message, conversationId);
       // Which agent serves this group is decided in the Agent Center, not here.
       // undefined means the central was unreachable, and classifyInbound then
       // falls back to CONTADOR_GROUP_CONVERSATION_ID.
-      const { isAccountingGroup } = require('../lib/agent-router');
-      const accountingGroup = await isAccountingGroup(brandId, conversationId);
       const contadorEvent = {
         messageId: externalMessageId || msgId,
         conversationId,
@@ -515,7 +572,6 @@ router.post('/', async (req, res) => {
         senderId,
         body,
         media,
-        accountingGroup,
         replyToContador: quoted?.source === 'contador',
         quotedContadorDraftId: quoted?.draftId || null,
       };
@@ -532,18 +588,60 @@ router.post('/', async (req, res) => {
           return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution', channel: 'whatsapp-group', expenseDecision: true });
         }
       }
-      // Central media router: every image/PDF is classified once. Text-only
-      // messages use a free deterministic gate and invoke the model only when
-      // they look like a request to inspect a charger.
-      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
-      if (isQuotedContadorDraftReply(contadorEvent)) {
-        // A quoted draft answer belongs to the Contador loop even when it says
-        // "estação". The Next boundary still revalidates the stable sender
-        // allowlist before accepting any financial mutation.
+      const { loadConfig, accountingGroupFromConfig } = require('../lib/agent-router');
+      const quotedContadorReply = hasQuotedContadorDraftReply(contadorEvent);
+      let sharedAgentConfig = null;
+      let sharedAgentConfigError = null;
+      try {
+        sharedAgentConfig = await loadConfig(brandId, quotedContadorReply ? { fresh: true } : undefined);
+      } catch (error) {
+        sharedAgentConfigError = error;
+      }
+      if (quotedContadorReply && sharedAgentConfigError) {
+        return res.status(503).json({ error: 'fresh_agent_config_required' });
+      }
+      if (quotedContadorReply && !sharedAgentConfig) {
+        return res.status(503).json({ error: 'fresh_agent_config_required' });
+      }
+      contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
+      if (quotedContadorReply) {
+        // Resolve authenticated Contador continuations before the stateful
+        // station preflight so they cannot reserve station quota or ownership.
         const contadorRoute = enqueueContadorMessage(contadorEvent);
         if (contadorRoute.kind === 'ignored') {
           scheduleGroupSuggestion(conversationId, brandId, { media: !!media });
         }
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group',
+        });
+      }
+      const stationPreparation = await prepareStationInvestigation(stationInput, {
+        loadConfig: async () => {
+          if (sharedAgentConfigError) throw sharedAgentConfigError;
+          return sharedAgentConfig;
+        },
+      }).catch((err) => {
+        console.warn(`${LOG_TAG} station investigator preflight failed for ${msgId}:`, err.message);
+        return { claimed: false, ready: false, result: { skipped: true, reason: 'preflight_failed' } };
+      });
+      if (!stationPreparation.claimed
+          && stationPreparation.result?.reason === 'config_unavailable'
+          && !media
+          && whatsappContext.mentionedJids.length > 0) {
+        return res.status(503).json({ error: 'station_config_unavailable' });
+      }
+      // Central media router: every image/PDF is classified once. Text-only
+      // messages use a free deterministic gate and invoke the model only when
+      // they look like a request to inspect a charger.
+      const stationRequest = /\b(carregador|esta[cç][aã]o|offline|falha|erro|analis|verific|ocpp)\b/i.test(body);
+      if (stationPreparation.claimed) {
+        void routeStationInvestigation(stationInput, { prepared: stationPreparation })
+          .catch(err => console.warn(`${LOG_TAG} station investigator failed for ${msgId}:`, err.message));
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group', stationInvestigation: true,
+        });
       } else if ((media && ['image', 'document'].includes(media.media_type)) || stationRequest) {
         const { routeInboundMessageDurably } = require('../lib/agent-router');
         routeInboundMessageDurably({

@@ -53,8 +53,19 @@ function jsonServer(handler) {
   let gatewayRequest = null;
   let intakeCount = 0;
   let gatewayCount = 0;
+  let accountingConversationId = null;
   let child;
   const next = jsonServer((req, res, body) => {
+    if (req.method === 'GET' && req.url.startsWith('/api/agents/config?')) {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        config: {
+          enabled: true,
+          agents: { accounting: true, stationSupport: false },
+          accountingGroupConversationIds: accountingConversationId ? [accountingConversationId] : [],
+        },
+      }));
+    }
     if (req.url === '/api/accounting/energy-bill-intake') {
       intakeCount += 1;
       intakeRequest = { authorization: req.headers.authorization, body };
@@ -90,6 +101,8 @@ function jsonServer(handler) {
         CONTADOR_GROUP_CONVERSATION_ID: GROUP_JID,
         CONTADOR_NEXT_BASE_URL: `http://127.0.0.1:${nextPort}`,
         CONTADOR_NEXT_SECRET: 'integration-secret',
+        AGENT_EVENT_BASE_URL: `http://127.0.0.1:${nextPort}`,
+        AGENT_EVENT_SECRET: 'integration-secret',
         CONTADOR_INSTANCE: 'turbostation',
         EVOLUTION_API_URL: `http://127.0.0.1:${gatewayPort}`,
         EVOLUTION_WEBHOOK_SECRET: WEBHOOK_SECRET,
@@ -158,6 +171,7 @@ function jsonServer(handler) {
     const Database = require('better-sqlite3');
     const bootstrap = new Database(DB_PATH);
     const original = bootstrap.prepare('SELECT conversation_id, brand_id FROM messages WHERE external_message_id = ?').get(MESSAGE_ID);
+    accountingConversationId = original.conversation_id;
     bootstrap.prepare(`
       INSERT INTO messages
         (id, conversation_id, brand_id, direction, source, body, external_message_id, delivery_status, sender_id, sender_name, created_at)

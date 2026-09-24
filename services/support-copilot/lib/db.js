@@ -601,6 +601,7 @@ try {
       context_message_ids_json TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       attempts INTEGER NOT NULL DEFAULT 0,
+      quota_reserved_at TEXT,
       next_attempt_at TEXT NOT NULL,
       last_error TEXT,
       decision TEXT,
@@ -619,6 +620,17 @@ try {
   `);
 } catch (err) {
   console.warn(`${LOG_TAG} station investigator migration:`, err.message);
+}
+safeAddColumn('station_investigation_jobs', 'quota_reserved_at', 'TEXT DEFAULT NULL');
+try {
+  const backfilled = db.prepare(`UPDATE station_investigation_jobs
+    SET quota_reserved_at = created_at
+    WHERE quota_reserved_at IS NULL AND status <> 'claimed'`).run();
+  if (backfilled.changes > 0) {
+    console.log(`${LOG_TAG} Migration: backfilled ${backfilled.changes} station quota reservation(s)`);
+  }
+} catch (err) {
+  console.warn(`${LOG_TAG} station investigator quota migration:`, err.message);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

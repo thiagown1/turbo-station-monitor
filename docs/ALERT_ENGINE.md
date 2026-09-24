@@ -152,6 +152,38 @@ the record hit the flat 30-day GC, and the URGENTE group was re-paged for a
 theft the team had already handled. Env overrides:
 `ALERT_CABLE_THEFT_BURST_COUNT`, `ALERT_CABLE_THEFT_BURST_INTERVAL_MS`.
 
+#### Losing that state re-pages the group — two layers stop it (added 2026-09-07)
+
+The record is the only thing keeping an ongoing theft silent, so losing the file
+is indistinguishable from "nothing is open". It happened twice:
+
+| Date | What | Result |
+|---|---|---|
+| 01/09 19:17 UTC → 02/09 20:44 | disk full → `ENOSPC` on save → `Unexpected end of JSON input` on load | false bursts for `GUTS2606030002` + `314030001957` |
+| 06/09 10:46 UTC → 06/09 18:28 | same pair, after the pm2 stack came back | false bursts for `314030001957` (Metrópole 3) + `GUTS2606030001` (UP CAR 01) |
+
+`fs.writeFileSync` **truncates before writing**, so a full disk empties the file
+without writing a byte. Two defenses:
+
+1. **Atomic writes** — `writeJsonAtomic` (`services/atomic-json.js`) writes a
+   `.tmp` sibling and `rename()`s it over the target, so a failed write leaves
+   the previous state untouched. Also used for the debounce cache and the
+   charger-fault backoff, which had the same hazard.
+2. **Rebuild instead of resetting** — a *missing* file is a genuine first run
+   (empty state), but a file that exists and won't parse means state was LOST.
+   In that case `reconstructOpenCableTheftIncidents()` derives the open
+   incidents from `ocpp.db`: connectors whose latest StatusNotification is a
+   theft-signature fault, anchored at the start of the current fault streak
+   (`findCableTheftStreakStart`, i.e. the first fault after the last operational
+   status, so a later genuine recovery still re-bursts). Streaks younger than
+   `ALERT_CABLE_THEFT_RECONSTRUCT_MIN_AGE_MS` (30 min) are deliberately NOT
+   adopted — a crash can beat the burst, and a theft that started minutes ago
+   may never have been paged. The rebuilt state is written back, so the next
+   boot reads a valid file. Window override:
+   `ALERT_CABLE_THEFT_RECONSTRUCT_WINDOW_MS` (default 1h).
+
+Regression coverage: `test/test-cable-theft-state-durability.js`.
+
 The critical **FCM push** for the same fault is a separate, independent path in
 the Next.js repo (`high-temp-critical-push.ts`) — the VPS cannot send FCM. The
 two detect the same signal via independent pipelines on purpose (see the

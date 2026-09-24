@@ -52,11 +52,65 @@ function assertCommitSha(value) {
   return sha;
 }
 
-function servicesForFiles(files) {
+// A `npm ci` on this box takes ~5 minutes when the CI runners are loading it,
+// and it wipes node_modules before reinstalling. Running it on every deploy -
+// even when no lockfile moved, is pure risk: on 2026-09-03 it blew the old
+// 180s ceiling and killed the deploy of #78 after the fast-forward had already
+// landed, leaving new code on disk and old code in memory. Install only when
+// the manifests actually changed (or nothing is installed yet), and give it
+// room when it does run.
+const INSTALL_TIMEOUT_MS = 900000;
+
+function needsInstall({
+  packageDir,
+  changedFiles,
+  repoDir,
+  fsImpl = fs,
+  packageJsonAffectsRuntime = true,
+}) {
+  const prefix = packageDir ? `${packageDir}/` : '';
+  const packageJson = `${prefix}package.json`;
+  const packageLock = `${prefix}package-lock.json`;
+  // `git diff --name-only` always emits forward slashes, on every platform.
+  if (changedFiles.some((file) => String(file || '').trim() === packageLock)) {
+    return 'manifest changed';
+  }
+  if (packageJsonAffectsRuntime && changedFiles.some((file) => String(file || '').trim() === packageJson)) {
+    return 'runtime manifest changed';
+  }
+  if (!fsImpl.existsSync(path.join(repoDir, packageDir, 'node_modules'))) {
+    return 'node_modules missing';
+  }
+  return null;
+}
+
+const RUNTIME_PACKAGE_FIELDS = [
+  'dependencies',
+  'optionalDependencies',
+  'peerDependencies',
+  'bundledDependencies',
+  'bundleDependencies',
+  'engines',
+  'type',
+];
+
+function packageManifestAffectsRuntime(beforeText, afterText) {
+  try {
+    const before = JSON.parse(beforeText);
+    const after = JSON.parse(afterText);
+    return RUNTIME_PACKAGE_FIELDS.some((field) =>
+      JSON.stringify(before[field] ?? null) !== JSON.stringify(after[field] ?? null)
+    );
+  } catch {
+    return true;
+  }
+}
+
+function servicesForFiles(files, { rootPackageAffectsRuntime = true } = {}) {
   const normalized = files.map((file) => String(file || '').replace(/\\/g, '/')).filter(Boolean);
   if (normalized.some((file) =>
     file === 'ecosystem.config.js' ||
-    file === 'package.json' ||
+    (file === 'package.json' && rootPackageAffectsRuntime) ||
     file === 'package-lock.json' ||
     file.startsWith('services/lib/')
   )) return new Set(ALL_SERVICES);
@@ -68,6 +122,49 @@ function servicesForFiles(files) {
     }
   }
   return services;
+}
+
+function emptyDeployProgress() {
+  return { version: 1, services: {}, installs: {}, pendingHealth: [] };
+}
+
+function readDeployProgress(progressPath, fsImpl = fs) {
+  try {
+    const parsed = JSON.parse(fsImpl.readFileSync(progressPath, 'utf8'));
+    if (parsed?.version !== 1 || typeof parsed.services !== 'object' || typeof parsed.installs !== 'object') {
+      return emptyDeployProgress();
+    }
+    return {
+      ...parsed,
+      pendingHealth: Array.isArray(parsed.pendingHealth)
+        ? parsed.pendingHealth.filter((service) => ALL_SERVICES.includes(service))
+        : [],
+    };
+  } catch {
+    return emptyDeployProgress();
+  }
+}
+
+function writeDeployProgress(progressPath, progress, fsImpl = fs) {
+  fsImpl.mkdirSync(path.dirname(progressPath), { recursive: true });
+  const tempPath = `${progressPath}.${process.pid}.tmp`;
+  fsImpl.writeFileSync(tempPath, `${JSON.stringify(progress, null, 2)}\n`, 'utf8');
+  fsImpl.renameSync(tempPath, progressPath);
+}
+
+async function manifestAffectsRuntimeBetween({ beforeSha, afterSha, manifestPath, run, gitBin, repoDir }) {
+  if (beforeSha === afterSha) return false;
+  try {
+    const [{ stdout: before }, { stdout: after }] = await Promise.all([
+      run(gitBin, ['show', `${beforeSha}:${manifestPath}`], { cwd: repoDir }),
+      run(gitBin, ['show', `${afterSha}:${manifestPath}`], { cwd: repoDir }),
+    ]);
+    return packageManifestAffectsRuntime(before, after);
+  } catch {
+    // Missing/malformed manifests are unusual and should never make deployment
+    // less conservative.
+    return true;
+  }
 }
 
 function execFilePromise(command, args, options = {}) {
@@ -268,6 +365,22 @@ async function restartServices(services, { run = execFilePromise, pm2Bin, repoDi
   return [...services];
 }
 
+// execFile's timeout kill surfaces as a bare "Command failed: <cmd>" with only
+// whatever npm had already written to stderr, which for npm is a deprecation
+// warning, not the cause. Name the timeout so the Telegram alert is actionable.
+async function runInstall(run, npmBin, args, repoDir, label) {
+  const startedAt = Date.now();
+  try {
+    return await run(npmBin, args, { cwd: repoDir, timeout: INSTALL_TIMEOUT_MS });
+  } catch (error) {
+    const elapsed = Date.now() - startedAt;
+    if (error.killed || elapsed >= INSTALL_TIMEOUT_MS) {
+      throw new Error(`npm ci (${label}) timed out after ${Math.round(elapsed / 1000)}s (limit ${INSTALL_TIMEOUT_MS / 1000}s)`);
+    }
+    throw error;
+  }
+}
+
 async function deployMonitor({
   sha,
   repoDir,
@@ -279,6 +392,7 @@ async function deployMonitor({
   npmBin = process.env.NPM_BIN || '/usr/bin/npm',
   pm2Bin = process.env.PM2_BIN || '/home/openclaw/.npm-global/bin/pm2',
   statePath = path.join(repoDir, 'db', '.monitor-deployed-sha'),
+  progressPath = path.join(repoDir, 'db', '.monitor-deploy-progress.json'),
   lockPath = path.join(repoDir, 'db', '.monitor-deploy.lock'),
   lockSleepFn = sleep,
   lockAttempts = 120,
@@ -322,22 +436,123 @@ async function deployMonitor({
     const deployedSha = readStateSha(statePath, headSha, fsImpl);
     const { stdout: diffOut } = await run(gitBin, ['diff', '--name-only', deployedSha, targetSha], { cwd: repoDir });
     const changedFiles = diffOut.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-    const services = servicesForFiles(changedFiles);
+    const progress = readDeployProgress(progressPath, fsImpl);
+    const diffCache = new Map([[`${deployedSha}:${targetSha}`, changedFiles]]);
+    const manifestCache = new Map();
+    const filesBetween = async (beforeSha) => {
+      if (beforeSha === targetSha) return [];
+      const key = `${beforeSha}:${targetSha}`;
+      if (diffCache.has(key)) return diffCache.get(key);
+      const { stdout } = await run(gitBin, ['diff', '--name-only', beforeSha, targetSha], { cwd: repoDir });
+      const files = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+      diffCache.set(key, files);
+      return files;
+    };
+    const runtimeManifestChanged = async (beforeSha, manifestPath = 'package.json') => {
+      const key = `${beforeSha}:${targetSha}:${manifestPath}`;
+      if (!manifestCache.has(key)) {
+        manifestCache.set(key, await manifestAffectsRuntimeBetween({
+          beforeSha,
+          afterSha: targetSha,
+          manifestPath,
+          run,
+          gitBin,
+          repoDir,
+        }));
+      }
+      return manifestCache.get(key);
+    };
+    const rootPackageAffectsRuntime = changedFiles.includes('package.json')
+      ? await runtimeManifestChanged(deployedSha)
+      : false;
+    const services = servicesForFiles(changedFiles, { rootPackageAffectsRuntime });
+    for (const service of progress.pendingHealth) services.add(service);
 
     if (headSha !== targetSha) {
       await run(gitBin, ['merge', '--ff-only', targetSha], { cwd: repoDir });
     }
 
-    await run(npmBin, ['ci', '--omit=dev'], { cwd: repoDir, timeout: 180000 });
-    if (fsImpl.existsSync(path.join(repoDir, 'services', 'support-copilot', 'package-lock.json'))) {
-      await run(npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], { cwd: repoDir, timeout: 180000 });
+    const usableBaseline = async (candidate) => {
+      try {
+        const baseline = assertCommitSha(candidate);
+        if (baseline === targetSha) return baseline;
+        return await isAncestorOf({ ancestorSha: baseline, descendantSha: targetSha, run, gitBin, repoDir })
+          ? baseline
+          : deployedSha;
+      } catch {
+        return deployedSha;
+      }
+    };
+
+    const rootInstallBaseline = await usableBaseline(progress.installs.root);
+    const rootInstallFiles = await filesBetween(rootInstallBaseline);
+    const rootInstallRuntimeChanged = rootInstallFiles.includes('package.json')
+      ? await runtimeManifestChanged(rootInstallBaseline)
+      : false;
+    const rootReason = needsInstall({
+      packageDir: '',
+      changedFiles: rootInstallFiles,
+      packageJsonAffectsRuntime: rootInstallRuntimeChanged,
+      repoDir,
+      fsImpl,
+    });
+    if (rootReason) {
+      log(`[auto-deploy] npm ci (root): ${rootReason}`);
+      await runInstall(run, npmBin, ['ci', '--omit=dev'], repoDir, 'root');
+    }
+    progress.installs.root = targetSha;
+    writeDeployProgress(progressPath, progress, fsImpl);
+    const copilotDir = path.join('services', 'support-copilot');
+    if (fsImpl.existsSync(path.join(repoDir, copilotDir, 'package-lock.json'))) {
+      const copilotInstallBaseline = await usableBaseline(progress.installs.supportCopilot);
+      const copilotInstallFiles = await filesBetween(copilotInstallBaseline);
+      const copilotManifestPath = 'services/support-copilot/package.json';
+      const copilotRuntimeChanged = copilotInstallFiles.includes(copilotManifestPath)
+        ? await runtimeManifestChanged(copilotInstallBaseline, copilotManifestPath)
+        : false;
+      const copilotReason = needsInstall({
+        packageDir: 'services/support-copilot',
+        changedFiles: copilotInstallFiles,
+        packageJsonAffectsRuntime: copilotRuntimeChanged,
+        repoDir,
+        fsImpl,
+      });
+      if (copilotReason) {
+        log(`[auto-deploy] npm ci (support-copilot): ${copilotReason}`);
+        await runInstall(run, npmBin, ['ci', '--omit=dev', '--prefix', 'services/support-copilot'], repoDir, 'support-copilot');
+      }
+      progress.installs.supportCopilot = targetSha;
+      writeDeployProgress(progressPath, progress, fsImpl);
     }
 
     const deferredServices = [...services].filter((s) => s === SELF_SERVICE);
-    const immediateServices = [...services].filter((s) => s !== SELF_SERVICE);
+    const affectedImmediateServices = [...services].filter((s) => s !== SELF_SERVICE);
+    const immediateServices = [];
+    for (const service of affectedImmediateServices) {
+      const serviceBaseline = await usableBaseline(progress.services[service]);
+      const serviceFiles = await filesBetween(serviceBaseline);
+      const serviceRootRuntimeChanged = serviceFiles.includes('package.json')
+        ? await runtimeManifestChanged(serviceBaseline)
+        : false;
+      const stillAffected = servicesForFiles(serviceFiles, {
+        rootPackageAffectsRuntime: serviceRootRuntimeChanged,
+      }).has(service);
+      if (stillAffected) {
+        await restartServices([service], { run, pm2Bin, repoDir });
+        immediateServices.push(service);
+        if (!progress.pendingHealth.includes(service)) progress.pendingHealth.push(service);
+      }
+      progress.services[service] = targetSha;
+      writeDeployProgress(progressPath, progress, fsImpl);
+    }
 
-    await restartServices(immediateServices, { run, pm2Bin, repoDir });
-    await checkHealth(immediateServices);
+    // Even when a successful restart is resumed from progress, health is always
+    // rechecked before advancing the global deployed marker.
+    await checkHealth(affectedImmediateServices);
+    progress.pendingHealth = progress.pendingHealth.filter(
+      (service) => !affectedImmediateServices.includes(service)
+    );
+    writeDeployProgress(progressPath, progress, fsImpl);
     await run(pm2Bin, ['save'], { cwd: repoDir, timeout: 30000 });
 
     fsImpl.writeFileSync(statePath, `${targetSha}\n`, 'utf8');
@@ -352,6 +567,7 @@ async function deployMonitor({
       changedFiles,
       services: [...services],
       immediateServices,
+      healthCheckedServices: affectedImmediateServices,
       deferredServices,
     };
   } finally {
@@ -422,6 +638,8 @@ module.exports = {
   HEALTH_ENDPOINTS,
   assertCommitSha,
   servicesForFiles,
+  needsInstall,
+  packageManifestAffectsRuntime,
   waitForSuccessfulCi,
   verifyHealth,
   deployMonitor,

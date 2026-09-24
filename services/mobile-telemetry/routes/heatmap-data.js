@@ -22,8 +22,10 @@ const {
     HEATMAP_QUERY_TIMEOUT_CODE,
     heatmapQueryRunner,
 } = require('../lib/heatmap-query-runner');
+const { HeatmapQueryCache } = require('../lib/heatmap-query-cache');
 
 const router = Router();
+const heatmapQueryCache = new HeatmapQueryCache({ runner: heatmapQueryRunner });
 
 // Cap to keep SQL size + prepared-statement cache bounded. Brands with more
 // admins than this fall back to truncated exclusion — acceptable since this
@@ -59,9 +61,12 @@ router.get('/', async (req, res) => {
                   .slice(0, MAX_EXCLUDE_USER_IDS)
             : [];
 
-        const result = await heatmapQueryRunner.run({ periodMs, brandId, excludeUserIds });
+        const { result, cacheStatus } = await heatmapQueryCache.run({ periodMs, brandId, excludeUserIds });
 
-        res.set('Cache-Control', 'max-age=60').json({ period, ...result });
+        res
+            .set('Cache-Control', 'private, no-store')
+            .set('X-Telemetry-Cache', cacheStatus)
+            .json({ period, ...result });
     } catch (err) {
         console.error(`${LOG_TAG} Error fetching heatmap data:`, err.message);
         if (err && err.code === HEATMAP_QUERY_TIMEOUT_CODE) {

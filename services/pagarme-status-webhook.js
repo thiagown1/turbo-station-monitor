@@ -5,30 +5,21 @@
  * Endpoint: /api/pagarme/status-webhook
  *
  * Receives statuspage.io style webhook events for incidents/components.
- * Sends concise notification to Telegram group.
+ * Sends a concise notification to the configured operational WhatsApp group.
  */
 
 const http = require('http');
 const crypto = require('crypto');
-const { spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
+const { sendOperationalWhatsApp } = require('./lib/operational-whatsapp');
 
 const PORT = resolveServicePort('PAGARME_WEBHOOK_PORT', 3004, '[pagarme-status-webhook]');
-const TELEGRAM_TARGET = process.env.PAGARME_STATUS_TELEGRAM_TARGET || 'telegram:-5250194812';
 const WEBHOOK_SECRET = process.env.PAGARME_WEBHOOK_SECRET || '';
-const OPENCLAW_CLI = process.env.OPENCLAW_CLI || '/home/openclaw/.npm-global/bin/openclaw';
 const MAX_PAYLOAD_SIZE = 64 * 1024;
 
-function sendTelegram(text) {
-  const child = spawn(
-    OPENCLAW_CLI,
-    ['message', 'send', '--channel', 'telegram', '--target', TELEGRAM_TARGET, '--message', String(text)],
-    { shell: false, timeout: 10000, stdio: 'ignore' }
-  );
-  child.on('error', (err) => console.error(`[pagarme-status] telegram send failed: ${err.message}`));
-  child.on('close', (code) => {
-    if (code === 0) console.log('[pagarme-status] telegram sent');
-    else console.error(`[pagarme-status] telegram exited with code ${code}`);
+function notifyOperations(text) {
+  void sendOperationalWhatsApp(text, 'pagarme-status-webhook').then((result) => {
+    console.log(`[pagarme-status] operational WhatsApp: ${result.status}${result.reason ? ` (${result.reason})` : ''}`);
   });
 }
 
@@ -121,9 +112,7 @@ function handler(req, res) {
       const payload = JSON.parse(body || '{}');
       const msg = summarize(payload);
 
-      // Add minimal delivery metadata for debugging (do not include sensitive headers)
-      const meta = `source_ip=${req.socket.remoteAddress || ''}`;
-      sendTelegram(msg + "\n" + meta);
+      notifyOperations(msg);
 
       ok(res, 200, { ok: true });
     } catch (e) {

@@ -11,9 +11,10 @@ const PROMPT = `Classifique a mensagem/mídia em exatamente um tipo:
 partner_payment_receipt (comprovante de repasse PIX/TED), expense_receipt (comprovante de dinheiro que saiu da Turbo Station), energy_invoice (fatura/conta de energia), station_support (pedido ou evidência de análise de carregador), support_attention (bug/erro que merece atenção), other.
 Extraia somente o que estiver legível. suggested_reply deve ser curta, em português, e nunca afirmar que um problema foi corrigido.
 Para partner_payment_receipt, payee deve ser o destinatário/favorecido do repasse (quem recebeu da Turbo Station), nunca a Turbo Station ou o remetente.
+payee_document deve ser o CPF/CNPJ do favorecido (campo "CPF ou CNPJ" ou a chave PIX quando ela for um CPF/CNPJ), somente dígitos, nunca o documento da Turbo Station pagadora. Se não estiver legível, null.
 Para expense_receipt, informe currency (ISO 4217), original_amount e settled_brl_amount. Se for moeda estrangeira e o valor final cobrado em reais não estiver legível, settled_brl_amount deve ser null. Não converta câmbio. Extraia transaction_date (AAAA-MM-DD), competency {year,month} e recurring_hint somente quando houver evidência no documento/texto. suggested_category deve ser exatamente gateway, ia, infra, marketing, taxas, emprestimos ou outros; use emprestimos somente quando o documento/contexto indicar claramente pagamento de empréstimo.
 Para energy_invoice, preencha energy_bill somente com campos literalmente legíveis na conta. distributor deve ser equatorial_go, neoenergia_df ou unknown. Valores ausentes ficam null; não derive tarifa dividindo total por kWh e não trate crédito SCEE como preço do gerador.
-JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"settled_brl_amount":null,"currency":null,"original_amount":null,"transaction_date":null,"competency":null,"recurring_hint":false,"transaction_id":null,"payee":null,"suggested_category":null,"suggested_reply":null,"energy_bill":{"distributor":"unknown","uc":null,"ref_period":null,"due_date":null,"kwh_nao_compensado":null,"tarifa_nao_compensada":null,"kwh_compensado":null,"tarifa_scee":null,"tarifa_sem_tributos_nao_compensada":null,"tarifa_sem_tributos":null,"total_brl":null}}`;
+JSON: {"kind":"other","summary":"...","confidence":0.0,"needs_attention":false,"amount":null,"settled_brl_amount":null,"currency":null,"original_amount":null,"transaction_date":null,"competency":null,"recurring_hint":false,"transaction_id":null,"payee":null,"payee_document":null,"suggested_category":null,"suggested_reply":null,"energy_bill":{"distributor":"unknown","uc":null,"ref_period":null,"due_date":null,"kwh_nao_compensado":null,"tarifa_nao_compensada":null,"kwh_compensado":null,"tarifa_scee":null,"tarifa_sem_tributos_nao_compensada":null,"tarifa_sem_tributos":null,"total_brl":null}}`;
 
 function mediaPart(absPath, mediaType, mimetype) {
   if (!absPath) return null;
@@ -27,6 +28,17 @@ function mediaPart(absPath, mediaType, mimetype) {
     return { type: 'image_url', image_url: { url: `data:${mime};base64,${base64}` } };
   }
   return null;
+}
+
+/**
+ * CPF/CNPJ do favorecido, só dígitos. Descarta qualquer coisa que não tenha
+ * tamanho de CPF (11) ou CNPJ (14): o backend usa esse número para dizer de qual
+ * parceiro é o comprovante quando ele é reenviado no grupo de Contas, e um
+ * fragmento mal lido não pode virar um palpite.
+ */
+function payeeDocument(value) {
+  const digits = String(value == null ? '' : value).replace(/\D/g, '');
+  return digits.length === 11 || digits.length === 14 ? digits : undefined;
 }
 
 function cleanString(value, max) {
@@ -148,6 +160,7 @@ async function classifyMessage({ absPath, mediaType, mimetype, body, context, mo
     recurringHint: parsed.recurring_hint === true,
     receiptRef: cleanString(parsed.transaction_id, 200),
     payee: cleanString(parsed.payee, 300),
+    payeeDocument: payeeDocument(parsed.payee_document),
     suggestedCategory: cleanString(parsed.suggested_category, 100),
     suggestedReply: cleanString(parsed.suggested_reply, 3000),
     energyBill,
