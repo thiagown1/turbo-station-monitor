@@ -19,7 +19,8 @@
  */
 
 const Database = require('better-sqlite3');
-const { execSync } = require('child_process');
+const { execFileSync } = require('child_process');
+const { sendOperationalWhatsApp } = require('./lib/operational-whatsapp');
 const path = require('path');
 const fs = require('fs');
 
@@ -27,7 +28,6 @@ const fs = require('fs');
 const DB_PATH = path.join(__dirname, '..', 'db', 'vercel.db');
 const STATE_PATH = path.join(__dirname, '..', 'db', 'deploy-health-state.json');
 const CRON_PATH = '/home/openclaw/.openclaw/cron/jobs.json';
-const DEPLOY_TELEGRAM_GROUP = process.env.DEPLOY_TELEGRAM_GROUP || 'telegram:-5215167228';
 
 // Agent cron job ID (must match jobs.json)
 const AGENT_CRON_ID = '2e4b1e4b-d252-41bd-b705-8ece63a2ad89';
@@ -137,20 +137,22 @@ function getAdaptiveIntervalMs(state, now = Date.now()) {
   return null;
 }
 
-// ─── Telegram messaging ─────────────────────────────────────────────
-function sendTelegram(msg) {
+// ─── Operational notice ─────────────────────────────────────────────
+// Telegram via `openclaw message send` was retired so the OpenClaw gateway can
+// be switched off. Notices go to the operational WhatsApp group through the
+// shared relay (docs/OPERATIONAL_WHATSAPP.md), which is inert until
+// OPERATIONAL_WHATSAPP_ENABLED=true. Returns true only when the relay accepted it;
+// skipped/failed results are logged so the decision stays auditable.
+async function notify(msg, { send = sendOperationalWhatsApp } = {}) {
+  let result;
   try {
-    // Escape for shell
-    const escaped = msg.replace(/"/g, '\\"').replace(/\$/g, '\\$');
-    execSync(
-      `openclaw message send --channel telegram --target "${DEPLOY_TELEGRAM_GROUP}" --message "${escaped}"`,
-      { timeout: 15000, stdio: 'pipe' }
-    );
-    return true;
+    result = await send(msg, 'deploy-health-check');
   } catch (err) {
-    console.error('[deploy-health] Failed to send telegram:', err.message);
-    return false;
+    result = { status: 'failed', reason: err && err.message ? err.message : 'unknown' };
   }
+  const status = result && result.status ? result.status : 'failed';
+  console.log(`[deploy-health] operational WhatsApp: ${status}${result && result.reason ? ` (${result.reason})` : ''}`);
+  return status === 'accepted';
 }
 
 // ─── DB queries ─────────────────────────────────────────────────────
@@ -297,7 +299,7 @@ function buildMessage(metrics, phase, state) {
 }
 
 // ─── Commands ───────────────────────────────────────────────────────
-function handleDeployStart() {
+async function handleDeployStart() {
   const state = loadState();
   const now = Date.now();
   state.deployActive = true;
@@ -326,18 +328,18 @@ function handleDeployStart() {
     `🕐 ${new Date(now).toISOString()}`
   ].join('\n');
 
-  sendTelegram(msg);
+  await notify(msg);
   console.log('[deploy-health] Deploy monitoring activated.');
 
   try {
-    execSync(`node "${__filename}" --force`, { stdio: 'inherit', timeout: 30000 });
+    execFileSync(process.execPath, [__filename, '--force'], { stdio: 'inherit', timeout: 30000 });
     console.log('[deploy-health] Immediate health check executed.');
   } catch (err) {
     console.error('[deploy-health] Immediate health check failed:', err.message);
   }
 }
 
-function handleDeployStop() {
+async function handleDeployStop() {
   const state = loadState();
   const wasActive = state.deployActive;
   const elapsed = getElapsedStr(state);
@@ -350,7 +352,7 @@ function handleDeployStop() {
   updateAgentCron(false, null);
 
   if (wasActive) {
-    sendTelegram(`🏁 Deploy monitoring DEACTIVATED after ${elapsed}\n🕐 ${new Date().toISOString()}`);
+    await notify(`🏁 Deploy monitoring DEACTIVATED after ${elapsed}\n🕐 ${new Date().toISOString()}`);
   }
 
   console.log('[deploy-health] Deploy monitoring deactivated.');
@@ -372,7 +374,7 @@ function handleStatus() {
 }
 
 // ─── Main ───────────────────────────────────────────────────────────
-function main() {
+async function main() {
   const args = process.argv.slice(2);
 
   // Handle commands
@@ -403,17 +405,17 @@ function main() {
 
     if (currentPhase === 'moderate') {
       updateAgentCron(true, getAdaptiveIntervalMs(state, now));
-      sendTelegram(`🟡 Deploy phase → MODERATE (agent now every 2min)\n⏱ Deploy +${getElapsedStr(state)}`);
+      await notify(`🟡 Deploy phase → MODERATE (agent now every 2min)\n⏱ Deploy +${getElapsedStr(state)}`);
       console.log('[deploy-health] Transitioned to moderate phase.');
     } else if (currentPhase === 'stable') {
       updateAgentCron(true, getAdaptiveIntervalMs(state, now));
-      sendTelegram(`🟢 Deploy phase → STABLE (agent now every 15min)\n⏱ Deploy +${getElapsedStr(state)}`);
+      await notify(`🟢 Deploy phase → STABLE (agent now every 15min)\n⏱ Deploy +${getElapsedStr(state)}`);
       console.log('[deploy-health] Transitioned to stable phase.');
     } else if (currentPhase === 'complete' && previousPhase !== 'complete') {
       state.deployActive = false;
       saveState(state);
       updateAgentCron(false, null);
-      sendTelegram(`⚪ Deploy monitoring window complete (agent OFF, script continues every 20min)\n⏱ Deploy +${getElapsedStr({ ...state, deployActive: true })}`);
+      await notify(`⚪ Deploy monitoring window complete (agent OFF, script continues every 20min)\n⏱ Deploy +${getElapsedStr({ ...state, deployActive: true })}`);
       console.log('[deploy-health] Monitoring window completed. Agent cron disabled.');
     }
   }
@@ -458,7 +460,7 @@ function main() {
   const msg = buildMessage(metrics, currentPhase, state);
 
   if (msg) {
-    if (sendTelegram(msg)) {
+    if (await notify(msg)) {
       console.log(`[deploy-health] Alert sent (phase: ${currentPhase}).`);
       state.lastAlertMs = now;
       state.lastAlertRoutes = metrics.recentRows.slice(0, 5).map(r => r.endpoint);
@@ -469,4 +471,11 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('[deploy-health] fatal:', err && err.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { notify };

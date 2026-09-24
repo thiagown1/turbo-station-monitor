@@ -1,6 +1,6 @@
 # Operational WhatsApp notices
 
-`github-webhook` and `pagarme-status-webhook` can submit notices to the existing
+`github-webhook`, `pagarme-status-webhook` and `deploy-health-check` can submit notices to the existing
 Support WhatsApp relay instead of using `openclaw message send` for Telegram.
 This does not change the webhook acknowledgement or start the Hermes migration.
 
@@ -26,13 +26,22 @@ The webhook logs only `skipped_disabled`, `skipped_unconfigured`, `accepted`, or
 `failed` with a short reason. There is no fallback to Telegram or OpenClaw.
 Operational notices do not inject into an OpenClaw agent session. To stop new
 submissions, set `OPERATIONAL_WHATSAPP_ENABLED` to any value other than `true`
-and restart only the two webhook processes after the separate configuration
+and restart only the affected processes after the separate configuration
 change is authorized.
 
 The GitHub webhook's legacy `short_trader` MoneyMan hook is now disabled unless
 `SHORT_TRADER_OPENCLAW_HOOK_ENABLED=true` is explicitly configured. Leave it
-disabled during retirement. Support-copilot still has other agent paths; audit
-and remove those separately before disabling the gateway.
+disabled during retirement.
+
+## OpenClaw CLI retirement status
+
+`test/test-no-openclaw-cli.js` fails if a shipped runtime file shells out to
+`openclaw` outside a short allowlist. Retired: alert-engine Telegram,
+deploy-health-check Telegram, vercel-deploy-hook Telegram and LLM checklist,
+the unscheduled `scripts/monitor.js`/`analyze.js`/`hourly-report.js`, and every
+support-copilot agent call (see its README, "Suggestion generation"). Still on
+the gateway: `ocpp-alerts` (PR #75), the Contador primary model,
+`ai-openclaw-agent`, `sweep-orchestrator` and `budget-guardian`.
 
 ## Group handoff at the gateway
 

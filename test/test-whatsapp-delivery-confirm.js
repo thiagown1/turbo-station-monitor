@@ -15,7 +15,9 @@
 
 process.env.SUPPORT_API_SECRET = 'test-secret';
 process.env.WHATSAPP_DELIVERY_POLL_MS = '1,1,1'; // keep polls fast in tests
-delete process.env.ALERT_TELEGRAM_GROUP; // telegram disabled (prod default)
+// Telegram was retired: a leftover ALERT_TELEGRAM_GROUP must not create a second
+// channel or spawn the openclaw CLI (see test-no-openclaw-cli.js).
+process.env.ALERT_TELEGRAM_GROUP = 'telegram:-100';
 
 const assert = require('assert');
 const Database = require('better-sqlite3');
@@ -236,60 +238,48 @@ check('pending rows do not prevent newer actionable alerts from being retried', 
     assert.strictEqual(alertRow(engine, actionableId).sent, 1);
 });
 
-check('pending WhatsApp delivery still retries Telegram independently', async () => {
+check('pending WhatsApp delivery is not re-posted and the alert stays unsent', async () => {
     const engine = dbEngine();
-    const id = insertAlert(engine, { waMessageId: 'msg_pending_with_telegram' });
-    let telegramAttempts = 0;
-    engine.sendTelegramAlert = async () => {
-        telegramAttempts += 1;
-        return true;
-    };
+    const id = insertAlert(engine, { waMessageId: 'msg_pending_only' });
     stubFetch({
         post: { status: 200, json: { id: 'msg_duplicate' } },
-        get: { status: 200, json: { messages: [{ id: 'msg_pending_with_telegram', delivery_status: 'pending' }] } },
+        get: { status: 200, json: { messages: [{ id: 'msg_pending_only', delivery_status: 'pending' }] } },
     });
 
-    await engine.retryUnsentAlerts({ telegramConfigured: true });
+    await engine.retryUnsentAlerts();
 
-    assert.strictEqual(telegramAttempts, 1);
     assert.strictEqual(posts().length, 0, 'stored pending WhatsApp message is not posted again');
-    assert.strictEqual(alertRow(engine, id).sent, 1, 'confirmed Telegram delivery completes the alert');
+    assert.strictEqual(alertRow(engine, id).sent, 0, 'no other channel may complete the alert');
 });
 
-check('Telegram retry quota cannot suppress a newer actionable WhatsApp retry', async () => {
+check('pending backlog cannot suppress a newer actionable WhatsApp retry', async () => {
     const engine = dbEngine();
     const base = Date.now() - 10_000;
     const pendingIds = [];
     for (let i = 0; i < 5; i++) {
-        const messageId = `msg_pending_telegram_${i}`;
+        const messageId = `msg_pending_backlog_${i}`;
         pendingIds.push(messageId);
         insertAlert(engine, { createdAt: base + i, waMessageId: messageId });
     }
     const actionableId = insertAlert(engine, { createdAt: base + 100 });
-    let telegramAttempts = 0;
-    engine.sendTelegramAlert = async () => {
-        telegramAttempts += 1;
-        return false;
-    };
     stubFetch({
-        post: { status: 200, json: { id: 'msg_actionable_after_telegram_quota' } },
+        post: { status: 200, json: { id: 'msg_actionable_after_backlog' } },
         get: (calls) => ({
             status: 200,
             json: {
                 messages: [
                     ...pendingIds.map((id) => ({ id, delivery_status: 'pending' })),
                     ...(calls.some((call) => call.method === 'POST')
-                        ? [{ id: 'msg_actionable_after_telegram_quota', delivery_status: 'sent' }]
+                        ? [{ id: 'msg_actionable_after_backlog', delivery_status: 'sent' }]
                         : []),
                 ],
             },
         }),
     });
 
-    await engine.retryUnsentAlerts({ telegramConfigured: true });
+    await engine.retryUnsentAlerts();
 
-    assert.strictEqual(telegramAttempts, 5, 'Telegram has its own bounded retry quota');
-    assert.strictEqual(posts().length, 1, 'WhatsApp remains independently actionable');
+    assert.strictEqual(posts().length, 1, 'WhatsApp remains actionable');
     assert.strictEqual(alertRow(engine, actionableId).sent, 1);
 });
 

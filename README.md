@@ -38,7 +38,7 @@ Runs on a VPS as a set of PM2-managed Node.js services that collect, store, and 
 | `github-webhook` | 3002 | `github-webhook.js` | GitHub CI/review webhook and evidence capture |
 | `mobile-telemetry` | 3003 | `mobile-telemetry.js` | Mobile app telemetry ingress → `db/mobile.db` |
 | `pagarme-status-webhook` | 3004 | `pagarme-status-webhook.js` | Payment status updates → optional operational WhatsApp group |
-| `alert-engine` | — | `alert-engine.js` | Advanced alerting with rate limiting, grouping, Telegram |
+| `alert-engine` | — | `alert-engine.js` | Advanced alerting with rate limiting, grouping, WhatsApp |
 
 GitHub review automation follows the fail-closed dual-read contract documented
 in [`docs/REVIEW_VERDICT_COMPATIBILITY.md`](docs/REVIEW_VERDICT_COMPATIBILITY.md).

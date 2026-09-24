@@ -142,8 +142,8 @@ the accounting-agent boundaries and activation runbook.
 
 `max_memory_restart` is **256M**. Steady state measured on the live process is
 86–102 MB RSS (heap 14–26 MB); the rest is headroom for transients — media
-base64, `openclaw agent` stdout buffers (5 MB each, several can overlap during
-an alert burst), and session-tail reads.
+base64 and session-tail reads (the old `openclaw agent` stdout buffers are
+gone with the retired agent path).
 
 The previous 150M cap sat only ~50 MB above steady state and was being tripped
 by a single transient, recycling the service and dropping in-flight work (160
@@ -165,61 +165,28 @@ Two rules keep that from taking the service down again:
    .split('\n')` on that 39 MB file peaked at 208 MB RSS — past the old cap on
    its own. `__tests__/session-file.test.js` guards this with a peak-RSS
    assertion plus a CONTROL case running the old approach.
-2. **Sessions get re-compacted.** Compaction used to be once-per-lifetime, so
-   an always-active conversation grew unbounded after its single pass. It now
-   runs again whenever the file exceeds `SESSION_RECOMPACT_BYTES` (8 MiB).
-   This matters beyond memory: past roughly 30 MB the OpenClaw agent fails to
-   load the session at all (`Failed to inject into session ...`), so an
-   overgrown transcript silently stops receiving alerts — and is then too big
-   to compact.
+Session compaction (`openclaw sessions compact`) was retired together with
+the OpenClaw agent; `compactSession` now only logs a skip. Existing transcript
+files are left on disk untouched.
 
-3. **Compaction goes through `openclaw sessions compact`, never
-   `--message /compact`.** OpenClaw 2026.7.1-2 rejects slash commands on the
-   `--message` path (`Slash commands cannot be executed via --message from the
-   CLI`). See below.
+### Suggestion generation (off by default)
 
-Tunable via `SUPPORT_SESSION_TAIL_MAX_BYTES` (default 2 MiB) and
-`SUPPORT_SESSION_RECOMPACT_BYTES` (default 8 MiB).
+The OpenClaw agent harness (`openclaw agent` CLI and gateway) is retired so the
+gateway can be switched off. `lib/copilot.js` never spawns `openclaw`:
 
-### How compaction is invoked (and how it broke silently)
+- Suggestion generation runs only when `SUPPORT_COPILOT_SUGGESTIONS_ENABLED=true`.
+  Any other value, including unset, is off (fail closed).
+- Even when enabled, the `agent` backend is refused. Only the stateless
+  backends (`SUGGESTION_BACKEND=claude-cli` or `openrouter`) generate text.
+- Session injection, session compaction, learned-rule extraction and edit
+  analysis ran through the agent and are now skipped.
 
-`lib/session-compact.js` shells out to:
-
-```
-openclaw sessions compact "agent:<agentId>:explicit:<sessionId>" \
-  --agent <agentId> --json --timeout <ms> [--max-lines <n>]
-```
-
-Three things are load-bearing:
-
-- **The key must be `:explicit:`.** `agent:<id>:main` also resolves but points
-  at whichever session was last made "main" — compacting that truncates an
-  unrelated conversation.
-- **`--json` output is authoritative, not the exit code.** A gateway timeout
-  comes back as `{"ok": false, "error": "gateway timeout after 10000ms"}`
-  without a non-zero exit, so a success check on the exit code alone reports a
-  phantom success.
-- **Oversized sessions use `--max-lines`.** LLM summarization has to load the
-  whole transcript, which is exactly what an overgrown session cannot do — the
-  39 MB one could not be summarized even with a 4-minute deadline. Truncation
-  is the only path that still works past that point, so a session over
-  `SESSION_RECOMPACT_BYTES` skips straight to it.
-
-The previous code sent `/compact` as an agent message. That worked until
-OpenClaw 2026.7.1-2 landed: last success 2026-08-14 23:12:22, gateway restarted
-onto the new version at 23:58:07, first rejection 2026-08-15 00:20:27. Every
-compaction failed for the next four days (102 rejections, zero successes) and
-**nobody noticed**, because the failure was caught as "non-critical" and
-`compacted_at` was stamped anyway — the DB recorded 212 compactions that never
-happened, and the stamp then suppressed every retry.
-
-`compacted_at` is now only written when compaction actually succeeded; a failed
-attempt leaves the session eligible for the next auto-close. If sessions start
-growing again, check for `⚠️ Session compaction failed` in
-`logs/support-copilot-error.log` — that line is now the honest signal.
-
-Tunable via `SUPPORT_COMPACT_MAX_LINES` (default 300) and
-`SUPPORT_COMPACT_TIMEOUT_MS` (default 180000).
+Every skip writes one line to the pm2 log:
+`[copilot-skip] action=<action> reason=<suggestions_disabled|agent_backend_retired|openclaw_agent_retired>`.
+`POST /conversations/:id/suggest` answers `{ suggestion: null, skipped: <reason> }`
+and stores no suggestion row. Message ingestion, storage, operator sends, the
+gateway group handoff and the Contador flows do not go through this gate.
+The copilot is expected to be rebuilt on Hermes later.
 
 ## Database
 

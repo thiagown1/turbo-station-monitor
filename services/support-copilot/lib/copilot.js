@@ -1,8 +1,11 @@
 /**
  * Copilot LLM Client — Support Copilot
  *
- * Generates AI-powered reply suggestions by delegating to brand-specific
- * OpenClaw agents. Each brand_id maps to an isolated agent workspace
+ * Builds reply-suggestion prompts and sends them to a stateless backend
+ * (claude-cli / openrouter). The OpenClaw agent CLI/gateway path is RETIRED:
+ * nothing here spawns `openclaw`, and suggestion generation itself is off
+ * unless SUPPORT_COPILOT_SUGGESTIONS_ENABLED=true (see lib/suggestion-gate.js).
+ * Historically each brand mapped to an OpenClaw agent workspace Each brand_id maps to an isolated agent workspace
  * (e.g. <brand_id> → support_<brand_id>) for data isolation.
  * Each WhatsApp conversation maps to a unique agent session, so the
  * agent sees the full chat history and learns from human corrections.
@@ -10,18 +13,21 @@
  * @module lib/copilot
  */
 
-const { execFile } = require('child_process');
 const { resolveSuggestionBackend, callSuggestionBackend, isStateless } = require('./suggestion-backends');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { LOG_TAG, MEDIA_DIR } = require('./constants');
-const { compactSessionWithFallback } = require('./session-compact');
+const {
+  OPENCLAW_AGENT_RETIRED,
+  suggestionsEnabled,
+  suggestionDecision,
+  skippedSuggestion,
+  logSkip,
+} = require('./suggestion-gate');
 const {
   readSessionTail,
   rewriteSessionTailWithout,
-  sessionFileSize,
-  needsRecompaction,
 } = require('./session-file');
 const { db, stmts, nowIso } = require('./db');
 const { enrichContext } = require('./context-enrichment');
@@ -35,8 +41,6 @@ function capBody(body) {
   return body.length > MAX_MSG_BODY ? body.substring(0, MAX_MSG_BODY) + '... [truncado]' : body;
 }
 
-const OPENCLAW_BIN = process.env.OPENCLAW_BIN || '/home/openclaw/.npm-global/bin/openclaw';
-const OPENCLAW_SRC_ROOT = process.env.OPENCLAW_SRC_ROOT || '/home/openclaw/openclaw';
 /**
  * Map brand_id → openclaw agent id.
  * Each brand gets an isolated agent workspace with its own knowledge
@@ -606,137 +610,14 @@ function deleteTestSessions(agentId) {
 }
 
 /**
- * Call the OpenClaw agent to generate a reply suggestion.
- *
- * Uses the CLI for text-only turns and the Gateway API for multimodal turns
- * so inbound images can be passed as native attachments (`attachments[]`).
+ * The OpenClaw agent (CLI + gateway) is retired. Kept as the single choke point
+ * for the callers that still expect an agent: it never spawns a process and
+ * always rejects with OPENCLAW_AGENT_RETIRED, so a stray caller fails closed.
  */
-function callOpenClawAgent(sessionId, message, agentId, options = {}) {
-  const resolvedAgent = agentId || DEFAULT_AGENT;
-  const attachments = Array.isArray(options.attachments) ? options.attachments : [];
-
-  // Ensure this conversation has its own session file in the agent
-  ensureAgentSession(sessionId, agentId);
-
-  return new Promise((resolve, reject) => {
-    console.log(`${LOG_TAG} Calling openclaw agent=${resolvedAgent} (session: ${sessionId}) attachments=${attachments.length}`);
-    console.log(`${LOG_TAG} Prompt:\n${message.slice(0, 2000)}`);
-
-    if (attachments.length > 0) {
-      const payload = {
-        message,
-        agentId: resolvedAgent,
-        sessionId,
-        idempotencyKey: `support-copilot-${sessionId}-${Date.now()}`,
-        attachments,
-        timeout: 120,
-      };
-
-      const gatewayScript = `
-        const payload = JSON.parse(process.env.OPENCLAW_AGENT_PAYLOAD || '{}');
-        const { callGateway } = await import('file://${OPENCLAW_SRC_ROOT}/src/gateway/call.ts');
-        const response = await callGateway({
-          method: 'agent',
-          params: payload,
-          expectFinal: true,
-          timeoutMs: 150000,
-        });
-        process.stdout.write(JSON.stringify(response));
-      `;
-
-      // Read gateway token from openclaw.json if OPENCLAW_GATEWAY_URL is overridden
-      let gatewayToken = process.env.OPENCLAW_GATEWAY_TOKEN || '';
-      if (!gatewayToken) {
-        try {
-          const configPath = path.join(process.env.HOME || '/home/openclaw', '.openclaw', 'openclaw.json');
-          const cfg = JSON.parse(fs.readFileSync(configPath, 'utf8'));
-          gatewayToken = cfg?.gateway?.auth?.token || '';
-        } catch {}
-      }
-
-      execFile(process.execPath, ['--import', 'tsx', '--eval', gatewayScript], {
-        cwd: OPENCLAW_SRC_ROOT,
-        timeout: 150_000,
-        maxBuffer: 5 * 1024 * 1024,
-        env: {
-          ...process.env,
-          NO_COLOR: '1',
-          OPENCLAW_AGENT_PAYLOAD: JSON.stringify(payload),
-          ...(gatewayToken ? { OPENCLAW_GATEWAY_TOKEN: gatewayToken } : {}),
-        },
-      }, (error, stdout, stderr) => {
-        if (error) {
-          console.warn(`${LOG_TAG} Multimodal gateway failed, retrying text-only: ${error.message}`);
-          // Fallback: retry without attachments, add image description to prompt
-          const imgNote = `\n[${attachments.length} imagem(ns) foram enviadas na conversa mas não puderam ser analisadas visualmente]`;
-          return callOpenClawAgent(sessionId, message + imgNote, agentId, { ...options, attachments: [] })
-            .then(resolve)
-            .catch(reject);
-        }
-
-        try {
-          resolve(JSON.parse(stdout));
-        } catch {
-          console.warn(`${LOG_TAG} Could not parse multimodal agent JSON, using raw output`);
-          resolve({ text: stdout.trim() });
-        }
-      });
-      return;
-    }
-
-    const args = [
-      'agent',
-      '--agent', resolvedAgent,
-      '--session-id', sessionId,
-      '--message', message,
-      '--json',
-    ];
-
-    console.log(`${LOG_TAG} execFile: ${OPENCLAW_BIN} ${args.join(' ').slice(0, 200)}`);
-    execFile(OPENCLAW_BIN, args, {
-      timeout: 120_000,
-      maxBuffer: 5 * 1024 * 1024, // 5MB — extended thinking responses can be large
-      env: { ...process.env, NO_COLOR: '1', OPENCLAW_GATEWAY_URL: '' },
-    }, (error, stdout, stderr) => {
-      if (error) {
-        console.error(`${LOG_TAG} OpenClaw agent error:`, error.message);
-        if (stderr) console.error(`${LOG_TAG} stderr:`, stderr.slice(0, 500));
-        if (stdout) console.warn(`${LOG_TAG} stdout despite error (${stdout.length} chars):`, stdout.slice(0, 300));
-        return reject(error);
-      }
-
-      // When gateway fails, OpenClaw falls back to embedded mode and may write
-      // the JSON response to stderr instead of stdout. Handle this transparently.
-      let output = stdout;
-      if (!output || output.length === 0) {
-        if (stderr && stderr.length > 0) {
-          // Try to extract JSON from stderr (it may have log lines before the JSON)
-          const jsonStart = stderr.indexOf('{');
-          if (jsonStart >= 0) {
-            const candidate = stderr.slice(jsonStart);
-            try {
-              JSON.parse(candidate);
-              console.log(`${LOG_TAG} stdout empty, recovered ${candidate.length} chars JSON from stderr (gateway fallback)`);
-              output = candidate;
-            } catch {
-              console.warn(`${LOG_TAG} stdout empty, stderr has ${stderr.length} chars but no valid JSON. stderr preview:`, stderr.slice(0, 300));
-            }
-          } else {
-            console.warn(`${LOG_TAG} stdout empty, stderr has ${stderr.length} chars (no JSON). preview:`, stderr.slice(0, 300));
-          }
-        }
-      }
-
-      try {
-        const result = JSON.parse(output);
-        resolve(result);
-      } catch (parseErr) {
-        console.warn(`${LOG_TAG} Could not parse agent JSON (stdout=${stdout.length} stderr=${stderr?.length || 0} chars), using raw output`);
-        if (output.length > 0) console.warn(`${LOG_TAG} Raw output preview:`, output.slice(0, 300));
-        resolve({ text: (output || '').trim() });
-      }
-    });
-  });
+function callOpenClawAgent(sessionId) {
+  const err = new Error(`${OPENCLAW_AGENT_RETIRED}: OpenClaw agent calls are disabled (session ${sessionId})`);
+  err.code = OPENCLAW_AGENT_RETIRED;
+  return Promise.reject(err);
 }
 
 /**
@@ -748,6 +629,11 @@ function callOpenClawAgent(sessionId, message, agentId, options = {}) {
  * @returns {{ text: string, model: string }}
  */
 async function generateSuggestion(conversation, messages, { userData, tags, forceFullPrompt } = {}) {
+  if (!suggestionsEnabled()) {
+    const decision = suggestionDecision(null);
+    logSkip(LOG_TAG, 'generate_suggestion', decision.reason, `conv=${conversation && conversation.id}`);
+    return skippedSuggestion(decision.reason);
+  }
   const sessionId = sessionIdFromConversation(conversation.id);
   const agentId = agentForBrand(conversation.brand_id, conversation.channel);
 
@@ -782,6 +668,11 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
   // Resolve the generation backend (env > per-brand setting > 'agent').
   // Stateless backends (claude-cli/openrouter) have no session memory → full prompt.
   const backend = resolveSuggestionBackend(customSettings && customSettings.suggestion_backend);
+  const decision = suggestionDecision(backend);
+  if (!decision.allowed) {
+    logSkip(LOG_TAG, 'generate_suggestion', decision.reason, `conv=${conversation.id} backend=${backend}`);
+    return skippedSuggestion(decision.reason);
+  }
   const useFullPrompt = forceFullPrompt || isStateless(backend);
 
   // Group -> partner context (Phase 3): when this group is linked to one or
@@ -1063,15 +954,10 @@ async function generateSuggestion(conversation, messages, { userData, tags, forc
  * @param {string} message - The message to inject (prefixed with role context)
  * @param {string} [brandId] - Brand ID to route to the correct agent
  */
-async function injectIntoSession(conversationId, message, brandId) {
-  const sessionId = sessionIdFromConversation(conversationId);
-  const agentId = agentForBrand(brandId);
-  try {
-    await callOpenClawAgent(sessionId, message, agentId);
-    console.log(`${LOG_TAG} Injected message into session ${sessionId} (agent: ${agentId})`);
-  } catch (err) {
-    console.error(`${LOG_TAG} Failed to inject into session ${sessionId}:`, err.message);
-  }
+async function injectIntoSession(conversationId) {
+  // Injection only fed the retired OpenClaw agent session. Stateless backends
+  // read the stored messages instead, so there is nothing to inject.
+  logSkip(LOG_TAG, 'inject_into_session', OPENCLAW_AGENT_RETIRED, `conv=${conversationId}`);
 }
 
 
@@ -1232,131 +1118,16 @@ function buildContextPreview(conversation, messages, { userData, tags } = {}) {
 // ─── Session compaction (on conversation close) ──────────────────────────────
 
 /**
- * Compact the OpenClaw session when a conversation is closed.
- *
- * Sends /compact to the agent session, which triggers OpenClaw's built-in
- * compaction: it summarizes the full conversation history into a compressed
- * summary, freeing context window for future use.
- *
- * Also cleans up the session_context tracking row.
- *
- * This runs async (fire-and-forget) because compaction can take a few seconds
- * and we don't want to block the close API response.
+ * Summarize + compact the OpenClaw agent session when a conversation closes.
+ * Retired with the OpenClaw agent: stateless backends keep no session, so this
+ * only records an auditable skip. Kept because the close routes still call it.
  *
  * @param {string} conversationId
- * @param {string} [brandId] - Brand ID to route to the correct agent
  */
-async function compactSession(conversationId, brandId) {
-  const sessionId = sessionIdFromConversation(conversationId);
-  const agentId = agentForBrand(brandId);
-
-  // Only compact if the copilot was actually used and not already compacted
-  const sessionCtx = stmts.getSessionContext.get(conversationId);
-  if (!sessionCtx || !sessionCtx.full_context_sent) {
-    console.log(`${LOG_TAG} Skipping compact for ${conversationId} — copilot never used`);
-    return;
-  }
-  // "Compacted once, never again" is what let the always-active alert feed grow
-  // to 39MB after its single compaction (issue #48). A conversation that keeps
-  // reopening keeps appending, so an overgrown session is eligible again.
-  const OPENCLAW_HOME = process.env.OPENCLAW_HOME || '/home/openclaw/.openclaw';
-  const sessionFilePath = path.join(OPENCLAW_HOME, 'agents', agentId, 'sessions', `${sessionId}.jsonl`);
-  if (sessionCtx.compacted_at && !needsRecompaction(sessionFilePath)) {
-    console.log(`${LOG_TAG} Skipping compact for ${conversationId} — already compacted at ${sessionCtx.compacted_at}`);
-    return;
-  }
-  if (sessionCtx.compacted_at) {
-    const sizeMB = (sessionFileSize(sessionFilePath) / 1048576).toFixed(1);
-    console.log(
-      `${LOG_TAG} Re-compacting ${conversationId} — session regrew to ${sizeMB}MB since ${sessionCtx.compacted_at}`
-    );
-  }
-
-  console.log(`${LOG_TAG} Compacting session ${sessionId} (agent: ${agentId})`);
-
-  let summaryText = null;
-  let compacted = false;
-
-  try {
-    // Pre-compact: instruct agent to summarize the conversation
-    const preCompactMsg = [
-      `[ENCERRAMENTO DE ATENDIMENTO]`,
-      `Este atendimento está sendo encerrado. Antes da compactação, gere um RESUMO do atendimento incluindo:`,
-      `1. Nome e telefone do cliente`,
-      `2. Problema(s) relatado(s) e resolução aplicada`,
-      `3. Preferências ou informações importantes do cliente descobertas`,
-      `4. Se ficou algo pendente ou não resolvido`,
-      `Responda APENAS com o resumo, em formato de notas. Não gere sugestão.`,
-    ].join('\n');
-
-    const preCompactResult = await callOpenClawAgent(sessionId, preCompactMsg, agentId);
-    console.log(`${LOG_TAG} Pre-compact memory flush sent for ${sessionId}`);
-
-    // Extract the summary from the agent response
-    const inner = preCompactResult?.result || preCompactResult;
-    summaryText =
-      (inner.payloads && inner.payloads.length > 0 && inner.payloads[0].text) ||
-      inner.reply || inner.text || inner.message || inner.output || inner.content ||
-      (typeof inner === 'string' ? inner : null);
-
-    if (summaryText) {
-      summaryText = summaryText.replace(/\[\[reply_to_\w+\]\]\s*/g, '').trim();
-      console.log(`${LOG_TAG} Compaction summary captured (${summaryText.length} chars): ${summaryText.substring(0, 120)}...`);
-    }
-
-    // Now trigger compaction. NOT via `--message /compact`: OpenClaw 2026.7.1-2
-    // rejects slash commands on that path ("Use: openclaw sessions compact
-    // <key>"), which silently broke every compaction for four days because the
-    // failure is swallowed here and compacted_at is stamped anyway (issue #48).
-    // An oversized session cannot be summarized at all, so that falls back to
-    // truncation — see lib/session-compact.js.
-    const oversized = needsRecompaction(sessionFilePath);
-    const result = await compactSessionWithFallback(sessionId, agentId, { forceTruncate: oversized });
-    compacted = result.ok;
-    if (result.ok) {
-      console.log(`${LOG_TAG} ✅ Session ${sessionId} compacted successfully (${result.mode})`);
-    } else {
-      console.warn(`${LOG_TAG} ⚠️ Session compaction failed for ${sessionId} (${result.mode}): ${result.error}`);
-    }
-  } catch (err) {
-    // Compaction failure is non-critical — log and continue
-    console.warn(`${LOG_TAG} ⚠️ Session compaction failed for ${sessionId}:`, err.message);
-  }
-
-  // Store the summary regardless — it is useful on its own — but only stamp
-  // compacted_at when compaction actually happened. Stamping unconditionally is
-  // what hid the four-day outage: the DB claimed 212 compactions while the CLI
-  // was rejecting every one of them, and the stamp then suppressed all retries.
-  try {
-    if (compacted) {
-      db.prepare('UPDATE session_context SET compacted_at = ?, compaction_summary = ? WHERE conversation_id = ?')
-        .run(nowIso(), summaryText || null, conversationId);
-      console.log(`${LOG_TAG} Session marked as compacted: ${conversationId}`);
-    } else {
-      db.prepare('UPDATE session_context SET compaction_summary = ? WHERE conversation_id = ?')
-        .run(summaryText || null, conversationId);
-      console.warn(
-        `${LOG_TAG} NOT marking ${conversationId} as compacted — compaction did not succeed; ` +
-        'it stays eligible for the next auto-close'
-      );
-    }
-  } catch (err) {
-    console.warn(`${LOG_TAG} Failed to record compaction state:`, err.message);
-  }
+async function compactSession(conversationId) {
+  logSkip(LOG_TAG, 'compact_session', OPENCLAW_AGENT_RETIRED, `conv=${conversationId}`);
 }
 
-/**
- * Extract a learned rule from an operator's edit to a suggestion.
- * Uses the LLM to analyze the difference in the context of the conversation.
- * Runs asynchronously — does not block the operator.
- *
- * @param {string} brandId
- * @param {string} suggestionId
- * @param {string} original - The copilot's original suggestion
- * @param {string} edited - What the operator changed it to
- * @param {string} [conversationId] - Conversation ID for context
- */
-/** Learned-rule scope from a conversation channel: 'group' vs 'direct'. */
 function scopeForChannel(channel) {
   return channel === 'whatsapp-group' ? 'group' : 'direct';
 }
@@ -1370,6 +1141,9 @@ function scopeForConversationId(conversationId) {
 
 async function extractLearnedRule(brandId, suggestionId, original, edited, conversationId) {
   if (!original || !edited || original.trim() === edited.trim()) return;
+  // Rule extraction ran through the retired OpenClaw agent.
+  logSkip(LOG_TAG, 'extract_learned_rule', OPENCLAW_AGENT_RETIRED, `suggestion=${suggestionId}`);
+  return;
 
   const agentId = agentForBrand(brandId);
   const ruleSessionId = `rule_extraction_${brandId}_${Date.now()}`;
@@ -1463,6 +1237,9 @@ async function analyzeEdit(brandId, original, edited, conversationId) {
   if (!original || !edited || original.trim() === edited.trim()) {
     return { rule: null, error: 'Texts are identical' };
   }
+  // Edit analysis ran through the retired OpenClaw agent.
+  logSkip(LOG_TAG, 'analyze_edit', OPENCLAW_AGENT_RETIRED, `brand=${brandId}`);
+  return { rule: null, error: OPENCLAW_AGENT_RETIRED, skipped: OPENCLAW_AGENT_RETIRED };
 
   const agentId = agentForBrand(brandId);
   const ruleSessionId = `analyze_edit_${brandId}_${Date.now()}`;
