@@ -1,5 +1,10 @@
 # Auto-Recovery: Limpeza Automática de Flags de Restart
 
+> **Histórico.** O processo `ocpp-alerts` (`services/alert-processor.js`) e a fila
+> `history/pending_alerts.json` foram aposentados em 25/09/2026. Alertas de
+> carregador no WhatsApp saem pelo `alert-engine` ([ALERT_ENGINE.md](ALERT_ENGINE.md)).
+> Os comandos `pm2 restart ocpp-alerts` abaixo não se aplicam mais.
+
 ## Problema
 
 Sistema alertava sobre problemas **já resolvidos**:

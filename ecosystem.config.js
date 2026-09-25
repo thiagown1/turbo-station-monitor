@@ -61,23 +61,6 @@ module.exports = {
       env: { ...dotenv }
     },
     {
-      name: 'ocpp-alerts',
-      script: './services/alert-processor.js',
-      cwd: CWD,
-      instances: 1,
-      autorestart: true,
-      max_restarts: 3,
-      min_uptime: '30s',
-      restart_delay: 5000,
-      watch: false,
-      max_memory_restart: '100M',
-      error_file: './logs/processor-error.log',
-      out_file: './logs/processor-out.log',
-      log_date_format: 'YYYY-MM-DD HH:mm:ss',
-      merge_logs: true,
-      env: { ...dotenv }
-    },
-    {
       name: 'vercel-drain',
       script: './services/vercel-drain.js',
       cwd: CWD,

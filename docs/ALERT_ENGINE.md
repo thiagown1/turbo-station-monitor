@@ -243,13 +243,16 @@ The Alert Engine **does NOT duplicate OCPP alerts**. It focuses exclusively on:
 1. **Vercel-specific issues** (5xx, timeouts, latency)
 2. **Cross-system correlations** (OCPP + Vercel)
 
-The existing `alert-processor.js` continues to handle:
-- Charger faults
-- Transaction failures
-- Auth rejections
-- Charger recovery notifications
+The legacy `ocpp-alerts` process (`alert-processor.js`) and its
+`history/pending_alerts.json` queue were retired on 2026-09-25: it had
+delivered no WhatsApp message since the OpenClaw CLI send path was removed, and
+since PR #75 it exited at boot because `OCPP_ALERTS_ENABLED` was unset.
+`smart-collector.js` still logs alert candidates but no longer queues them.
 
-Both systems write to the same WhatsApp group but monitor different problem domains.
+Operator cleanup on the server (manual, optional): `pm2 delete ocpp-alerts`
+followed by `pm2 save`, and the leftover `history/pending_alerts.json`,
+`history/sent_alerts.json`, `history/manual_pending_cache.json` and
+`history/expired_alerts.jsonl` can be deleted by hand.
 
 ## Future Enhancements
 

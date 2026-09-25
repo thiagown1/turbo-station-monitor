@@ -22,9 +22,6 @@ Runs on a VPS as a set of PM2-managed Node.js services that collect, store, and 
 │  │ :3002            │  │ :3004            │  │ (daemon)         │ │
 │  └─────────────────┘  └─────────────────┘  └──────────────────┘ │
 │                                                                  │
-│  ┌─────────────────┐                                             │
-│  │ ocpp-alerts      │  ← durable OCPP queue → support/WhatsApp  │
-│  └─────────────────┘                                             │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -33,7 +30,6 @@ Runs on a VPS as a set of PM2-managed Node.js services that collect, store, and 
 | Service | Port | Script | Description |
 |---|---|---|---|
 | `ocpp-collector` | — | `smart-collector.js` | WebSocket + REST poller for OCPP charger logs → `db/ocpp.db` |
-| `ocpp-alerts` | — | `alert-processor.js` | Delivers queued OCPP fault/recovery alerts after support/WhatsApp ACK; disabled by default |
 | `vercel-drain` | 3001 | `vercel-drain.js` | Vercel log drain webhook → `db/vercel.db` |
 | `github-webhook` | 3002 | `github-webhook.js` | GitHub CI/review webhook and evidence capture |
 | `mobile-telemetry` | 3003 | `mobile-telemetry.js` | Mobile app telemetry ingress → `db/mobile.db` |
