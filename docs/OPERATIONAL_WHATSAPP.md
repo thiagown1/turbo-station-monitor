@@ -40,9 +40,11 @@ disabled during retirement.
 deploy-health-check Telegram, vercel-deploy-hook Telegram and LLM checklist,
 the unscheduled `scripts/monitor.js`/`analyze.js`/`hourly-report.js`, and every
 support-copilot agent call (see its README, "Suggestion generation"), and the
-`ocpp-alerts` process itself (deleted 2026-09-25, see ALERT_ENGINE.md). Still on
-the gateway: the Contador primary model,
-`ai-openclaw-agent`, `sweep-orchestrator` and `budget-guardian`.
+`ocpp-alerts` process itself (deleted 2026-09-25, see ALERT_ENGINE.md). The
+OpenClaw gateway was switched off on 2026-09-25 and `ai-openclaw-agent` was
+removed; the Contador moved to Hermes. The unscheduled `sweep-orchestrator` and
+`budget-guardian` still reference the CLI and must not be started while the
+gateway stays off.
 
 ## Group handoff at the gateway
 

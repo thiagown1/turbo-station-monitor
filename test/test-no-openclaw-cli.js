@@ -103,8 +103,6 @@ const ALLOWED = new Set([
   'services/budget-guardian.js', // gateway admin tooling (`openclaw gateway restart`)
   'services/support-copilot/lib/contador-runtime.js', // Contador primary model
   'services/support-copilot/lib/contador-model-runner.js',
-  'services/ai-subscription-gateway/index.js', // ai-openclaw-agent (pm2)
-  'services/ai-subscription-gateway/openclaw-gateway-runner.mjs',
 ]);
 const EXCLUDED_DIRS = new Set(['node_modules', '__tests__', 'test', 'tests', '.git', 'docs']);
 const CLI_PATTERNS = [
