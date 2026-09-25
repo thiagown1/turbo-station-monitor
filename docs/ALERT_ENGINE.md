@@ -102,10 +102,9 @@ fires async and the message's `delivery_status` can still flip to `failed`
    alerts younger than 30 min (max 5 delivery attempts per tick). Status-only
    checks do not consume that delivery limit, so old `pending` rows cannot
    block newer actionable alerts. Stored WhatsApp ids are checked with one
-   batched conversation read per tick, and an uncertain WhatsApp delivery does
-   not suppress an independently configured Telegram retry. Each channel has
-   its own five-attempt budget, so Telegram exhaustion cannot block an
-   actionable WhatsApp retry (or vice versa). Alerts without a message id
+   batched conversation read per tick. WhatsApp is the only channel: the
+   Telegram path (`openclaw message send`) was retired and
+   `ALERT_TELEGRAM_GROUP` is ignored with a startup warning. Alerts without a message id
    may be POSTed again, and an explicit terminal `failed` status permits one
    replacement POST. A recorded message that is still `pending`, missing from
    the lookup, or temporarily unreadable is only checked again — it is never

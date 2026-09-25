@@ -63,6 +63,13 @@ test('noReply response carries a human-readable closed message', () => {
   assert.match(outcome.response.message, /encerrada/i);
 });
 
+test('a skipped suggestion (generation disabled) is never persisted', () => {
+  const out = formatSuggestOutcome({ text: null, model: 'skipped', skipped: 'suggestions_disabled' });
+  assert.equal(out.shouldPersist, false);
+  assert.equal(out.response.skipped, 'suggestions_disabled');
+  assert.equal(out.response.suggestion, null);
+});
+
 test('waiting takes precedence if a result somehow sets both flags', () => {
   const outcome = formatSuggestOutcome({ text: null, waiting: true, noReply: true });
   assert.equal(outcome.response.model, 'waiting');

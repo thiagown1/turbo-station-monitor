@@ -3,7 +3,9 @@
  * Alert Engine - Phase 4
  * 
  * Monitors logs.db for Vercel issues and OCPP+Vercel correlations.
- * Generates alerts and sends them via Telegram (temporary) / WhatsApp (legacy).
+ * Generates alerts and sends them to the WhatsApp alerts group through the
+ * support-copilot relay. The Telegram path (via the `openclaw` CLI) was retired
+ * so the OpenClaw gateway can be switched off; nothing here spawns a process.
  * 
  * Runs every 1-2 minutes via PM2.
  */
@@ -11,7 +13,6 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
-const { exec } = require('child_process');
 const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
 const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
@@ -25,12 +26,12 @@ const MOBILE_DB_PATH = path.join(DB_DIR, 'mobile.db');
 
 // Alert state is persisted in a small local DB (legacy: logs.db only stores alerts now)
 const ALERTS_DB_PATH = path.join(DB_DIR, 'logs.db');
-// Temporary: send alerts to Telegram while we polish alert quality
-// Disabled by default (Thiago request 2026-02-26). To enable:
-//   export ALERT_TELEGRAM_GROUP='telegram:-5102620169'
-const TELEGRAM_GROUP = process.env.ALERT_TELEGRAM_GROUP || null;
-// WhatsApp alerts via the support-copilot → Evolution transport (the openclaw
-// WhatsApp-Web gateway is NOT linked, so `openclaw message send` fails). This is
+// Telegram (`openclaw message send`) was retired 2026-09: ALERT_TELEGRAM_GROUP
+// is ignored and only logged at startup so a stale .env stays visible.
+if (process.env.ALERT_TELEGRAM_GROUP) {
+    console.warn('⚠️ ALERT_TELEGRAM_GROUP is set but Telegram alerts were retired; ignoring it (WhatsApp only).');
+}
+// WhatsApp alerts via the support-copilot → Evolution transport. This is
 // the same path the Next whatsapp-notifier and the manual tests use, confirmed
 // delivering to the "Notificações Turbo Station" group. Set ALERT_WHATSAPP_CONV=''
 // to disable WhatsApp dispatch.
@@ -1368,29 +1369,6 @@ class AlertEngine {
     }
 
     /**
-     * Send alert to Telegram group (temporary until alerts are polished)
-     */
-    async sendTelegramAlert(message) {
-        // Soft-disable: if no group is configured, do nothing.
-        if (!TELEGRAM_GROUP) return false;
-
-        return new Promise((resolve, reject) => {
-            const escapedMsg = message.replace(/'/g, "'\\''");
-            const cmd = `openclaw message send --channel telegram --target '${TELEGRAM_GROUP}' --message '${escapedMsg}'`;
-
-            exec(cmd, (error) => {
-                if (error) {
-                    console.error(`❌ Error sending Telegram: ${error.message}`);
-                    reject(error);
-                    return;
-                }
-                console.log('✅ Alert sent to Telegram');
-                resolve(true);
-            });
-        });
-    }
-
-    /**
      * Send alert to the WhatsApp alerts group ("Notificações Turbo Station").
      * A 2xx from the support API only means the message was QUEUED — so after
      * the POST we confirm the message's delivery_status and only report
@@ -1400,7 +1378,7 @@ class AlertEngine {
      */
     async sendWhatsappAlert(message, conversationId = WHATSAPP_CONV) {
         if (!conversationId || !SUPPORT_API_SECRET) return { delivered: false, messageId: null };
-        // formatAlertMessage emits literal "\n" (for the Telegram CLI); convert to
+        // formatAlertMessage emits literal "\n" (legacy CLI format); convert to
         // real newlines for the JSON/Evolution path.
         const text = message.replace(/\\n/g, '\n');
         try {
@@ -1496,19 +1474,15 @@ class AlertEngine {
      * accepted, so an unconfirmed send can be late-confirmed before any retry.
      */
     async dispatchAlert(message, options = {}) {
-        const telegramEnabled = options.telegramEnabled ?? true;
         const whatsappEnabled = options.whatsappEnabled ?? true;
-        const [telegram, whatsapp] = await Promise.allSettled([
-            telegramEnabled ? this.sendTelegramAlert(message) : Promise.resolve(false),
-            whatsappEnabled
-                ? this.sendWhatsappAlert(message)
-                : Promise.resolve({ delivered: false, messageId: null }),
-        ]);
-        const telegramOk = telegram.status === 'fulfilled' && telegram.value === true;
-        const wa = whatsapp.status === 'fulfilled' && whatsapp.value
-            ? whatsapp.value
-            : { delivered: false, messageId: null };
-        return { sent: telegramOk || wa.delivered === true, waMessageId: wa.messageId || null };
+        if (!whatsappEnabled) return { sent: false, waMessageId: null };
+        let wa = { delivered: false, messageId: null };
+        try {
+            wa = (await this.sendWhatsappAlert(message)) || wa;
+        } catch (e) {
+            console.error('❌ WhatsApp alert dispatch threw:', e.message);
+        }
+        return { sent: wa.delivered === true, waMessageId: wa.messageId || null };
     }
 
     /**
@@ -1590,58 +1564,6 @@ class AlertEngine {
     }
 
     /**
-     * Send the last 5 recent alerts (fresh only) to the alerts group.
-     * This is intended to repopulate context after restarts.
-     */
-    async sendRecentAlertsOnStartup() {
-        try {
-            const now = Date.now();
-            const cutoff = now - MAX_ALERT_AGE_MS;
-
-            const rows = this.alertsDb
-                .prepare(
-                    `SELECT id, created_at, charger_id, severity, title, description, ocpp_log_ids, vercel_log_ids, evidence_json
-                     FROM alerts
-                     WHERE created_at >= ?
-                       AND (sent = 0 OR sent IS NULL)
-                     ORDER BY created_at DESC
-                     LIMIT 5`
-                )
-                .all(cutoff);
-
-            if (!rows.length) return;
-
-            // Send oldest -> newest to read naturally
-            for (const row of rows.slice().reverse()) {
-                const alert = {
-                    type: 'db_recent',
-                    // Use created_at as the event time for these replays
-                    event_ts: row.created_at,
-                    timestamp: row.created_at,
-                    charger_id: row.charger_id,
-                    severity: row.severity,
-                    title: row.title,
-                    description: row.description,
-                    ocpp_log_ids: row.ocpp_log_ids,
-                    vercel_log_ids: row.vercel_log_ids,
-                    evidence_json: row.evidence_json,
-                };
-
-                const msg = this.formatAlertMessage(alert);
-                const sent = await this.sendTelegramAlert(msg);
-                if (sent) {
-                    this.markAlertSent(row.id);
-                }
-
-                // small spacing
-                await new Promise((r) => setTimeout(r, 500));
-            }
-        } catch (e) {
-            console.error('⚠️ Error in sendRecentAlertsOnStartup:', e.message);
-        }
-    }
-
-    /**
      * Record the upstream WhatsApp message id for an alert whose POST was
      * accepted, so a later retry can late-confirm instead of re-sending.
      */
@@ -1666,10 +1588,9 @@ class AlertEngine {
      * UNSENT_RETRY_WINDOW_MS are retried; anything older stays unsent by
      * design (stale alerts are noise).
      */
-    async retryUnsentAlerts(options = {}) {
+    async retryUnsentAlerts() {
         const whatsappConfigured = Boolean(WHATSAPP_CONV && SUPPORT_API_SECRET);
-        const telegramConfigured = options.telegramConfigured ?? Boolean(TELEGRAM_GROUP);
-        if (!telegramConfigured && !whatsappConfigured) return;
+        if (!whatsappConfigured) return;
 
         let rows;
         try {
@@ -1693,7 +1614,6 @@ class AlertEngine {
             ? await this.fetchWhatsappDeliveryStatuses(WHATSAPP_CONV, rows.map((row) => row.wa_message_id))
             : new Map();
         let whatsappAttempts = 0;
-        let telegramAttempts = 0;
         for (const row of rows) {
             try {
                 // The previous POST may have been accepted and delivered after the
@@ -1717,25 +1637,12 @@ class AlertEngine {
                             `⏳ Alert ${row.id} delivery still unconfirmed ` +
                             `(status=${status || 'unavailable'}, msg=${row.wa_message_id}); not re-sending`
                         );
-                        if (!telegramConfigured) continue;
-                        if (telegramAttempts >= UNSENT_RETRY_SEND_LIMIT) continue;
-                        const telegramMessage = this.formatAlertMessage({
-                            type: 'db_recent', event_ts: row.created_at, timestamp: row.created_at,
-                            charger_id: row.charger_id, severity: row.severity, title: row.title,
-                            description: row.description, ocpp_log_ids: row.ocpp_log_ids,
-                            vercel_log_ids: row.vercel_log_ids, evidence_json: row.evidence_json,
-                        });
-                        telegramAttempts += 1;
-                        const telegramSent = await this.sendTelegramAlert(telegramMessage);
-                        if (telegramSent) this.markAlertSent(row.id);
-                        await new Promise((r) => setTimeout(r, 2000));
                         continue;
                     }
                 }
 
                 const whatsappEnabled = whatsappConfigured && whatsappAttempts < UNSENT_RETRY_SEND_LIMIT;
-                const telegramEnabled = telegramConfigured && telegramAttempts < UNSENT_RETRY_SEND_LIMIT;
-                if (!whatsappEnabled && !telegramEnabled) continue;
+                if (!whatsappEnabled) continue;
 
                 const message = this.formatAlertMessage({
                     type: 'db_recent',
@@ -1750,10 +1657,8 @@ class AlertEngine {
                     evidence_json: row.evidence_json,
                 });
                 if (whatsappEnabled) whatsappAttempts += 1;
-                if (telegramEnabled) telegramAttempts += 1;
                 const { sent, waMessageId } = await this.dispatchAlert(message, {
                     whatsappEnabled,
-                    telegramEnabled,
                 });
                 if (waMessageId) this.recordWaMessageId(row.id, waMessageId);
                 if (sent) this.markAlertSent(row.id);
@@ -1874,7 +1779,7 @@ class AlertEngine {
                     continue;
                 }
 
-                // Format and send to every configured channel (Telegram + WhatsApp)
+                // Format and send to the WhatsApp alerts group
                 const message = this.formatAlertMessage(alert);
                 const { sent, waMessageId } = await this.dispatchAlert(message);
                 if (waMessageId) this.recordWaMessageId(alertId, waMessageId);

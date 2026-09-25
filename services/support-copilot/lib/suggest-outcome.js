@@ -15,6 +15,18 @@
  * so the caller should skip the insert when shouldPersist is false.
  */
 function formatSuggestOutcome(result) {
+  if (result.skipped) {
+    return {
+      shouldPersist: false,
+      response: {
+        id: null,
+        suggestion: null,
+        model: 'skipped',
+        skipped: result.skipped,
+        message: 'Sugestões do copilot desativadas',
+      },
+    };
+  }
   if (result.waiting) {
     return {
       shouldPersist: false,

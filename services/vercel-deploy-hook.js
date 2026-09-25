@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * vercel-deploy-hook.js — Vercel native Webhook receiver → WhatsApp + Telegram.
+ * vercel-deploy-hook.js — Vercel native Webhook receiver → WhatsApp.
  *
  * Purpose
  *   The team's recurring pain is unreliable deploy notifications. `deploy-watch`
@@ -9,16 +9,16 @@
  *   `deployment.promoted` / `deployment.error` / `deployment.succeeded` events
  *   INSTANTLY with the sha + deployment id. This standalone service receives
  *   those events and relays a concise message to:
- *     • the team WhatsApp alerts group (via support-copilot relay), and
- *     • Telegram (via the openclaw CLI, same path the auto-rollback-watchdog uses).
+ *     • the team WhatsApp alerts group (via support-copilot relay).
+ *   Telegram and the `openclaw` CLI were retired (2026-09) so the OpenClaw
+ *   gateway can be switched off; this service spawns no openclaw process.
  *
  *   It is NEW coverage for FAILED builds: nothing currently alerts on
  *   `deployment.error`.
  *
  *   On a PRODUCTION promotion it also appends a short "what to test manually"
  *   checklist, derived from the files changed since the last prod deploy we saw
- *   (gh api compare, read-only) and phrased by a fast cloud LLM (openclaw agent)
- *   with a deterministic path→area map as the always-on fallback. Automated tests
+ *   (gh api compare, read-only) and phrased by a deterministic path→area map. Automated tests
  *   don't cover real payments / OCPP charging / push / mobile UI — this nudges a
  *   human to smoke exactly the areas this deploy touched. Toggle: DEPLOY_HOOK_SMOKE=0.
  *
@@ -35,21 +35,20 @@
  *     compare.
  *   - A10 (SSRF): no URL is taken from the request to drive a server-side fetch;
  *     the only outbound calls are to fixed loopback (support-copilot :3005) and
- *     the openclaw CLI. The inspector/alias URL from the payload is only ever
+ *     read-only `gh api`. The inspector/alias URL from the payload is only ever
  *     placed into the human-readable message text, never fetched.
  *   - A09/LGPD: no PII is read or logged. We log only event type, project id,
  *     target, short sha, and a truncated commit message. No request bodies are
  *     persisted. The relay body is a deploy notice (sha + commit subject), not
- *     customer data. The smoke checklist feeds the LLM only changed file PATHS
+ *     customer data. The smoke checklist reads only changed file PATHS
  *     and commit SUBJECTS — never customer data.
  *   - A03/A10 (smoke checklist): the sha from the payload is validated against
  *     /^[0-9a-f]{7,40}$/ before it is interpolated into a fixed `gh api` path on a
- *     hard-coded repo slug; gh is invoked via execFileSync (array args, no shell),
- *     and the LLM via the openclaw CLI the same way. No request value reaches a
+ *     hard-coded repo slug; gh is invoked via execFileSync (array args, no shell). No request value reaches a
  *     shell or an arbitrary URL.
  *   - A04 (cost/DoS): MAX_PAYLOAD_SIZE cap before parse; loopback bind only, so
  *     nginx (with its own client_max_body_size) is the only reachable path.
- *   - Best-effort relays: a WhatsApp/Telegram hiccup never fails the 200 — we
+ *   - Best-effort relays: a WhatsApp hiccup never fails the 200 — we
  *     respond 200 FAST and relay AFTER, so Vercel never retries on our slow/down
  *     downstream.
  *
@@ -96,10 +95,6 @@ const MESSAGE_SOURCE = 'vercel-deploy-hook';
 const DASHBOARD_URL = (process.env.DASHBOARD_URL || 'https://www.turbostation.com.br').replace(/\/+$/, '');
 const ENABLE_WATCH_START = process.env.DEPLOY_HOOK_START_WATCH !== '0';
 
-// Telegram — mirror auto-rollback-watchdog.js sendTelegram (openclaw CLI).
-const DEPLOY_TELEGRAM_GROUP =
-  process.env.DEPLOY_TELEGRAM_GROUP || process.env.ALERT_TELEGRAM_GROUP || 'telegram:-5102620169';
-
 // Safety switches (never spam the group during build/verify).
 const DRY_WHATSAPP = process.env.DRY_WHATSAPP === '1' || process.argv.includes('--dry-whatsapp');
 
@@ -107,14 +102,11 @@ const DRY_WHATSAPP = process.env.DRY_WHATSAPP === '1' || process.argv.includes('
 // On a PRODUCTION promotion we append a short "what to test manually" list,
 // derived from the files changed since the LAST production deploy we saw.
 // Diff comes from `gh api compare` (read-only, GitHub already has the sha — no
-// local checkout / fetch lag). Phrasing optionally goes through a fast cloud LLM
-// (openclaw agent), with a deterministic path→area map as the always-on fallback.
+// local checkout / fetch lag). Phrasing is a deterministic path→area map (the
+// openclaw-agent LLM phrasing was retired with the OpenClaw gateway).
 const REPO_SLUG = process.env.DEPLOY_HOOK_REPO || 'thiagown1/turbo_station';
 const ENABLE_SMOKE = process.env.DEPLOY_HOOK_SMOKE !== '0';
-const ENABLE_SMOKE_LLM = process.env.DEPLOY_HOOK_SMOKE_LLM !== '0';
 const SMOKE_MAX = Number(process.env.DEPLOY_HOOK_SMOKE_MAX || 8);
-const SMOKE_LLM_SESSION = process.env.DEPLOY_HOOK_SMOKE_SESSION || 'vercel-deploy-hook-smoke';
-const SMOKE_LLM_TIMEOUT = Number(process.env.DEPLOY_HOOK_SMOKE_LLM_TIMEOUT || 75); // seconds
 // Pointer to the last production sha we built a checklist for (the diff base).
 const LAST_SHA_FILE = process.env.DEPLOY_HOOK_LAST_SHA_FILE ||
   path.join(__dirname, '..', '.deploy-hook-last-prod-sha');
@@ -323,86 +315,24 @@ function fetchDiff(prevSha, sha) {
   }
 }
 
-// Optional: phrase the checklist with a fast cloud LLM (openclaw agent).
-// Sync execFileSync (relay already runs after the 200, off the response path).
-// Returns string[] or null on any failure → caller falls back to deterministic.
-function llmChecklist(commits, files, areas) {
-  if (!ENABLE_SMOKE_LLM) return null;
-  const env = { ...process.env, PATH: '/home/openclaw/.npm-global/bin:' + (process.env.PATH || '') };
-  delete env.OPENCLAW_GATEWAY_URL; // CLI refuses the override without explicit creds; use its own config
-  const prompt =
-`Você é QA do Turbo Station (app de recarga de carro elétrico). Vai sair um deploy em PRODUÇÃO.
-Com base nos commits e arquivos alterados abaixo, escreva uma checklist CURTA do que vale testar MANUALMENTE para pegar regressão.
-Regras: pt-BR, no máximo ${SMOKE_MAX} itens, 1 linha cada, específico ao que mudou (não genérico). Priorize dinheiro/pagamento, carga (OCPP), auth e fluxos de usuário. Responda SOMENTE as linhas, cada uma começando com "- ".
-
-Commits (${commits.length}):
-${commits.slice(0, 40).map((c) => '- ' + c).join('\n')}
-
-Áreas detectadas: ${areas.map((a) => a.key).join(', ') || 'nenhuma'}
-Arquivos alterados (amostra):
-${files.slice(0, 60).join('\n')}`;
-  try {
-    const out = execFileSync('openclaw', ['agent',
-      '--session-id', SMOKE_LLM_SESSION, '--model', 'claude-cli/claude-opus-4-8',
-      '--json', '--timeout', String(SMOKE_LLM_TIMEOUT), '-m', prompt],
-      { timeout: (SMOKE_LLM_TIMEOUT + 15) * 1000, stdio: ['ignore', 'pipe', 'pipe'], env, maxBuffer: 8 * 1024 * 1024 });
-    const j = JSON.parse(out.toString());
-    const text = j && j.result && j.result.payloads && j.result.payloads[0] && j.result.payloads[0].text;
-    if (!text) return null;
-    const lines = String(text).split('\n')
-      .map((l) => l.trim())
-      .filter((l) => /^[-•*]/.test(l))
-      .map((l) => l.replace(/^[-•*]+\s*/, '').trim())
-      .filter(Boolean);
-    return lines.length ? lines.slice(0, SMOKE_MAX) : null;
-  } catch (e) {
-    log('smoke llm failed:', e.message);
-    return null;
-  }
-}
-
 // Build the "what to test" block appended to a production deploy notice.
 // Returns a string (header + bullets) or null when there's nothing to say.
 async function buildSmokeChecklist(sha) {
   const prevSha = readLastSha();
   const diff = fetchDiff(prevSha, sha);
   // Advance the pointer regardless, so the next deploy diffs from this one even
-  // if this build's diff/LLM hiccuped (avoids an ever-growing range).
+  // if this build's diff hiccuped (avoids an ever-growing range).
   writeLastSha(sha);
   if (!diff || !diff.files.length) {
     log('smoke: no diff files (base=' + (prevSha || 'none') + ') — skipping checklist');
     return null;
   }
   const areas = deriveSmokeAreas(diff.files);
-  let items = llmChecklist(diff.commits, diff.files, areas);
-  const usedLlm = !!(items && items.length);
-  if (!usedLlm) items = deterministicChecklist(areas);
+  const items = deterministicChecklist(areas);
   if (!items.length) return null;
   const baseNote = prevSha ? ` (mudou desde ${String(prevSha).slice(0, 7)})` : '';
-  log(`smoke: ${items.length} item(s), ${areas.length} area(s), source=${usedLlm ? 'llm' : 'map'}`);
+  log(`smoke: ${items.length} item(s), ${areas.length} area(s), source=map`);
   return ['', `🧪 Vale testar manualmente${baseNote}:`, ...items.map((i) => '• ' + i)].join('\n');
-}
-
-// ─── Telegram relay (best-effort, never throws) ──────────────────────
-// The `openclaw` CLI sends via its locally-configured gateway. If
-// OPENCLAW_GATEWAY_URL is present in the env (it is, in the skill .env), the CLI
-// refuses to use it without explicit --token/--password ("gateway url override
-// requires explicit credentials"). We strip that override so the CLI falls back
-// to its own openclaw.json gateway + creds, which is the path that actually
-// delivers. PATH is pinned so the CLI is found under pm2.
-function sendTelegram(msg) {
-  try {
-    const env = { ...process.env, PATH: '/home/openclaw/.npm-global/bin:' + (process.env.PATH || '') };
-    delete env.OPENCLAW_GATEWAY_URL;
-    execFileSync('openclaw', ['message', 'send', '--channel', 'telegram',
-      '--target', DEPLOY_TELEGRAM_GROUP, '--message', msg],
-      { timeout: 15000, stdio: 'pipe', env });
-    log('telegram sent →', DEPLOY_TELEGRAM_GROUP);
-    return true;
-  } catch (e) {
-    log('telegram send failed:', e.message);
-    return false;
-  }
 }
 
 // ─── WhatsApp relay via support-copilot (best-effort, never throws) ──
@@ -621,8 +551,7 @@ function handle(req, res) {
 // ─── Self-test (no WhatsApp group send) ──────────────────────────────
 // Builds a locally-signed sample deployment.promoted payload, runs the full
 // signature→parse→format path, asserts a wrong signature is rejected, and prints
-// the formatted text for both promoted and error. Telegram is OPTIONAL (only
-// when --telegram is passed) so the default self-test sends NOTHING anywhere.
+// the formatted text for both promoted and error. The self-test sends NOTHING anywhere.
 function selftest() {
   const assert = (cond, msg) => { if (!cond) { console.error('SELFTEST FAIL:', msg); process.exit(1); } };
   const secret = WEBHOOK_SECRET || 'selftest-secret';
@@ -691,12 +620,12 @@ function selftest() {
   console.log('  tampered signature → REJECTED ✅');
   console.log('  missing signature  → REJECTED ✅');
   console.log('  other-project event → IGNORED ✅');
-  console.log('\n===== Formatted WhatsApp/Telegram text (deployment.promoted, production) =====');
+  console.log('\n===== Formatted WhatsApp text (deployment.promoted, production) =====');
   console.log(formatMessage(eP));
-  console.log('\n===== Formatted WhatsApp/Telegram text (deployment.error) =====');
+  console.log('\n===== Formatted WhatsApp text (deployment.error) =====');
   console.log(formatMessage(eE));
 
-  // ── Smoke-checklist derivation (offline: no gh / no LLM) ──
+  // ── Smoke-checklist derivation (offline: no gh) ──
   const sampleFiles = [
     'next/app/api/recharge/stop-transaction/route.ts',
     'next/lib/services/coupon.ts',
@@ -729,18 +658,11 @@ function selftest() {
   console.log('  recharge-only → ocpp excluded ✅, injection sha rejected ✅');
 
   console.log('\n(no message was sent to WhatsApp; default self-test sends nothing)');
-
-  if (process.argv.includes('--telegram')) {
-    const line = '🧪 [vercel-deploy-hook] selftest — Telegram path OK (' + new Date().toISOString() + '). Ignore.';
-    console.log('\nSending ONE test line to TELEGRAM only (safe channel)…');
-    const ok = sendTelegram(line);
-    console.log(ok ? 'Telegram test line sent ✅' : 'Telegram test line FAILED ❌');
-  }
   console.log('\nSELFTEST PASSED ✅');
   process.exit(0);
 }
 
-// ─── Smoke preview (live gh + LLM, NO WhatsApp, does NOT touch the pointer) ──
+// ─── Smoke preview (live gh, NO WhatsApp, does NOT touch the pointer) ──
 // Usage: node vercel-deploy-hook.js --smoke-preview --head <sha> [--base <sha>]
 // Exercises the real diff + checklist path for debugging without side effects.
 function smokePreview() {
@@ -762,9 +684,6 @@ function smokePreview() {
   console.log('[smoke-preview] areas:', areas.map((a) => a.key).join(', ') || '(none)');
   console.log('\n----- deterministic checklist -----');
   console.log(deterministicChecklist(areas).map((i) => '• ' + i).join('\n'));
-  console.log('\n----- LLM checklist (live openclaw agent) -----');
-  const llm = llmChecklist(diff.commits, diff.files, areas);
-  console.log(llm ? llm.map((i) => '• ' + i).join('\n') : '(LLM unavailable — would fall back to deterministic)');
   process.exit(0);
 }
 
@@ -784,7 +703,6 @@ if (process.argv.includes('--selftest')) {
     log(`signature verification: ${WEBHOOK_SECRET ? 'ENABLED' : 'DISABLED (fail-closed — all events rejected 503)'}`);
     log(`project filter: ${VERCEL_PROJECT_ID}`);
     log(`whatsapp: ${DRY_WHATSAPP ? 'DRY (logs only)' : 'support-copilot ' + SUPPORT_BASE + ' conv=' + ALERTS_CONVERSATION_ID}`);
-    log(`telegram: ${DEPLOY_TELEGRAM_GROUP}`);
-    log(`smoke checklist: ${ENABLE_SMOKE ? 'ON' : 'OFF'} (prod promotions only; llm=${ENABLE_SMOKE_LLM ? 'on' : 'off'}; repo=${REPO_SLUG}; base-file=${LAST_SHA_FILE})`);
+    log(`smoke checklist: ${ENABLE_SMOKE ? 'ON' : 'OFF'} (prod promotions only; repo=${REPO_SLUG}; base-file=${LAST_SHA_FILE})`);
   });
 }
