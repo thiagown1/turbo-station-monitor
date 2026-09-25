@@ -99,7 +99,6 @@ test('deploy-health-check notice is not counted as sent when skipped or failing'
 // Runtime consumers that still invoke OpenClaw on purpose. Each is reported in
 // the PR/docs; removing one from here must come with its migration.
 const ALLOWED = new Set([
-  'services/alert-processor.js', // ocpp-alerts — moved off the CLI in PR #75
   'services/sweep-orchestrator.js', // white-label sweep loop drives OpenClaw scout/coder agents + cron
   'services/budget-guardian.js', // gateway admin tooling (`openclaw gateway restart`)
   'services/support-copilot/lib/contador-runtime.js', // Contador primary model
