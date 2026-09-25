@@ -1,5 +1,10 @@
 # Heartbeat Timeout com MeterValues - Fix v2
 
+> **Histórico.** O processo `ocpp-alerts` (`services/alert-processor.js`) e a fila
+> `history/pending_alerts.json` foram aposentados em 25/09/2026. Alertas de
+> carregador no WhatsApp saem pelo `alert-engine` ([ALERT_ENGINE.md](ALERT_ENGINE.md)).
+> Os comandos `pm2 restart ocpp-alerts` abaixo não se aplicam mais.
+
 ## Problema Atualizado
 
 Além de não alertar durante transações ativas, também precisamos **verificar se estamos recebendo MeterValues** do carregador.

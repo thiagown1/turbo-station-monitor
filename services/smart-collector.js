@@ -3,7 +3,6 @@ const fs = require('fs');
 const path = require('path');
 const Database = require('better-sqlite3');
 const StateTracker = require('./state-tracker');
-const { enqueueAlert, readAlertQueue } = require('./lib/alert-queue');
 
 // Config
 const WS_URL = 'wss://logs.ocpp.turbostation.com.br/dashboard/ws/logs';
@@ -22,7 +21,6 @@ const OCPP_EVENTS_TTL_DAYS = parseInt(process.env.OCPP_EVENTS_TTL_DAYS || '7', 1
 const OCPP_RAW_TTL_CLEAN_INTERVAL_MS = 10 * 60 * 1000; // every 10 min
 
 const EVENTS_FILE = path.join(__dirname, '..', 'history/events_buffer.json');
-const ALERTS_FILE = path.join(__dirname, '..', 'history/pending_alerts.json');
 
 // NOTE: OCPP now has its own SQLite DB (split from shared logs.db)
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -109,10 +107,6 @@ console.log(`💾 SQLite connected (OCPP): ${DB_PATH}`);
 
 const tracker = new StateTracker();
 let eventBuffer = [];
-// Keep undelivered alerts across collector restarts. The processor and collector
-// serialize changes through alert-queue's lock, so an ACK cannot overwrite an
-// alert appended at the same time.
-let pendingAlerts = readAlertQueue(ALERTS_FILE);
 
 // Track Transaction -1 errors per charger (for smart filtering)
 const transaction1ErrorCount = new Map(); // key: chargerId, value: count
@@ -838,12 +832,11 @@ function updateTrackerState(chargerId, log, analysis) {
     tracker.saveState();
 }
 
+// Alert candidates are only logged. The history/pending_alerts.json queue and its
+// consumer (ocpp-alerts / alert-processor.js) were retired; WhatsApp alerting for
+// charger faults lives in alert-engine.js, which reads the SQLite events directly.
 function queueAlert(alert) {
-    const result = enqueueAlert(ALERTS_FILE, alert);
-    pendingAlerts = result.queue;
-    if (result.added) {
-        console.log(`🔔 Alert queued: ${alert.type} (${alert.chargerId})`);
-    }
+    console.log(`🔔 Alert candidate (not queued): ${alert.type} (${alert.chargerId})`);
 }
 
 function extractChargerId(log) {
@@ -987,7 +980,11 @@ module.exports = {
     extractChargerId,
     isValidChargerId,
     simpleCategoryForDb,
-    hasWsLogs
+    hasWsLogs,
+    // Exposed for tests only.
+    processEntry,
+    tracker,
+    db
 };
 
 if (require.main === module) {

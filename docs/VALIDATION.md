@@ -46,7 +46,7 @@ pm2 list
 
 **Expected:**
 - `ocpp-collector`: online
-- `ocpp-alerts`: online
+- `alert-engine`: online
 - Both with uptime > 0
 
 **Fix if failed:**
@@ -121,7 +121,7 @@ sessions_list({ limit: 5, messageLimit: 3 })
 
 **Check logs:**
 ```bash
-pm2 logs ocpp-alerts --lines 50 | grep -i debounced
+pm2 logs alert-engine --lines 50 | grep -i -E 'debounc|rate'
 ```
 
 **Expected output:**
@@ -213,14 +213,16 @@ Connects ~10 times, disconnects ~9 times in last 20 lines.
 ### No alerts being sent
 
 **Check:**
-1. `pm2 logs ocpp-alerts --lines 50`
-2. `cat history/pending_alerts.json` (should be empty if processed)
-3. `cat history/sent_alerts.json` (should have entries)
+1. `pm2 logs alert-engine --lines 50`
+2. Confirm `ALERT_WHATSAPP_CONV` and `SUPPORT_API_SECRET` are set in `.env`
 
 **Fix:**
 ```bash
-pm2 restart ocpp-alerts
+pm2 restart ecosystem.config.js --only alert-engine --update-env
 ```
+
+The old `ocpp-alerts` queue (`history/pending_alerts.json`) was retired on
+2026-09-25; see [ALERT_ENGINE.md](ALERT_ENGINE.md).
 
 ### Events not collecting
 

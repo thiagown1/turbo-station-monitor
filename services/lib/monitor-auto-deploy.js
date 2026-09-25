@@ -17,7 +17,6 @@ const REPOSITORY = 'thiagown1/turbo-station-monitor';
 const SELF_SERVICE = 'github-webhook';
 const ALL_SERVICES = [
   'ocpp-collector',
-  'ocpp-alerts',
   'vercel-drain',
   'github-webhook',
   'mobile-telemetry',
@@ -31,7 +30,6 @@ const SERVICE_RULES = [
   ['services/support-copilot/', ['support-copilot']],
   ['services/whatsapp-gateway/', ['whatsapp-gateway']],
   ['services/smart-collector.js', ['ocpp-collector']],
-  ['services/alert-processor.js', ['ocpp-alerts']],
   ['services/vercel-drain.js', ['vercel-drain']],
   ['services/github-webhook.js', ['github-webhook']],
   ['services/mobile-telemetry/', ['mobile-telemetry']],

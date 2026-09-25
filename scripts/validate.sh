@@ -8,7 +8,7 @@ echo ""
 # 1. Process Health
 echo "1️⃣ Process Health"
 echo "-------------------"
-pm2 list | grep -E "ocpp-collector|ocpp-alerts"
+pm2 list | grep -E "ocpp-collector|alert-engine"
 echo ""
 
 # 2. Charger Tracking
@@ -50,11 +50,8 @@ echo ""
 # 4. Alert System
 echo "4️⃣ Alert System"
 echo "-------------------"
-PENDING=$(cat history/pending_alerts.json | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-echo "📬 Pending alerts: $PENDING"
-
-SENT_COUNT=$(cat history/sent_alerts.json | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
-echo "✅ Alert cache entries: $SENT_COUNT"
+echo "WhatsApp alerts are sent by alert-engine (the ocpp-alerts queue was retired)."
+echo "Check with: pm2 logs alert-engine --lines 50"
 echo ""
 
 # 5. WebSocket Connection
@@ -75,7 +72,7 @@ echo ""
 # 6. Last Alert Sent
 echo "6️⃣ Last Alert Sent to WhatsApp"
 echo "-------------------"
-echo "Check with: openclaw sessions_list"
+echo "Check with: pm2 logs alert-engine --lines 50 | grep -i whatsapp"
 echo ""
 
 # 7. Recommendations
@@ -85,9 +82,6 @@ if [ $DISCONNECTS -gt 10 ]; then
     echo "❌ Fix WebSocket connection (reconnecting too often)"
 fi
 
-if [ "$PENDING" -gt 0 ]; then
-    echo "⚠️  Process pending alerts: $PENDING waiting"
-fi
 
 python3 << 'EOF'
 import json

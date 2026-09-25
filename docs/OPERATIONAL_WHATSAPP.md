@@ -39,8 +39,9 @@ disabled during retirement.
 `openclaw` outside a short allowlist. Retired: alert-engine Telegram,
 deploy-health-check Telegram, vercel-deploy-hook Telegram and LLM checklist,
 the unscheduled `scripts/monitor.js`/`analyze.js`/`hourly-report.js`, and every
-support-copilot agent call (see its README, "Suggestion generation"). Still on
-the gateway: `ocpp-alerts` (PR #75), the Contador primary model,
+support-copilot agent call (see its README, "Suggestion generation"), and the
+`ocpp-alerts` process itself (deleted 2026-09-25, see ALERT_ENGINE.md). Still on
+the gateway: the Contador primary model,
 `ai-openclaw-agent`, `sweep-orchestrator` and `budget-guardian`.
 
 ## Group handoff at the gateway

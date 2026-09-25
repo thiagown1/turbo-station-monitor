@@ -1,5 +1,10 @@
 # Station Lookup Integration - Before & After
 
+> **Histórico.** O processo `ocpp-alerts` (`services/alert-processor.js`) e a fila
+> `history/pending_alerts.json` foram aposentados em 25/09/2026. Alertas de
+> carregador no WhatsApp saem pelo `alert-engine` ([ALERT_ENGINE.md](ALERT_ENGINE.md)).
+> Os comandos `pm2 restart ocpp-alerts` abaixo não se aplicam mais.
+
 ## Overview
 
 Alertas OCPP agora incluem automaticamente o nome e localização da estação, tornando-os muito mais úteis e acionáveis.
