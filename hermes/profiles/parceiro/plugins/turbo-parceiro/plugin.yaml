@@ -1,0 +1,10 @@
+name: turbo-parceiro
+version: "0.1.0"
+description: Assistente de parceiros da Turbo Station — consulta (só leitura) as estações do parceiro do grupo e a base de conhecimento.
+provides_tools:
+  - parceiro_estacoes
+  - parceiro_status_estacao
+  - parceiro_uso
+  - parceiro_conhecimento
+provides_hooks:
+  - transform_llm_output
