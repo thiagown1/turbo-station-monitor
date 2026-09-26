@@ -1,0 +1,33 @@
+model:
+  provider: openrouter
+  default: deepseek/deepseek-v4-flash
+agent:
+  api_max_retries: 1
+display:
+  busy_input_mode: queue
+  interim_assistant_messages: false
+  tool_progress: 'off'
+  long_running_notifications: false
+  busy_ack_enabled: false
+timezone: America/Sao_Paulo
+tools:
+  tool_search:
+    enabled: 'off'
+session_reset:
+  mode: none
+plugins:
+  enabled:
+    - turbo-parceiro
+  disabled: []
+# Read-only partner tools only: no terminal, files, web, memory, messaging or
+# delegation. The WhatsApp platform stays disabled until it is wired and approved.
+platforms:
+  whatsapp:
+    enabled: false
+platform_toolsets:
+  cli:
+    - turbo_parceiro
+  whatsapp:
+    - turbo_parceiro
+  api_server:
+    - turbo_parceiro

@@ -1,0 +1,23 @@
+name: parceiro
+version: 0.1.0
+description: "Assistente de parceiros da Turbo Station — consultas só leitura das estações do grupo + base de conhecimento"
+hermes_requires: ">=0.20.0"
+author: "Turbo Station"
+env_requires:
+  - name: OPENROUTER_API_KEY
+    description: "Chave OpenRouter do modelo (deepseek/deepseek-v4-flash)"
+    required: true
+  - name: TURBO_PARTNER_AGENT_SECRET
+    description: "Segredo do endpoint /api/agents/partner-tools (PARTNER_AGENT_SECRET no app)"
+    required: true
+  - name: TURBO_PARTNER_TOOLS_BASE_URL
+    description: "Base do app Next"
+    required: false
+    default: "https://www.turbostation.com.br"
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - plugins/
+  - knowledge/
+  - eval/
+  - distribution.yaml

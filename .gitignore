@@ -92,3 +92,6 @@ services/turbo-parking/
 core
 core.*
 *.core
+
+# ─── Python ───
+__pycache__/
