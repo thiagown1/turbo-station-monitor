@@ -53,6 +53,16 @@ class CallPartnerToolTest(unittest.TestCase):
         self.assertEqual(result["error"], "disabled")
         self.assertIn("desligado", result["message"])
 
+    def test_contexto_asks_for_the_partner_context_of_the_group(self):
+        captured = {}
+        original = plugin.call_partner_tool
+        plugin.call_partner_tool = lambda tool, args, **kw: captured.update(tool=tool, args=args) or {"ok": True, "data": {}}
+        try:
+            plugin.contexto({})
+        finally:
+            plugin.call_partner_tool = original
+        self.assertEqual(captured, {"tool": "partner_context", "args": {}})
+
     def test_uso_defaults_to_last_seven_days(self):
         captured = {}
         original = plugin.call_partner_tool
@@ -144,7 +154,7 @@ class RegistrationTest(unittest.TestCase):
         plugin.register(Ctx())
         self.assertEqual(hooks, ["transform_llm_output"])
         names = {tool["name"] for tool in registered}
-        self.assertEqual(names, {"parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_conhecimento"})
+        self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_conhecimento"})
         self.assertTrue(all(tool["toolset"] == "turbo_parceiro" for tool in registered))
         for tool in registered:
             json.dumps(tool["schema"])  # schemas must be serializable
