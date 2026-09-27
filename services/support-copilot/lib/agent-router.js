@@ -604,6 +604,8 @@ function startAgentEventWorker() {
     void require('./station-investigator-runtime').deliverDueStationInvestigations();
     void require('./partner-assistant-runtime').deliverDuePartnerAssistantJobs()
       .catch((error) => console.warn('[partner-assistant] sweep failed:', error.message));
+    void require('./partner-profile-job').maybeRunDailyPartnerProfiles()
+      .catch((error) => console.warn('[partner-profile] daily run failed:', error.message));
     void processFinancialApprovalWork();
   }, 30_000);
   worker.unref?.();

@@ -650,6 +650,28 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} partner assistant migration:`, err.message);
 }
+
+// Daily partner profile job: per-group watermark and one row per Brasília day.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS partner_profile_runs (
+      conversation_id TEXT PRIMARY KEY,
+      last_message_at TEXT,
+      last_run_at TEXT NOT NULL,
+      last_status TEXT NOT NULL,
+      last_error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS partner_profile_daily (
+      run_date TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      summary_json TEXT
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} partner profile migration:`, err.message);
+}
 try {
   const backfilled = db.prepare(`UPDATE station_investigation_jobs
     SET quota_reserved_at = created_at
