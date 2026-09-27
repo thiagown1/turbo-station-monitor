@@ -20,9 +20,15 @@ function checkProductionCheckout(repoDir = PRODUCTION_DIR, runGit = execFileSync
     const paths = dirty.split(/\r?\n/).slice(0, 10).join(', ');
     throw new Error(`production checkout is dirty; move reviewed changes into Git before merging: ${paths}`);
   }
-  run(['fetch', '--quiet', 'origin', 'main']);
+  // Read main from the remote and fetch only its objects. Writing
+  // refs/remotes/origin/main or FETCH_HEAD here races the auto-deploy's own
+  // fetch in this same checkout ("cannot lock ref"), which on 2026-09-27 failed
+  // this required check and left a merged commit undeployed.
+  const mainSha = run(['ls-remote', '--exit-code', 'origin', 'refs/heads/main']).split(/\s+/)[0];
+  if (!/^[0-9a-f]{40,64}$/.test(mainSha)) throw new Error(`could not read origin main: ${mainSha}`);
+  run(['fetch', '--quiet', '--no-write-fetch-head', '--refmap=', 'origin', mainSha]);
   try {
-    run(['merge-base', '--is-ancestor', 'HEAD', 'refs/remotes/origin/main']);
+    run(['merge-base', '--is-ancestor', 'HEAD', mainSha]);
   } catch {
     throw new Error('production HEAD diverges from origin/main; review local commits before merging');
   }
