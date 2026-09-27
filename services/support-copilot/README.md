@@ -85,6 +85,10 @@ underlying WhatsApp library.
 | `SUPPORT_COPILOT_MEDIA_DIR` | Shared inbound-media directory | repository `db/media` by default |
 | `AGENT_EVENT_BASE_URL` | Dashboard base URL that receives agent events | `https://app.example.com` |
 | `AGENT_EVENT_SECRET` | Dedicated shared secret for config/events | random secret |
+| `PARTNER_AGENT_SECRET` | Secret of the app's `/api/agents/partner-memory` (partner assistant) | random secret |
+| `HERMES_BIN` | Hermes CLI used by the partner assistant | `~/.local/bin/hermes` |
+| `PARTNER_PROFILE_JOB_ENABLED` | Daily partner profile job (exactly `true` to run) | `false` |
+| `PARTNER_PROFILE_MODEL` | OpenRouter model of the daily profile | `deepseek/deepseek-v4-flash` |
 | `OPENROUTER_API_KEY` | Vision/classification provider | provider key |
 | `AGENT_VISION_MODEL` | Cheap vision-capable model | `openai/gpt-4o-mini` |
 
@@ -124,6 +128,34 @@ curl -X POST https://logs.turbostation.com.br/api/support/ingest/whatsapp \
 - Auto-creates conversation on first message from a phone number
 - Deduplicates by `external_message_id`
 - Normalizes phone (strips non-digits)
+
+## Partner assistant (Hermes `parceiro`)
+
+A partner who mentions the support number in their group gets an answer from the
+Hermes profile `parceiro` (`hermes/profiles/parceiro`). The Agent Center decides
+which groups are served (`partnerAssistant.allowedConversationIds`), which mention
+JIDs trigger it and whether replies go out directly (`autoSend`, off by default).
+
+- `lib/partner-assistant-runtime.js` claims the message (one durable
+  `partner_assistant_jobs` row per message), builds a prompt with the last 15
+  group messages (24h, phones/CPF/e-mails redacted) and runs
+  `hermes -p parceiro chat -Q --query-file -` with the group's conversation id in
+  `TURBO_PARCEIRO_CONVERSATION_ID`. The app resolves the partner from the group
+  links; the model never chooses the scope.
+- Shadow mode posts the answer to `POST /api/agents/partner-memory`
+  (`propose_reply`): it becomes a review in Agentes e revisões and is sent only
+  after approval. With `autoSend` the answer goes through the gateway and the
+  interaction is recorded.
+- A message the partner assistant owns is never handed to the station
+  investigator, including provider replays. Failures retry up to 3 times through
+  the agent-router worker sweep.
+- **Daily profile** (`lib/partner-profile-job.js`, off unless
+  `PARTNER_PROFILE_JOB_ENABLED=true`): once per Brasília day after 03:00, for
+  every group with a partner link, reads only the messages since the last run,
+  asks `PARTNER_PROFILE_MODEL` to update each linked partner's short profile from
+  its current version (`read_profiles`, so team edits are kept) and writes it with
+  `upsert_profile` (versioned and audited by the app). A failed group keeps its
+  watermark and is retried the next day; output is validated and PII-redacted.
 
 ## PM2
 

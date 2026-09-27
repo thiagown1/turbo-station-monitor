@@ -622,6 +622,56 @@ try {
   console.warn(`${LOG_TAG} station investigator migration:`, err.message);
 }
 safeAddColumn('station_investigation_jobs', 'quota_reserved_at', 'TEXT DEFAULT NULL');
+
+// Partner assistant (Hermes `parceiro`): one durable job per WhatsApp message
+// that mentioned the support number in an allowlisted partner group.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS partner_assistant_jobs (
+      message_id TEXT PRIMARY KEY,
+      conversation_id TEXT NOT NULL,
+      brand_id TEXT NOT NULL,
+      group_jid TEXT NOT NULL,
+      instance TEXT NOT NULL,
+      auto_send INTEGER NOT NULL DEFAULT 0,
+      payload_json TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'claimed',
+      attempts INTEGER NOT NULL DEFAULT 0,
+      next_attempt_at TEXT NOT NULL,
+      last_error TEXT,
+      review_id TEXT,
+      response_external_message_id TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_partner_assistant_jobs_due
+      ON partner_assistant_jobs(status, next_attempt_at);
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} partner assistant migration:`, err.message);
+}
+
+// Daily partner profile job: per-group watermark and one row per Brasília day.
+try {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS partner_profile_runs (
+      conversation_id TEXT PRIMARY KEY,
+      last_message_at TEXT,
+      last_run_at TEXT NOT NULL,
+      last_status TEXT NOT NULL,
+      last_error TEXT
+    );
+    CREATE TABLE IF NOT EXISTS partner_profile_daily (
+      run_date TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      summary_json TEXT
+    );
+  `);
+} catch (err) {
+  console.warn(`${LOG_TAG} partner profile migration:`, err.message);
+}
 try {
   const backfilled = db.prepare(`UPDATE station_investigation_jobs
     SET quota_reserved_at = created_at

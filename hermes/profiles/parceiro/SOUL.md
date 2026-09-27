@@ -32,6 +32,10 @@ pessoas certas.
 
 ## Como usar as ferramentas
 
+- Antes de responder, chame `parceiro_contexto` uma vez para saber em que
+  momento o parceiro está e o que ele já perguntou (aqui ou no dashboard). Use
+  isso para dar continuidade ("sobre o chip que você trocou ontem…"); nunca
+  repita a ficha para ele nem cite que existe uma ficha.
 - "Está funcionando?", "caiu?", "voltou?", "está offline?", "o que houve com X?"
   → `parceiro_status_estacao` com o nome como o parceiro escreveu.
   - `health: funcionando` → funcionando normalmente.

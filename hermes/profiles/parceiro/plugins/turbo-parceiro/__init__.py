@@ -134,6 +134,10 @@ def _dump(result: dict) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def contexto(args: dict | None = None, **_) -> str:
+    return _dump(call_partner_tool("partner_context", {}))
+
+
 def estacoes(args: dict | None = None, **_) -> str:
     return _dump(call_partner_tool("partner_overview", {}))
 
@@ -254,6 +258,11 @@ def whatsapp_format(response_text: str = "", **kwargs):
 # Registration
 # ---------------------------------------------------------------------------
 
+CONTEXTO_SCHEMA = {
+    "name": "parceiro_contexto",
+    "description": "Ficha do parceiro (em que momento está, dificuldades, pedidos abertos, o que a equipe prometeu) e as últimas perguntas dele em qualquer canal (WhatsApp ou dashboard). Use no começo da conversa ou quando ele se referir a algo já tratado.",
+    "parameters": {"type": "object", "properties": {}},
+}
 ESTACOES_SCHEMA = {
     "name": "parceiro_estacoes",
     "description": "Lista as estações do parceiro deste grupo (nome, cidade) e o que o grupo pode consultar de cada uma. Use antes de responder sobre 'minhas estações' ou quando não souber o nome exato.",
@@ -283,6 +292,7 @@ CONHECIMENTO_SCHEMA = {
 }
 
 _TOOLS = [
+    (CONTEXTO_SCHEMA, contexto, "🗂"),
     (ESTACOES_SCHEMA, estacoes, "\U0001f50c"),
     (STATUS_SCHEMA, status_estacao, "\U0001f6a6"),
     (USO_SCHEMA, uso, "\U0001f4ca"),

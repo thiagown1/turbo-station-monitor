@@ -42,6 +42,7 @@ const { resolveCustomerData } = require('../lib/user-data');
 const { emitEvent } = require('../lib/sse');
 const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
 const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
+const { claimPartnerAssistantMessage, partnerAssistantOwns, runPartnerAssistantJob } = require('../lib/partner-assistant-runtime');
 const {
   handleFinancialApprovalReply,
   sendFinancialApprovalAcknowledgement,
@@ -431,6 +432,9 @@ router.post('/', async (req, res) => {
                 enqueueContadorMessage(contadorEvent);
                 return;
               }
+              // A replay of a message the partner assistant owns is already
+              // handled (its worker retries); never hand it to the investigator.
+              if (partnerAssistantOwns(stationInput.messageId)) return;
               const prepared = await prepareStationInvestigation(stationInput, {
                 loadConfig: async () => {
                   if (sharedAgentConfigError) throw sharedAgentConfigError;
@@ -615,6 +619,30 @@ router.post('/', async (req, res) => {
           id: msgId, conversationId, created, duplicate: false,
           source: 'evolution', channel: 'whatsapp-group',
         });
+      }
+      // Partner assistant (Hermes `parceiro`): a mention of the support number in
+      // a group the Agent Center assigned to it. It takes precedence over the
+      // station investigator so one message never gets two answers.
+      if (sharedAgentConfig && !sharedAgentConfigError) {
+        let partnerClaim = { owned: false };
+        try {
+          partnerClaim = claimPartnerAssistantMessage({
+            messageId: externalMessageId || msgId, conversationId, brandId, groupJid, instance, direction,
+            body: groupBody, receivedAt: whatsappContext.providerTimestamp || now, whatsappContext,
+          }, sharedAgentConfig);
+        } catch (err) {
+          console.warn(`${LOG_TAG} partner assistant claim failed for ${msgId}:`, err.message);
+        }
+        if (partnerClaim.owned) {
+          if (partnerClaim.fresh) {
+            void runPartnerAssistantJob(externalMessageId || msgId)
+              .catch(err => console.warn(`${LOG_TAG} partner assistant failed for ${msgId}:`, err.message));
+          }
+          return res.status(201).json({
+            id: msgId, conversationId, created, duplicate: false,
+            source: 'evolution', channel: 'whatsapp-group', partnerAssistant: true,
+          });
+        }
       }
       const stationPreparation = await prepareStationInvestigation(stationInput, {
         loadConfig: async () => {
