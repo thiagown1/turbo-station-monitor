@@ -672,6 +672,8 @@ try {
 } catch (err) {
   console.warn(`${LOG_TAG} partner profile migration:`, err.message);
 }
+// Watermark of the dashboard chat turns already folded into the profiles.
+safeAddColumn('partner_profile_runs', 'last_dashboard_at', 'TEXT');
 try {
   const backfilled = db.prepare(`UPDATE station_investigation_jobs
     SET quota_reserved_at = created_at

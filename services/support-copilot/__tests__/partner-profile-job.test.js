@@ -10,7 +10,7 @@ process.env.AGENT_EVENT_BASE_URL = 'https://dashboard.test';
 process.env.PARTNER_AGENT_SECRET = 'partner-secret';
 
 const { db } = require('../lib/db');
-const { maybeRunDailyPartnerProfiles, transcript, updateGroupProfiles, validateProfile } = require('../lib/partner-profile-job');
+const { SYSTEM_PROMPT, maybeRunDailyPartnerProfiles, transcript, updateGroupProfiles, validateProfile } = require('../lib/partner-profile-job');
 
 test.after(() => {
   db.close();
@@ -100,6 +100,44 @@ test('a failed group keeps its watermark so the same messages are retried next t
   }, NOW);
   assert.equal(ok, 'ok');
   assert.match(retried[0], /estação parou/);
+});
+
+test('dashboard chat turns feed the profile of their partner, once each', async () => {
+  link('conv_d', 'p-d1', 'Arena');
+  link('conv_d', 'p-d2', 'Damião');
+  const calls = [];
+  let turns = [{ question: 'quando cai o repasse?', answer: 'Dia 10.', at: '2026-09-27T14:00:00.000Z' }];
+  const request = async (url, init) => {
+    const body = JSON.parse(init.body);
+    calls.push(body);
+    if (body.action === 'read_profiles') {
+      return { ok: true, status: 200, json: async () => ({ ok: true, partners: [
+        { id: 'p-d1', name: 'Arena', profile: null, dashboardTurns: turns },
+        { id: 'p-d2', name: 'Damião', profile: null, dashboardTurns: [] },
+      ] }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true, changed: true, version: 1 }) };
+  };
+  const summarized = [];
+  const summarize = async (input) => { summarized.push(input); return { summary: 'ok', sections: {} }; };
+
+  // No group message, but the partner asked in the dashboard: only that partner is updated.
+  assert.equal(await updateGroupProfiles({ conversation_id: 'conv_d', group_jid: 'conv_d@g.us', brand_id: 'turbo_station' }, { request, summarize }, NOW), 'ok');
+  assert.equal(calls[0].dashboardSince, new Date(NOW.getTime() - 7 * 24 * 60 * 60_000).toISOString());
+  assert.deepEqual(summarized.map((s) => s.partnerName), ['Arena']);
+  assert.match(summarized[0].messages, /Dashboard.*quando cai o repasse\?.*Dia 10\./);
+  assert.deepEqual(calls.filter((c) => c.action === 'upsert_profile').map((c) => c.partnerId), ['p-d1']);
+
+  // The next run asks only for turns after the last one processed.
+  turns = [];
+  calls.length = 0;
+  assert.equal(await updateGroupProfiles({ conversation_id: 'conv_d', group_jid: 'conv_d@g.us', brand_id: 'turbo_station' }, { request, summarize }, NOW), 'no_new_messages');
+  assert.equal(calls[0].dashboardSince, '2026-09-27T14:00:00.000Z');
+  assert.equal(summarized.length, 1);
+});
+
+test('the profile instructions say the partner may read it', () => {
+  assert.match(SYSTEM_PROMPT, /parceiro pode ler/i);
 });
 
 test('runs at most once per Brasília day, only after 03:00 and only when enabled', async () => {
