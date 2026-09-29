@@ -4,9 +4,10 @@
  * Daily partner profile (the partner assistant's shared memory).
  *
  * Once a day, for every WhatsApp group linked to a partner, reads only the
- * messages that arrived since the last run, and asks a cheap model to update
- * each linked partner's short profile from its current version (read from the
- * app, so team edits in the dashboard are kept). The result is written through
+ * messages that arrived since the last run, plus each partner's dashboard chat
+ * turns since the last run, and asks a cheap model to update each linked
+ * partner's short profile from its current version (read from the app, so
+ * team edits in the dashboard are kept). A partner with nothing new is skipped. The result is written through
  * POST /api/agents/partner-memory `upsert_profile`, which versions and audits it.
  *
  * Off unless PARTNER_PROFILE_JOB_ENABLED=true; the app side also refuses writes
@@ -41,9 +42,10 @@ function linkedGroups() {
       ORDER BY conversation_id LIMIT ?`).all(MAX_GROUPS_PER_RUN);
 }
 
-function lastProcessedAt(conversationId, now) {
-  const row = db.prepare('SELECT last_message_at FROM partner_profile_runs WHERE conversation_id = ?').get(conversationId);
-  return row?.last_message_at || new Date(now.getTime() - FIRST_RUN_LOOKBACK_MS).toISOString();
+function watermarks(conversationId, now) {
+  const row = db.prepare('SELECT last_message_at, last_dashboard_at FROM partner_profile_runs WHERE conversation_id = ?').get(conversationId);
+  const firstRun = new Date(now.getTime() - FIRST_RUN_LOOKBACK_MS).toISOString();
+  return { messagesSince: row?.last_message_at || firstRun, dashboardSince: row?.last_dashboard_at || firstRun };
 }
 
 function newMessages(conversationId, since) {
@@ -64,11 +66,24 @@ function transcript(rows) {
   return text;
 }
 
+
+function dashboardTranscript(turns) {
+  return turns.map((turn) => {
+    const at = new Date(turn.at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
+    // The app already sends short notes without amounts; keep who asked.
+    const who = turn.askedBy ? String(turn.askedBy).slice(0, 80) : 'parceiro';
+    return `[${at}] Dashboard: ${who} perguntou: ${redact(String(turn.question)).slice(0, 400)} | assistente respondeu: ${redact(String(turn.answer)).slice(0, 400)}`;
+  }).join('\n');
+}
+
 const SYSTEM_PROMPT = `Você mantém a ficha de um parceiro da Turbo Station (dono ou anfitrião de estações de recarga de carros elétricos).
-Atualize a ficha a partir da ficha atual e das mensagens novas do grupo de WhatsApp com esse parceiro.
+Atualize a ficha a partir da ficha atual, das mensagens novas do grupo de WhatsApp com esse parceiro e das perguntas novas que ele fez no chat do dashboard.
 Regras:
+- O próprio parceiro pode ler a ficha (no WhatsApp e no dashboard): escreva de forma factual e respeitosa, sem julgamentos sobre ele.
 - Só fatos que aparecem nas mensagens ou na ficha atual; nada inventado.
 - Sem dados pessoais: nenhum telefone, CPF, e-mail, endereço de pessoa, valor pago por usuário final ou nome de cliente final.
+- Sem valores financeiros (receita, repasse, preços pagos): registre só o assunto, por exemplo "Luan perguntou se o faturamento do Caju Limão está caindo".
+- Pode dizer quem da equipe do parceiro perguntou o quê, pelo primeiro nome.
 - Mantenha o que continua válido da ficha atual; tire o que foi resolvido ou ficou velho; seja curto.
 - Responda só JSON: {"summary": "até 600 caracteres", "sections": {"momento": "...", "estacoes": "...", "dificuldades": "...", "pedidosAbertos": "...", "compromissosEquipe": "...", "relacionamento": "..."}}.
 - Cada seção tem até 400 caracteres; omita a seção quando não houver nada a dizer.`;
@@ -127,29 +142,38 @@ function recordRun(conversationId, patch) {
         last_message_at = COALESCE(@lastMessageAt, partner_profile_runs.last_message_at),
         last_run_at = @at, last_status = @status, last_error = @error`)
     .run({ conversationId, lastMessageAt: patch.lastMessageAt ?? null, at: nowIso(), status: patch.status, error: patch.error ?? null });
+  if (patch.lastDashboardAt) {
+    db.prepare('UPDATE partner_profile_runs SET last_dashboard_at = ? WHERE conversation_id = ?').run(patch.lastDashboardAt, conversationId);
+  }
 }
 
 /** Updates the profiles of one group's partners. Returns a status string. */
 async function updateGroupProfiles(group, deps = {}, now = new Date()) {
-  const since = lastProcessedAt(group.conversation_id, now);
-  const rows = newMessages(group.conversation_id, since);
-  if (!rows.length) {
-    recordRun(group.conversation_id, { status: 'no_new_messages' });
-    return 'no_new_messages';
-  }
+  const { messagesSince, dashboardSince } = watermarks(group.conversation_id, now);
+  const rows = newMessages(group.conversation_id, messagesSince);
   const subject = { type: 'whatsapp_group', conversationId: group.conversation_id };
   try {
-    const { partners = [] } = await postMemory({ brandId: group.brand_id, subject, action: 'read_profiles' }, deps);
-    const messages = transcript(rows);
+    const { partners = [] } = await postMemory({ brandId: group.brand_id, subject, action: 'read_profiles', dashboardSince }, deps);
+    const groupText = rows.length ? transcript(rows) : '';
+    let updated = 0;
+    let lastDashboardAt = null;
     for (const partner of partners) {
+      const turns = Array.isArray(partner.dashboardTurns) ? partner.dashboardTurns : [];
+      if (!groupText && !turns.length) continue;
       const content = await (deps.summarize || summarizeWithModel)({
         partnerName: partner.name,
         current: partner.profile ? { summary: partner.profile.summary, sections: partner.profile.sections } : null,
-        messages,
+        messages: [groupText, dashboardTranscript(turns)].filter(Boolean).join('\n'),
       }, deps);
       await postMemory({ brandId: group.brand_id, subject, action: 'upsert_profile', partnerId: partner.id, profile: content }, deps);
+      updated += 1;
+      for (const turn of turns) if (!lastDashboardAt || turn.at > lastDashboardAt) lastDashboardAt = turn.at;
     }
-    recordRun(group.conversation_id, { status: 'ok', lastMessageAt: rows[rows.length - 1].created_at });
+    if (!updated) {
+      recordRun(group.conversation_id, { status: 'no_new_messages' });
+      return 'no_new_messages';
+    }
+    recordRun(group.conversation_id, { status: 'ok', lastMessageAt: rows.length ? rows[rows.length - 1].created_at : null, lastDashboardAt });
     return 'ok';
   } catch (error) {
     // Keep last_message_at so the next run retries the same messages.
@@ -178,6 +202,7 @@ async function maybeRunDailyPartnerProfiles(deps = {}, now = new Date()) {
 }
 
 module.exports = {
+  SYSTEM_PROMPT,
   maybeRunDailyPartnerProfiles,
   transcript,
   updateGroupProfiles,
