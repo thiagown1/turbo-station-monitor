@@ -106,7 +106,7 @@ test('dashboard chat turns feed the profile of their partner, once each', async 
   link('conv_d', 'p-d1', 'Arena');
   link('conv_d', 'p-d2', 'Damião');
   const calls = [];
-  let turns = [{ question: 'quando cai o repasse?', answer: 'Dia 10.', at: '2026-09-27T14:00:00.000Z' }];
+  let turns = [{ askedBy: 'Marina', question: 'quando cai o repasse?', answer: 'Dia 10.', at: '2026-09-27T14:00:00.000Z' }];
   const request = async (url, init) => {
     const body = JSON.parse(init.body);
     calls.push(body);
@@ -125,7 +125,7 @@ test('dashboard chat turns feed the profile of their partner, once each', async 
   assert.equal(await updateGroupProfiles({ conversation_id: 'conv_d', group_jid: 'conv_d@g.us', brand_id: 'turbo_station' }, { request, summarize }, NOW), 'ok');
   assert.equal(calls[0].dashboardSince, new Date(NOW.getTime() - 7 * 24 * 60 * 60_000).toISOString());
   assert.deepEqual(summarized.map((s) => s.partnerName), ['Arena']);
-  assert.match(summarized[0].messages, /Dashboard.*quando cai o repasse\?.*Dia 10\./);
+  assert.match(summarized[0].messages, /Dashboard: Marina perguntou: quando cai o repasse\?.*Dia 10\./);
   assert.deepEqual(calls.filter((c) => c.action === 'upsert_profile').map((c) => c.partnerId), ['p-d1']);
 
   // The next run asks only for turns after the last one processed.
