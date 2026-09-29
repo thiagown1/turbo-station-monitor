@@ -79,6 +79,7 @@ function jsonServer(handler) {
         CONTADOR_NEXT_SECRET: 'test-energy-secret',
         CONTADOR_BANK_STATEMENTS_ENABLED: 'true',
         CONTADOR_BANK_STATEMENTS_API_KEY: 'test-bank-key',
+        CONTADOR_BANK_STATEMENTS_APPROVAL_SECRET: 'synthetic-test-approval-secret-32-bytes',
         CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS: allowedSender,
         AGENT_EVENT_BASE_URL: `http://127.0.0.1:${nextPort}`,
         AGENT_EVENT_SECRET: 'test-energy-secret',
@@ -86,9 +87,12 @@ function jsonServer(handler) {
         EVOLUTION_WEBHOOK_SECRET: 'test-webhook-secret',
         EVOLUTION_INSTANCE_MAP: 'turbostation:turbo_station',
       },
-      stdio: 'ignore',
+      stdio: ['ignore', 'ignore', 'pipe'],
     });
+    let startupError = '';
+    child.stderr.on('data', (chunk) => { startupError = (startupError + chunk.toString()).slice(-2000); });
     await waitUntil(async () => {
+      if (child.exitCode != null) throw new Error(`Isolated OFX server exited ${child.exitCode}: ${startupError}`);
       try { return (await fetch(`http://127.0.0.1:${supportPort}/health`)).ok; }
       catch { return false; }
     });

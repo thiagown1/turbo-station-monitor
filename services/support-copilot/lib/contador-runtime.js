@@ -19,6 +19,7 @@ const {
   CONTADOR_NEXT_SECRET,
   CONTADOR_BANK_STATEMENTS_ENABLED,
   CONTADOR_BANK_STATEMENTS_API_KEY,
+  CONTADOR_BANK_STATEMENTS_APPROVAL_SECRET,
   CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS,
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
@@ -47,7 +48,7 @@ const config = {
   nextBaseUrl: CONTADOR_NEXT_BASE_URL,
   secret: CONTADOR_NEXT_SECRET,
   bankStatementsEnabled: CONTADOR_BANK_STATEMENTS_ENABLED,
-  bankApiConfigured: Boolean(CONTADOR_BANK_STATEMENTS_API_KEY),
+  bankApiConfigured: Boolean(CONTADOR_BANK_STATEMENTS_API_KEY && CONTADOR_BANK_STATEMENTS_APPROVAL_SECRET.length >= 32),
   bankStatementsAllowedSenderIds: CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS,
   instance: CONTADOR_INSTANCE,
   agent: CONTADOR_OPENCLAW_AGENT,
@@ -403,6 +404,7 @@ let contador = buildContador({
   importBankStatement: createBankStatementClient({
     baseUrl: CONTADOR_NEXT_BASE_URL,
     apiKey: CONTADOR_BANK_STATEMENTS_API_KEY,
+    approvalSecret: CONTADOR_BANK_STATEMENTS_APPROVAL_SECRET,
   }).importOfx,
   queryTool: async (tool, params) => {
     const response = await postNext('/api/accounting/energy-agent/query', { tool, params });

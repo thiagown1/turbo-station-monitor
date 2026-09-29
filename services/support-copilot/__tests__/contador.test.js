@@ -72,8 +72,8 @@ test('authorized OFX import forwards the original bytes and verified sender with
   const contador = buildContador({
     config: bankConfig,
     readMedia: async () => Buffer.from('OFX synthetic bytes'),
-    importBankStatement: async (payload) => {
-      calls.push(['import', payload]);
+    importBankStatement: async (payload, authority) => {
+      calls.push(['import', payload, authority]);
       return { counts: { total: 3, new: 2, duplicate: 1, ignoredBalance: 1, autoClassified: 1 } };
     },
     intake: async () => { throw new Error('energy intake must not run'); },
@@ -83,7 +83,7 @@ test('authorized OFX import forwards the original bytes and verified sender with
     loadContext: async () => [],
   });
   const event = {
-    kind: 'ofx', messageId: 'wamid-ofx', groupJid: config.groupConversationId,
+    kind: 'ofx', messageId: 'wamid-ofx', groupJid: config.groupConversationId, brandId: 'brand-example',
     senderId: '5511999999999',
     media: { media_type: 'document', filename: 'extrato.ofx', url: '/api/support/media/wamid-ofx.ofx' },
   };
@@ -92,7 +92,7 @@ test('authorized OFX import forwards the original bytes and verified sender with
   assert.deepEqual(calls[0], ['import', {
     fileName: 'extrato.ofx', contentBase64: Buffer.from('OFX synthetic bytes').toString('base64'),
     confirmedBy: '5511999999999',
-  }]);
+  }, { brandId: 'brand-example' }]);
   assert.match(calls[1][1], /2 novos/);
   assert.match(calls[1][1], /1 já existentes/);
 });

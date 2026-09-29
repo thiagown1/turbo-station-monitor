@@ -566,7 +566,7 @@ function buildContador({ config, readMedia, intake, importBankStatement, sendRep
         fileName: event.media.filename,
         contentBase64: content.toString('base64'),
         confirmedBy: event.senderId,
-      });
+      }, { brandId: event.brandId });
       const counts = result?.counts;
       if (!counts || !['new', 'duplicate', 'ignoredBalance', 'autoClassified'].every((key) =>
         Number.isSafeInteger(counts[key]) && counts[key] >= 0)) {
