@@ -20,9 +20,29 @@ const ALLOWED_TOOLS = new Set([
 ]);
 
 const ACCOUNTING_TRIGGER = /\b(contador|contas?|faturas?|energia|tarifa|kwh|venc(?:e|imento|ida|idas)?|pend[eê]ncias?|lan[cç]amentos?|custos?|nfse|nfs-e)\b/i;
+const MAX_OFX_BYTES = 5 * 1024 * 1024;
+
+function isAllowedBankSender(senderId, config) {
+  const sender = String(senderId || '').trim();
+  return /^\d{10,15}$/.test(sender)
+    && Array.isArray(config?.bankStatementsAllowedSenderIds)
+    && config.bankStatementsAllowedSenderIds.includes(sender);
+}
+
+function bankStatementGate(event, config) {
+  if (!config?.bankStatementsEnabled) return 'bank_statements_disabled';
+  if (!config.bankApiConfigured) return 'bank_api_unconfigured';
+  if (!isAllowedBankSender(event?.senderId, config)) return 'bank_sender_not_allowed';
+  return null;
+}
 
 function normalizedMime(value) {
   return String(value || '').split(';', 1)[0].trim().toLowerCase();
+}
+
+function isOfxDocument(media) {
+  return String(media?.media_type || '').toLowerCase() === 'document'
+    && String(media?.filename || '').toLowerCase().endsWith('.ofx');
 }
 
 function classifyInbound(event, config) {
@@ -48,6 +68,10 @@ function classifyInbound(event, config) {
   const mime = normalizedMime(event.media?.mimetype);
   const mediaType = String(event.media?.media_type || '').toLowerCase();
   const filename = String(event.media?.filename || '').toLowerCase();
+  if (isOfxDocument(event.media)) {
+    const reason = bankStatementGate(event, config);
+    return reason ? { kind: 'ignored', reason } : { kind: 'ofx' };
+  }
   if (mime === 'application/pdf' || (mediaType === 'document' && filename.endsWith('.pdf'))) {
     return { kind: 'pdf' };
   }
@@ -438,7 +462,7 @@ function periodInSaoPaulo(now) {
   return { year: Number(parts.year), month: Number(parts.month), day: Number(parts.day) };
 }
 
-function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTool, loadContext, listarFatos, registrarFatos, listarPerguntasAbertas, resolverPerguntas }) {
+function buildContador({ config, readMedia, intake, importBankStatement, sendReply, runAgent, queryTool, loadContext, listarFatos, registrarFatos, listarPerguntasAbertas, resolverPerguntas }) {
   if (!config || !readMedia || !intake || !sendReply || !runAgent || !queryTool || !loadContext) {
     throw new Error('Contador dependencies are incomplete');
   }
@@ -525,6 +549,37 @@ function buildContador({ config, readMedia, intake, sendReply, runAgent, queryTo
   }
 
   async function handle(event) {
+    if (event.kind === 'ofx') {
+      if (event.groupJid !== config.groupConversationId) return { status: 'blocked', reason: 'group_not_allowed' };
+      const reason = bankStatementGate(event, config);
+      if (reason) return { status: 'blocked', reason };
+      if (!event.media || String(event.media.media_type || '').toLowerCase() !== 'document'
+        || !String(event.media.filename || '').toLowerCase().endsWith('.ofx')) {
+        return { status: 'blocked', reason: 'bank_file_invalid' };
+      }
+      if (typeof importBankStatement !== 'function') return { status: 'blocked', reason: 'bank_import_unavailable' };
+      const content = await readMedia(event.media, event);
+      if (!Buffer.isBuffer(content) || content.length === 0 || content.length > MAX_OFX_BYTES) {
+        return { status: 'blocked', reason: 'bank_file_too_large' };
+      }
+      const result = await importBankStatement({
+        fileName: event.media.filename,
+        contentBase64: content.toString('base64'),
+        confirmedBy: event.senderId,
+      });
+      const counts = result?.counts;
+      if (!counts || !['new', 'duplicate', 'ignoredBalance', 'autoClassified'].every((key) =>
+        Number.isSafeInteger(counts[key]) && counts[key] >= 0)) {
+        throw new Error('Bank import returned invalid counts');
+      }
+      await sendReply(
+        `Extrato recebido: ${counts.new} novos, ${counts.duplicate} já existentes, `
+        + `${counts.ignoredBalance} linhas de saldo ignoradas e ${counts.autoClassified} classificados por regras. `
+        + 'Confira os lançamentos pendentes na aba Extrato do dashboard.',
+        event,
+      );
+      return { status: 'sent', outcome: 'bank_statement_imported' };
+    }
     if (event.kind === 'pdf') {
       const content = await readMedia(event.media, event);
       const result = await intake({
@@ -744,6 +799,7 @@ module.exports = {
   ALLOWED_TOOLS,
   buildContador,
   classifyInbound,
+  isOfxDocument,
   parseAgentInstruction,
   redactForModel,
   collectStationIds,

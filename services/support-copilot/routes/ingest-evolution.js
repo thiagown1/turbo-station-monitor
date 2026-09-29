@@ -31,6 +31,7 @@ const path = require('path');
 const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = require('../lib/db');
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
+const { isOfxDocument } = require('../lib/contador');
 const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
 const {
   enqueueContadorMessage,
@@ -432,6 +433,12 @@ router.post('/', async (req, res) => {
                 enqueueContadorMessage(contadorEvent);
                 return;
               }
+              // Bank statements never enter the paid media classifier. The
+              // Contador's own group/sender/API-key gates decide whether to queue.
+              if (isOfxDocument(media)) {
+                enqueueContadorMessage(contadorEvent);
+                return;
+              }
               // A replay of a message the partner assistant owns is already
               // handled (its worker retries); never hand it to the investigator.
               if (partnerAssistantOwns(stationInput.messageId)) return;
@@ -618,6 +625,17 @@ router.post('/', async (req, res) => {
         return res.status(201).json({
           id: msgId, conversationId, created, duplicate: false,
           source: 'evolution', channel: 'whatsapp-group',
+        });
+      }
+      // OFX is a financial document, not an image/PDF to classify with a model.
+      // Even when intake is disabled or the sender is untrusted, do not forward
+      // its contents into the generic media pipeline.
+      if (isOfxDocument(media)) {
+        const contadorRoute = enqueueContadorMessage(contadorEvent);
+        return res.status(201).json({
+          id: msgId, conversationId, created, duplicate: false,
+          source: 'evolution', channel: 'whatsapp-group',
+          bankStatementQueued: contadorRoute.kind === 'ofx' && contadorRoute.enqueued === true,
         });
       }
       // Partner assistant (Hermes `parceiro`): a mention of the support number in
@@ -1074,6 +1092,10 @@ router.post('/', async (req, res) => {
   }
 
   if (media && direction === 'inbound' && ['image', 'document'].includes(media.media_type)) {
+    if (isOfxDocument(media)) {
+      // OFX sent to a DM has no authorized Contador group and is never analyzed.
+      return res.status(201).json({ id: msgId, conversationId, created, duplicate: false, source: 'evolution' });
+    }
     const { routeInboundMessageDurably } = require('../lib/agent-router');
     routeInboundMessageDurably({
       messageId: msgId, externalMessageId, conversationId, brandId,

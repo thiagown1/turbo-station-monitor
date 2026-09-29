@@ -45,6 +45,80 @@ test('gate only accepts the configured group and ignores ordinary chatter', () =
   }, config).kind, 'pdf');
 });
 
+test('OFX routing requires the accounting group, opt-in, API configuration and an allowed sender', () => {
+  const event = {
+    direction: 'inbound', groupJid: config.groupConversationId,
+    senderId: '5511999999999',
+    media: { media_type: 'document', mimetype: 'application/x-ofx', filename: 'extrato.ofx' },
+  };
+  const enabled = {
+    ...config, bankStatementsEnabled: true, bankApiConfigured: true,
+    bankStatementsAllowedSenderIds: ['5511999999999'],
+  };
+  assert.deepEqual(classifyInbound(event, enabled), { kind: 'ofx' });
+  assert.equal(classifyInbound(event, config).reason, 'bank_statements_disabled');
+  assert.equal(classifyInbound(event, { ...enabled, bankApiConfigured: false }).reason, 'bank_api_unconfigured');
+  assert.equal(classifyInbound({ ...event, senderId: '5511888888888' }, enabled).reason, 'bank_sender_not_allowed');
+  assert.equal(classifyInbound({ ...event, accountingGroup: false }, enabled).reason, 'group_not_allowed');
+  assert.equal(classifyInbound({ ...event, groupJid: 'other@g.us' }, enabled).reason, 'group_not_allowed');
+});
+
+test('authorized OFX import forwards the original bytes and verified sender without calling the model', async () => {
+  const calls = [];
+  const bankConfig = {
+    ...config, bankStatementsEnabled: true, bankApiConfigured: true,
+    bankStatementsAllowedSenderIds: ['5511999999999'],
+  };
+  const contador = buildContador({
+    config: bankConfig,
+    readMedia: async () => Buffer.from('OFX synthetic bytes'),
+    importBankStatement: async (payload) => {
+      calls.push(['import', payload]);
+      return { counts: { total: 3, new: 2, duplicate: 1, ignoredBalance: 1, autoClassified: 1 } };
+    },
+    intake: async () => { throw new Error('energy intake must not run'); },
+    sendReply: async (message) => calls.push(['reply', message]),
+    runAgent: async () => { throw new Error('model must not run'); },
+    queryTool: async () => { throw new Error('query tool must not run'); },
+    loadContext: async () => [],
+  });
+  const event = {
+    kind: 'ofx', messageId: 'wamid-ofx', groupJid: config.groupConversationId,
+    senderId: '5511999999999',
+    media: { media_type: 'document', filename: 'extrato.ofx', url: '/api/support/media/wamid-ofx.ofx' },
+  };
+  const result = await contador.handle(event);
+  assert.equal(result.status, 'sent');
+  assert.deepEqual(calls[0], ['import', {
+    fileName: 'extrato.ofx', contentBase64: Buffer.from('OFX synthetic bytes').toString('base64'),
+    confirmedBy: '5511999999999',
+  }]);
+  assert.match(calls[1][1], /2 novos/);
+  assert.match(calls[1][1], /1 já existentes/);
+});
+
+test('OFX handler rejects a forged sender and an oversized file before the API call', async () => {
+  let imported = 0;
+  const bankConfig = {
+    ...config, bankStatementsEnabled: true, bankApiConfigured: true,
+    bankStatementsAllowedSenderIds: ['5511999999999'],
+  };
+  const contador = buildContador({
+    config: bankConfig,
+    readMedia: async () => Buffer.alloc(5 * 1024 * 1024 + 1),
+    importBankStatement: async () => { imported++; },
+    intake: async () => {}, sendReply: async () => {}, runAgent: async () => '',
+    queryTool: async () => ({}), loadContext: async () => [],
+  });
+  const event = {
+    kind: 'ofx', groupJid: config.groupConversationId, senderId: '5511888888888',
+    media: { media_type: 'document', filename: 'statement.ofx' },
+  };
+  assert.equal((await contador.handle(event)).reason, 'bank_sender_not_allowed');
+  assert.equal((await contador.handle({ ...event, senderId: '5511999999999' })).reason, 'bank_file_too_large');
+  assert.equal(imported, 0);
+});
+
 test('PDF intake forwards the original message id and sends the deterministic reply', async () => {
   const calls = [];
   const contador = buildContador({

@@ -65,6 +65,37 @@ There are two independent kill switches: the local `CONTADOR_ENABLED` and the
 Next feature flag. Both fail closed. Deploying this code does not activate
 messages or accounting writes.
 
+### OFX bank statements
+
+OFX import is a separate opt-in. A document ending in `.ofx` is intercepted
+before the paid media classifier, including when import is disabled or the
+sender is not authorized. It is never sent to the model. The Contador queues an
+import only when the message arrives in its exact configured accounting group,
+`CONTADOR_BANK_STATEMENTS_ENABLED=true`, a scoped API key is configured, and the
+normalized WhatsApp sender id is in the explicit allowlist. Sending the file
+from an allowlisted account is the human import instruction; that sender id is
+sent as `confirmedBy` and recorded by the Next API. A retry may create another
+import batch, but the Next service deduplicates the statement transactions.
+
+The worker reads at most 5 MiB of the already stored attachment and calls
+`POST /api/accounting/bank-statements/import` with `x-api-key`. The key must
+carry `accounting:bank-statements:write` for the correct brand. The reply in the
+group contains counts only: new, already existing, ignored balance lines and
+classified by existing rules. It never includes account numbers, memos or
+balances. Unrecognized transactions remain for review in the dashboard's
+**Extrato** tab. This change does not let the model classify or create rules.
+
+| Variable | Default / purpose |
+|---|---|
+| `CONTADOR_BANK_STATEMENTS_ENABLED` | `false`; separate OFX kill switch |
+| `CONTADOR_BANK_STATEMENTS_API_KEY` | empty; brand-scoped Next API key with write scope |
+| `CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS` | empty; comma-separated, 10–15 digit sender ids |
+
+Deploying the code does not grant the key scope or activate OFX import. To
+roll back an activated intake, set `CONTADOR_BANK_STATEMENTS_ENABLED=false`
+and restart only `support-copilot`; existing dashboard transactions remain for
+review. Production key changes and activation require separate approval.
+
 The Codex capacity fallback is a third, independent opt-in. It remains inert
 unless `CONTADOR_CODEX_FALLBACK_ENABLED=true`; deploying the runner alone does
 not change the active model or consume the ChatGPT subscription.

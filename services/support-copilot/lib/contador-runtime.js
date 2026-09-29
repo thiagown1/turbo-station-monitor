@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const { buildContador, classifyInbound } = require('./contador');
+const { createBankStatementClient } = require('./contador-bank-statements');
 const { createContadorModelRunner } = require('./contador-model-runner');
 const { db, nowIso, randomId } = require('./db');
 const { sendText } = require('./evolution-client');
@@ -16,6 +17,9 @@ const {
   CONTADOR_OPEN_CONVERSATION,
   CONTADOR_NEXT_BASE_URL,
   CONTADOR_NEXT_SECRET,
+  CONTADOR_BANK_STATEMENTS_ENABLED,
+  CONTADOR_BANK_STATEMENTS_API_KEY,
+  CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS,
   CONTADOR_INSTANCE,
   CONTADOR_OPENCLAW_AGENT,
   CONTADOR_OPENCLAW_MODEL,
@@ -42,6 +46,9 @@ const config = {
   openConversation: CONTADOR_OPEN_CONVERSATION,
   nextBaseUrl: CONTADOR_NEXT_BASE_URL,
   secret: CONTADOR_NEXT_SECRET,
+  bankStatementsEnabled: CONTADOR_BANK_STATEMENTS_ENABLED,
+  bankApiConfigured: Boolean(CONTADOR_BANK_STATEMENTS_API_KEY),
+  bankStatementsAllowedSenderIds: CONTADOR_BANK_STATEMENTS_ALLOWED_SENDER_IDS,
   instance: CONTADOR_INSTANCE,
   agent: CONTADOR_OPENCLAW_AGENT,
   model: CONTADOR_OPENCLAW_MODEL,
@@ -393,6 +400,10 @@ let contador = buildContador({
   config,
   readMedia,
   intake: (payload) => postNext('/api/accounting/energy-bill-intake', payload),
+  importBankStatement: createBankStatementClient({
+    baseUrl: CONTADOR_NEXT_BASE_URL,
+    apiKey: CONTADOR_BANK_STATEMENTS_API_KEY,
+  }).importOfx,
   queryTool: async (tool, params) => {
     const response = await postNext('/api/accounting/energy-agent/query', { tool, params });
     if (!response || response.data == null) throw new Error(`Next query ${tool} returned no data`);
