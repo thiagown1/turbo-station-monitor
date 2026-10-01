@@ -175,3 +175,27 @@ test('helpers strip CLI noise and personal data', () => {
   assert.equal(cleanHermesOutput('\n  ⚠ tirith security scanner\nWarning: Unknown toolsets: x\nsession_id: 123\nResposta final\n'), 'Resposta final');
   assert.equal(redact('fale com joao@exemplo.com'), 'fale com [email]');
 });
+
+// Single source of truth for the prompt format: the Python eval runner
+// (hermes/profiles/parceiro/eval/run_eval.py build_prompt) is tested against the
+// same fixture, so the eval cannot drift from what production sends to Hermes.
+const PROMPT_FIXTURE = JSON.parse(fs.readFileSync(
+  path.join(__dirname, '..', '..', '..', 'hermes', 'profiles', 'parceiro', 'eval', 'prompt_fixture.json'), 'utf8'));
+
+PROMPT_FIXTURE.cases.forEach((fixture, index) => {
+  test(`prompt format matches the shared eval fixture: ${fixture.name}`, () => {
+    const conversationId = `conv_promptfixture${index}`;
+    const insert = db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, sender_name, created_at)
+        VALUES (?, ?, 'turbo_station', ?, 'evolution', ?, ?, ?)`);
+    fixture.context.forEach((message, i) => insert.run(
+      `${conversationId}-${i}`, conversationId, message.sender === 'Turbo Station' ? 'outbound' : 'inbound',
+      `[${message.sender}]: ${message.text}`, message.sender, message.at));
+
+    const prompt = buildPrompt(
+      { conversation_id: conversationId, message_id: `wamid-fixture-${index}` },
+      { question: `[Leonardo]: ${fixture.question}`, receivedAt: PROMPT_FIXTURE.receivedAt },
+    );
+
+    assert.equal(prompt, fixture.expected);
+  });
+});
