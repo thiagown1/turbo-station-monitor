@@ -157,6 +157,12 @@ def uso(args: dict | None = None, **_) -> str:
     return _dump(call_partner_tool("station_usage", payload))
 
 
+def resumo_dia(args: dict | None = None, **_) -> str:
+    args = args or {}
+    station = str(args.get("estacao") or "").strip()
+    return _dump(call_partner_tool("station_day_summary", {"station": station} if station else {}))
+
+
 # ---------------------------------------------------------------------------
 # Knowledge base (RAG): BM25 over Markdown sections
 # ---------------------------------------------------------------------------
@@ -283,6 +289,13 @@ USO_SCHEMA = {
         "periodo": {"type": "string", "enum": USAGE_PERIODS, "description": "Período. Padrão last_7_days."},
     }},
 }
+RESUMO_DIA_SCHEMA = {
+    "name": "parceiro_resumo_dia",
+    "description": "Resumo de HOJE das estações (horário de Brasília): recargas, kWh e horas até a última hora completa, comparados com o que a estação costuma fazer no mesmo dia da semana (últimas 4 semanas), e as falhas desde a meia-noite. Use para 'como está minha estação?', 'está rendendo bem?', 'teve algum problema hoje?'. Com o nome/ID consulta uma; vazio consulta todas do grupo (até 5).",
+    "parameters": {"type": "object", "properties": {
+        "estacao": {"type": "string", "description": "Nome (ou parte) ou ID da estação, como foi escrito. Vazio = todas."},
+    }},
+}
 CONHECIMENTO_SCHEMA = {
     "name": "parceiro_conhecimento",
     "description": "Busca na base de conhecimento da Turbo Station (diagnóstico de estação offline, falhas, repasse e relatório, preços, dashboard, app). Use para dúvidas de 'como funciona' ou 'o que fazer'.",
@@ -296,6 +309,7 @@ _TOOLS = [
     (ESTACOES_SCHEMA, estacoes, "\U0001f50c"),
     (STATUS_SCHEMA, status_estacao, "\U0001f6a6"),
     (USO_SCHEMA, uso, "\U0001f4ca"),
+    (RESUMO_DIA_SCHEMA, resumo_dia, "\U0001f4c8"),
     (CONHECIMENTO_SCHEMA, conhecimento, "\U0001f4da"),
 ]
 
