@@ -6,6 +6,7 @@ provides_tools:
   - parceiro_estacoes
   - parceiro_status_estacao
   - parceiro_uso
+  - parceiro_resumo_dia
   - parceiro_conhecimento
 provides_hooks:
   - transform_llm_output

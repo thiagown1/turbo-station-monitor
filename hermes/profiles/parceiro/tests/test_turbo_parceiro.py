@@ -74,6 +74,31 @@ class CallPartnerToolTest(unittest.TestCase):
         self.assertEqual(captured, {"tool": "station_usage", "args": {"period": "last_7_days"}})
 
 
+class ResumoDiaTest(unittest.TestCase):
+    def _capture(self, fn, args):
+        captured = {}
+        original = plugin.call_partner_tool
+        plugin.call_partner_tool = lambda tool, a, **kw: captured.update(tool=tool, args=a) or {"ok": True, "data": {}}
+        try:
+            fn(args)
+        finally:
+            plugin.call_partner_tool = original
+        return captured
+
+    def test_asks_for_the_day_summary_of_the_named_station(self):
+        self.assertEqual(self._capture(plugin.resumo_dia, {"estacao": " Arena Norte "}),
+                         {"tool": "station_day_summary", "args": {"station": "Arena Norte"}})
+
+    def test_without_a_station_asks_for_all_of_the_conversation(self):
+        self.assertEqual(self._capture(plugin.resumo_dia, {}), {"tool": "station_day_summary", "args": {}})
+        self.assertEqual(self._capture(plugin.resumo_dia, None), {"tool": "station_day_summary", "args": {}})
+
+    def test_the_prompt_teaches_when_to_use_it_and_how_to_read_the_verdict(self):
+        soul = (Path(__file__).resolve().parents[1] / "SOUL.md").read_text(encoding="utf-8")
+        for needle in ("parceiro_resumo_dia", "poucos_dados", "faultsToday", "throughBrasilia", "scope"):
+            self.assertIn(needle, soul)
+
+
 class KnowledgeSearchTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -154,7 +179,7 @@ class RegistrationTest(unittest.TestCase):
         plugin.register(Ctx())
         self.assertEqual(hooks, ["transform_llm_output"])
         names = {tool["name"] for tool in registered}
-        self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_conhecimento"})
+        self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_resumo_dia", "parceiro_conhecimento"})
         self.assertTrue(all(tool["toolset"] == "turbo_parceiro" for tool in registered))
         for tool in registered:
             json.dumps(tool["schema"])  # schemas must be serializable
