@@ -63,6 +63,11 @@ This enables:
 ### Endpoint-specific 5xx policy
 
 Backend 5xx events are normalized without query strings before grouping.
+Known opaque record IDs in path segments (station codes, long numeric IDs,
+prefixed tokens, UUIDs and long mixed-case tokens) become `:id` for grouping
+and the one-hour debounce. Unknown segments remain distinct routes. This
+prevents one failing route from emitting a separate alert per station while
+retaining separate alerts for genuinely different routes.
 Charging/payment routes remain critical on the first error. Observability reads
 use dedicated warning policies: OCPP log reads require three errors in five
 minutes, while the mobile-telemetry dashboard routes (`heatmap-data`,
