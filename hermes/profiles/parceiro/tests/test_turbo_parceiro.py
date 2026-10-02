@@ -99,6 +99,24 @@ class ResumoDiaTest(unittest.TestCase):
             self.assertIn(needle, soul)
 
 
+class CustomerDataPolicyTest(unittest.TestCase):
+    def setUp(self):
+        self.soul = (Path(__file__).resolve().parents[1] / "SOUL.md").read_text(encoding="utf-8")
+
+    def test_customer_data_is_never_shared_in_the_group(self):
+        for needle in ("quem carregou", "privado", "mediante pedido direto"):
+            self.assertIn(needle, self.soul)
+
+    def test_rule_4_does_not_send_customer_data_requests_to_the_team_line(self):
+        rule4 = self.soul.split("4. **")[1].split("5. **")[0]
+        self.assertNotIn("tratar dado de cliente", rule4)
+
+    def test_the_reply_is_not_the_team_handoff_line(self):
+        rule = self.soul.split("5. **")[1].split("## Como usar")[0]
+        self.assertIn("Não use a linha", rule)
+        self.assertIn("Para a equipe", rule)
+
+
 class KnowledgeSearchTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
