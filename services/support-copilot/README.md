@@ -157,6 +157,37 @@ JIDs trigger it and whether replies go out directly (`autoSend`, off by default)
   `upsert_profile` (versioned and audited by the app). A failed group keeps its
   watermark and is retried the next day; output is validated and PII-redacted.
 
+### Simulating a partner message without WhatsApp
+
+`lib/partner-whatsapp-simulator.js` boots the real service (`index.js`) on a
+throwaway SQLite database with a stub central (serves the Agent Center config,
+captures `propose_reply`/`record_interaction`, counts station-investigator calls)
+and a stub Evolution gateway (counts sends, delivers nothing). For each scenario
+`{ id, conversationId, question, context?, mention?, allowed?, autoSend?, groupJid?, sender? }`
+it seeds the conversation and context, posts a simulated Evolution webhook (with a
+structured mention unless `mention: false`) and returns
+`{ claimed, answer, tools, reviewId, sentToGroup }`.
+
+```bash
+node scripts/simulate-partner-whatsapp.js --scenarios scenarios.json [--hermes <bin>] [--json]
+```
+
+- The child process gets an explicit environment: real Evolution credentials, the
+  real central and every other secret in your shell are never forwarded, and the run
+  aborts unless the gateway is the loopback stub. There is no option to change that.
+- `--hermes` / `HERMES_BIN` selects the binary (a `*.js` path is a fake, run by Node).
+  The real CLI needs the profile (`~/.hermes/profiles/parceiro/.env`) pointed at a
+  **local** Next started with `PARTNER_AGENT_LOCAL_OVERRIDE=1` and conversation ids
+  that exist in that local data; never production.
+- One run has one `autoSend` mode (the Agent Center setting is global), and every
+  scenario starts from a clean conversation (earlier scenarios' messages are removed).
+- The same harness backs `__tests__/partner-assistant-webhook-integration.test.js`
+  and `__tests__/partner-whatsapp-simulator.test.js` (fake Hermes).
+- Prompt format: `hermes/profiles/parceiro/eval/run_eval.py` (`group` keys in
+  `~/.hermes/eval/parceiro/groups.json`, cases with `context`) wraps questions like
+  `buildPrompt`; both are tested against `eval/prompt_fixture.json`, so change the
+  three together.
+
 ## PM2
 
 ```bash
