@@ -258,3 +258,25 @@ SQLite with WAL mode. Core tables: `brands`, `conversations`, `messages`,
 migrations, including the Contador outbox and daily-run ledger.
 
 Schema and migrations run automatically on startup.
+
+### Temporal evidence and status reply contract
+
+The question clock (`payload.receivedAt`, Brasília) is explicit. Recent messages are selected
+inside `[receivedAt - 24h, receivedAt]` **before** the 15-message limit; a delayed job cannot
+import later group messages as context. Python evaluation uses the same frozen-clock fixture.
+The tool's `checkedAtBrasilia` is the current query time, not the question time. This does not
+reconstruct historical Firestore connector/session snapshots or reinterpret current tools as
+an as-of query. Calendar changes across delayed jobs still require separate period-aware evaluation.
+
+For `station_status`, the app emits `data.replyContract = { version: 1, tool: 'station_status', text }`.
+The plugin writes that object separately to the trace, without the raw-result 8,000-character truncation.
+The runtime ignores generated prose and uses the server text. Missing/malformed/oversized (3,000)
+or conflicting contracts end the job as `failed`, without a send, proposal or another paid model attempt.
+A missing/invalid trace also fails closed. Other tools still produce model prose: this contract does
+not prove unrestricted answers about money, customers, knowledge or past days are correct.
+
+Dependency: release the matching Next contract before adopting this monitor/profile change;
+the old API will safely block status replies. Both PRs require separate release authorization.
+Monitor merges can deploy automatically: **do not merge to test**. Profile installation, Agent Center
+config, `autoSend` and allowlist activation are separate operations; this change performs none.
+Regression tests use local stubs and synthetic data, never production WhatsApp or credentials.

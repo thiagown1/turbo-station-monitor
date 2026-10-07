@@ -27,7 +27,7 @@ fs.writeFileSync(FAKE_HERMES, [
   "  const conversationId = process.env.TURBO_PARCEIRO_CONVERSATION_ID;",
   `  fs.appendFileSync(${JSON.stringify(HERMES_LOG)}, JSON.stringify({ conversationId, prompt: input }) + '\\n');`,
   "  if (input.includes('FAKE_HERMES_FAIL')) process.exit(5);",
-  "  fs.appendFileSync(process.env.TURBO_PARCEIRO_TRACE_FILE, JSON.stringify({ tool: 'station_status' }) + '\\n');",
+  "  fs.appendFileSync(process.env.TURBO_PARCEIRO_TRACE_FILE, JSON.stringify({ tool: 'station_status', ok: true, replyContract: { version: 1, tool: 'station_status', text: 'Resposta simulada para ' + conversationId + '.' } }) + '\\n');",
   "  console.log('session_id: 20260930_000000_000000');",
   "  console.log('Resposta simulada para ' + conversationId + '.');",
   '});',

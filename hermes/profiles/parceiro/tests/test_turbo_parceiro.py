@@ -1,5 +1,6 @@
 import importlib.util
 import json
+from unittest.mock import patch
 import sys
 import tempfile
 import unittest
@@ -47,6 +48,17 @@ class CallPartnerToolTest(unittest.TestCase):
         result = plugin.call_partner_tool("station_status", {"station": "Arena"}, subject=self.subject, post=post)
         self.assertTrue(result["ok"])
         self.assertEqual(sent, {"brandId": "turbo_station", "subject": self.subject, "tool": "station_status", "args": {"station": "Arena"}})
+
+    def test_trace_keeps_server_contract_intact_even_when_raw_result_is_truncated(self):
+        contract = {"version": 1, "tool": "station_status", "text": "Comunicação recente; histórico incompleto. Ação da equipe não comprovada."}
+        with tempfile.TemporaryDirectory() as directory:
+            trace = Path(directory) / "trace.jsonl"
+            with patch.dict(plugin.os.environ, {"TURBO_PARCEIRO_TRACE_FILE": str(trace)}), patch.object(plugin, "_session_platform", return_value="cli"):
+                plugin.call_partner_tool("station_status", {}, subject=self.subject,
+                    post=lambda _: (200, {"ok": True, "data": {"padding": "x" * 9000, "replyContract": contract}}))
+            entry = json.loads(trace.read_text(encoding="utf-8"))
+            self.assertEqual(entry["replyContract"], contract)
+            self.assertEqual(len(entry["result"]), 8000)
 
     def test_maps_server_refusals_to_plain_messages(self):
         result = plugin.call_partner_tool("partner_overview", {}, subject=self.subject, post=lambda body: (403, {"ok": False, "error": "disabled"}))

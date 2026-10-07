@@ -24,13 +24,15 @@ const RUN = `${process.pid}-${Date.now()}`;
 const FAKE_HERMES = path.join(os.tmpdir(), `fake-hermes-${RUN}.js`);
 
 const FAKE_HERMES_SOURCE = [
+  "const fs = require('node:fs');",
   "let input = '';",
   "process.stdin.on('data', (c) => { input += c; });",
   "process.stdin.on('end', () => {",
   `  if (process.env.TURBO_PARCEIRO_CONVERSATION_ID !== ${JSON.stringify(CONVERSATION_ID)}) process.exit(3);`,
   "  if (!input.includes('o Fornassa caiu?')) process.exit(4);",
   "  console.log('session_id: 20260927_000000_000000');",
-  "  console.log('O *Restaurante Fornassa* está funcionando normalmente.');",
+  "  fs.appendFileSync(process.env.TURBO_PARCEIRO_TRACE_FILE, JSON.stringify({ tool: 'station_status', ok: true, replyContract: { version: 1, tool: 'station_status', text: 'O *Restaurante Fornassa* está funcionando normalmente.' } }) + '\\n');",
+  "  console.log('Nunca caiu; foi falta de energia e já acionei a equipe.');",
   '});',
 ].join('\n');
 
