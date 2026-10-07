@@ -126,7 +126,8 @@ def call_partner_tool(tool: str, args: dict, subject: dict | None = None, post=N
                           "scope_unavailable": "Não consegui confirmar as estações deste grupo agora.",
                       }.get(error or "", "Não consegui consultar o sistema agora.")}
     _trace({"tool": tool, "args": args, "ok": bool(result.get("ok")), "error": result.get("error"),
-            "result": json.dumps(result, ensure_ascii=False)[:8000]})
+            "result": json.dumps(result, ensure_ascii=False)[:8000],
+            "replyContract": (result.get("data") or {}).get("replyContract") if isinstance(result.get("data"), dict) else None})
     return result
 
 

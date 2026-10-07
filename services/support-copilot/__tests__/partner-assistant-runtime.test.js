@@ -14,6 +14,7 @@ const {
   buildPrompt,
   claimPartnerAssistantMessage,
   cleanHermesOutput,
+  evidenceAnswer,
   deliverDuePartnerAssistantJobs,
   partnerAssistantPolicy,
   redact,
@@ -95,7 +96,7 @@ test('shadow mode proposes the reply for human review instead of sending it', as
   let sent = false;
 
   const result = await runPartnerAssistantJob(msg.messageId, {
-    askHermes: async () => ({ answer: 'O Restaurante Fornassa está funcionando normalmente.', tools: ['station_status'] }),
+    askHermes: async () => ({ answer: 'O Restaurante Fornassa está funcionando normalmente.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: { version: 1, tool: 'station_status', text: 'O Restaurante Fornassa está funcionando normalmente.' } }] }),
     sendText: async () => { sent = true; return { key: { id: 'x' } }; },
     request: async (url, init) => { requests.push({ url, body: JSON.parse(init.body), auth: init.headers.Authorization }); return okResponse({ ok: true, reviewId: 'review-1' }); },
   });
@@ -182,6 +183,25 @@ test('helpers strip CLI noise and personal data', () => {
 const PROMPT_FIXTURE = JSON.parse(fs.readFileSync(
   path.join(__dirname, '..', '..', '..', 'hermes', 'profiles', 'parceiro', 'eval', 'prompt_fixture.json'), 'utf8'));
 
+test('temporal replay keeps the question clock and excludes future context before limiting rows', () => {
+  const conversationId = 'conv_temporalreplay';
+  const insert = db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, sender_name, created_at)
+    VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, 'Parceiro', ?)`);
+  insert.run('clock-before', conversationId, 'Estação sem comunicação.', '2026-10-06T21:00:00.000Z');
+  for (let i = 0; i < 20; i++) insert.run(`clock-future-${i}`, conversationId, 'FUTURE_RETURN', `2026-10-07T00:18:${String(i).padStart(2, '0')}.000Z`);
+  const prompt = buildPrompt({ conversation_id: conversationId, message_id: 'clock-question' }, {
+    question: 'Já voltou?', receivedAt: '2026-10-06T22:18:00.000Z',
+  });
+  assert.match(prompt, /06\/10\/2026 19h18 \(Brasília\)/);
+  assert.match(prompt, /06\/10\/2026 18h00/);
+  assert.match(prompt, /Estação sem comunicação/);
+  assert.doesNotMatch(prompt, /FUTURE_RETURN/);
+});
+
+test('temporal replay rejects an invalid question clock rather than querying unbounded context', () => {
+  assert.throws(() => buildPrompt({ conversation_id: 'conv_temporalreplay' }, { question: 'Já voltou?', receivedAt: 'invalid' }), /invalid_question_clock/);
+});
+
 PROMPT_FIXTURE.cases.forEach((fixture, index) => {
   test(`prompt format matches the shared eval fixture: ${fixture.name}`, () => {
     const conversationId = `conv_promptfixture${index}`;
@@ -198,4 +218,77 @@ PROMPT_FIXTURE.cases.forEach((fixture, index) => {
 
     assert.equal(prompt, fixture.expected);
   });
+});
+
+const canonical = { version: 1, tool: 'station_status', text: 'Consulta atual: comunicação recente. Intervalo observado: 7h04. Causa e acionamento não comprovados.' };
+test('operational response uses the server contract and discards invented model claims', async () => {
+  const msg = input();
+  claimPartnerAssistantMessage(msg, config());
+  let proposed;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: 'Nunca caiu. Foi falta de energia. Já acionei a equipe.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] }),
+    request: async (_, init) => { proposed = JSON.parse(init.body); return okResponse({ reviewId: 'guard-review' }); },
+  });
+  assert.equal(result.status, 'review');
+  assert.equal(proposed.reply.answer, canonical.text);
+});
+test('status without a complete server contract fails closed without sending or retrying the model', async () => {
+  for (const contract of [undefined, { ...canonical, version: 2 }, { ...canonical, tool: 'station_usage' }, { ...canonical, text: '' }]) {
+    const msg = input(); claimPartnerAssistantMessage(msg, config({ autoSend: true }));
+    let effects = 0;
+    const result = await runPartnerAssistantJob(msg.messageId, {
+      askHermes: async () => ({ answer: 'Está normal.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: contract }] }),
+      sendText: async () => { effects++; }, request: async () => { effects++; },
+    });
+    assert.equal(result.status, 'failed'); assert.equal(result.error, 'evidence_contract_missing'); assert.equal(effects, 0);
+  }
+});
+test('conflicting status consultations fail closed instead of mixing evidence', async () => {
+  const msg = input(); claimPartnerAssistantMessage(msg, config({ autoSend: true }));
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: 'Normal.', tools: ['station_status'], trace: [
+      { tool: 'station_status', ok: true, replyContract: canonical },
+      { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 'Outro resultado.' } },
+    ] }),
+    sendText: async () => { assert.fail('must not send'); },
+  });
+  assert.equal(result.error, 'evidence_contract_conflict'); assert.equal(result.status, 'failed');
+});
+
+test('provider event time determines context order and window despite ingestion delay', () => {
+  const conversationId = 'conv_delayedcontext';
+  const insert = db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, sender_name, provider_timestamp, created_at) VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, 'Parceiro', ?, ?)`);
+  insert.run('event-before', conversationId, 'Earlier provider event', '2026-10-06T20:00:00Z', '2026-10-06T23:00:00Z');
+  insert.run('event-later', conversationId, 'Later provider event', '2026-10-06T21:00:00Z', '2026-10-06T20:00:00Z');
+  insert.run('event-future', conversationId, 'Future provider event', '2026-10-06T23:00:00Z', '2026-10-06T20:00:00Z');
+  insert.run('event-fallback', conversationId, 'Fallback ingestion time', 'invalid', '2026-10-06T21:30:00Z');
+  const prompt = buildPrompt({ conversation_id: conversationId, message_id: 'question' }, { question: 'Voltou?', receivedAt: '2026-10-06T22:18:00Z' });
+  assert.match(prompt, /17h00.*Earlier provider event/); assert.match(prompt, /18h00.*Later provider event/);
+  assert.ok(prompt.indexOf('Earlier provider event') < prompt.indexOf('Later provider event'));
+  assert.match(prompt, /18h30.*Fallback ingestion time/); assert.doesNotMatch(prompt, /Future provider event/);
+});
+test('mixed status and usage preserve both validated responses without model additions', async () => {
+  const msg = input({ body: 'Está online e quantas recargas teve hoje?' }); claimPartnerAssistantMessage(msg, config());
+  let answer;
+  const usage = { version: 1, tool: 'station_usage', text: 'Uso: 3 recargas encerradas.' };
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: '10 recargas e equipe acionada.', tools: ['station_status', 'station_usage'], trace: [{ tool: 'station_usage', ok: true, replyContract: usage }, { tool: 'station_status', ok: true, replyContract: canonical }] }),
+    request: async (_, init) => { answer = JSON.parse(init.body).reply.answer; return okResponse({ reviewId: 'mixed' }); },
+  });
+  assert.equal(result.status, 'review'); assert.equal(answer, canonical.text + '\n\n' + usage.text);
+});
+
+test('mixed unvalidated parts are explicit and oversized composition is blocked', () => {
+  const trace = [{ tool: 'station_status', ok: true, replyContract: canonical }];
+  const answer = evidenceAnswer({ answer: 'Equipe acionada.', tools: ['station_status', 'knowledge'], trace });
+  assert.match(answer, /precisam de revisão humana/); assert.ok(answer.startsWith(canonical.text)); assert.doesNotMatch(answer, /Equipe acionada/);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status', 'station_usage'], trace: [
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(2000) } },
+    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(2000) } },
+  ] }), /evidence_contract_oversized/);
+});
+
+test('mixed requested overview is explicitly unvalidated rather than silently dropped', () => {
+  const answer = evidenceAnswer({ answer: 'Texto livre misturando lista e status.', tools: ['partner_overview', 'station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] });
+  assert.ok(answer.startsWith(canonical.text)); assert.match(answer, /Outras partes da pergunta não foram validadas.*revisão humana/);
 });
