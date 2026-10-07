@@ -287,3 +287,8 @@ test('mixed unvalidated parts are explicit and oversized composition is blocked'
     { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(2000) } },
   ] }), /evidence_contract_oversized/);
 });
+
+test('mixed requested overview is explicitly unvalidated rather than silently dropped', () => {
+  const answer = evidenceAnswer({ answer: 'Texto livre misturando lista e status.', tools: ['partner_overview', 'station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] });
+  assert.ok(answer.startsWith(canonical.text)); assert.match(answer, /Outras partes da pergunta não foram validadas.*revisão humana/);
+});

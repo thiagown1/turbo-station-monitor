@@ -143,7 +143,7 @@ function evidenceAnswer(result) {
     byTool.set(call.tool, text);
   }
   const text = ['station_status', 'station_usage'].filter(tool => byTool.has(tool)).map(tool => byTool.get(tool)).join('\n\n');
-  const other = (result.tools || []).some(tool => !operational.has(tool) && !['partner_context', 'partner_overview'].includes(tool));
+  const other = (result.tools || []).some(tool => !operational.has(tool) && tool !== 'partner_context');
   const answer = text + (other ? '\n\nOutras partes da pergunta não foram validadas nesta resposta; precisam de revisão humana.' : '');
   if (answer.length > 3000) throw new Error('evidence_contract_oversized');
   return answer;
