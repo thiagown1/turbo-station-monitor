@@ -14,6 +14,7 @@ const {
   buildPrompt,
   claimPartnerAssistantMessage,
   cleanHermesOutput,
+  evidenceAnswer,
   deliverDuePartnerAssistantJobs,
   partnerAssistantPolicy,
   redact,
@@ -252,4 +253,37 @@ test('conflicting status consultations fail closed instead of mixing evidence', 
     sendText: async () => { assert.fail('must not send'); },
   });
   assert.equal(result.error, 'evidence_contract_conflict'); assert.equal(result.status, 'failed');
+});
+
+test('provider event time determines context order and window despite ingestion delay', () => {
+  const conversationId = 'conv_delayedcontext';
+  const insert = db.prepare(`INSERT INTO messages (id, conversation_id, brand_id, direction, source, body, sender_name, provider_timestamp, created_at) VALUES (?, ?, 'turbo_station', 'inbound', 'evolution', ?, 'Parceiro', ?, ?)`);
+  insert.run('event-before', conversationId, 'Earlier provider event', '2026-10-06T20:00:00Z', '2026-10-06T23:00:00Z');
+  insert.run('event-later', conversationId, 'Later provider event', '2026-10-06T21:00:00Z', '2026-10-06T20:00:00Z');
+  insert.run('event-future', conversationId, 'Future provider event', '2026-10-06T23:00:00Z', '2026-10-06T20:00:00Z');
+  insert.run('event-fallback', conversationId, 'Fallback ingestion time', 'invalid', '2026-10-06T21:30:00Z');
+  const prompt = buildPrompt({ conversation_id: conversationId, message_id: 'question' }, { question: 'Voltou?', receivedAt: '2026-10-06T22:18:00Z' });
+  assert.match(prompt, /17h00.*Earlier provider event/); assert.match(prompt, /18h00.*Later provider event/);
+  assert.ok(prompt.indexOf('Earlier provider event') < prompt.indexOf('Later provider event'));
+  assert.match(prompt, /18h30.*Fallback ingestion time/); assert.doesNotMatch(prompt, /Future provider event/);
+});
+test('mixed status and usage preserve both validated responses without model additions', async () => {
+  const msg = input({ body: 'Está online e quantas recargas teve hoje?' }); claimPartnerAssistantMessage(msg, config());
+  let answer;
+  const usage = { version: 1, tool: 'station_usage', text: 'Uso: 3 recargas encerradas.' };
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: '10 recargas e equipe acionada.', tools: ['station_status', 'station_usage'], trace: [{ tool: 'station_usage', ok: true, replyContract: usage }, { tool: 'station_status', ok: true, replyContract: canonical }] }),
+    request: async (_, init) => { answer = JSON.parse(init.body).reply.answer; return okResponse({ reviewId: 'mixed' }); },
+  });
+  assert.equal(result.status, 'review'); assert.equal(answer, canonical.text + '\n\n' + usage.text);
+});
+
+test('mixed unvalidated parts are explicit and oversized composition is blocked', () => {
+  const trace = [{ tool: 'station_status', ok: true, replyContract: canonical }];
+  const answer = evidenceAnswer({ answer: 'Equipe acionada.', tools: ['station_status', 'knowledge'], trace });
+  assert.match(answer, /precisam de revisão humana/); assert.ok(answer.startsWith(canonical.text)); assert.doesNotMatch(answer, /Equipe acionada/);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status', 'station_usage'], trace: [
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(2000) } },
+    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(2000) } },
+  ] }), /evidence_contract_oversized/);
 });

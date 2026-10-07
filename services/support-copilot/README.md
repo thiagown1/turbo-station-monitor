@@ -261,18 +261,18 @@ Schema and migrations run automatically on startup.
 
 ### Temporal evidence and status reply contract
 
-The question clock (`payload.receivedAt`, Brasília) is explicit. Recent messages are selected
+The question clock (`payload.receivedAt`, Brasília) is explicit. Recent messages use the provider event timestamp (valid `provider_timestamp`, ingestion `created_at` only as fallback) for windowing, ordering and display. They are selected
 inside `[receivedAt - 24h, receivedAt]` **before** the 15-message limit; a delayed job cannot
 import later group messages as context. Python evaluation uses the same frozen-clock fixture.
 The tool's `checkedAtBrasilia` is the current query time, not the question time. This does not
 reconstruct historical Firestore connector/session snapshots or reinterpret current tools as
 an as-of query. Calendar changes across delayed jobs still require separate period-aware evaluation.
 
-For `station_status`, the app emits `data.replyContract = { version: 1, tool: 'station_status', text }`.
+For `station_status` and `station_usage`, the app emits `data.replyContract = { version: 1, tool: 'station_status' | 'station_usage', text }`.
 The plugin writes that object separately to the trace, without the raw-result 8,000-character truncation.
-The runtime ignores generated prose and uses the server text. Missing/malformed/oversized (3,000)
+The runtime ignores generated prose and uses the server text. Mixed status/usage questions compose both contracts deterministically; other consulted tools get an explicit unvalidated-part notice instead of silently dropping them. Status text states that requests for action need human review and no action was executed. Missing/malformed/oversized (3,000)
 or conflicting contracts end the job as `failed`, without a send, proposal or another paid model attempt.
-A missing/invalid trace also fails closed. Other tools still produce model prose: this contract does
+A missing/invalid trace also fails closed. Other tools still produce model prose when consulted alone: this contract does
 not prove unrestricted answers about money, customers, knowledge or past days are correct.
 
 Dependency: release the matching Next contract before adopting this monitor/profile change;

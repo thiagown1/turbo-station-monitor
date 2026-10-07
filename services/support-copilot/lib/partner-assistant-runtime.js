@@ -94,14 +94,16 @@ function buildPrompt(job, payload) {
     }).formatToParts(new Date(value)).map(part => [part.type, part.value]));
     return `${parts.day}/${parts.month}/${parts.year} ${parts.hour}h${parts.minute}`;
   };
-  const rows = db.prepare(`SELECT id, direction, sender_name, body, created_at, external_message_id FROM messages
-      WHERE conversation_id = ? AND created_at >= ? AND created_at <= ? ORDER BY created_at DESC LIMIT ?`)
+  const rows = db.prepare(`SELECT id, direction, sender_name, body, external_message_id,
+      CASE WHEN julianday(provider_timestamp) IS NOT NULL THEN provider_timestamp ELSE created_at END AS event_at FROM messages
+      WHERE conversation_id = ? AND julianday(event_at) >= julianday(?) AND julianday(event_at) <= julianday(?)
+      ORDER BY julianday(event_at) DESC, id DESC LIMIT ?`)
     .all(job.conversation_id, since, receivedAt, CONTEXT_MESSAGES + 1)
     .filter((row) => row.external_message_id !== job.message_id)
     .slice(0, CONTEXT_MESSAGES)
     .reverse();
   const context = rows.map((row) => {
-    const at = formatTime(row.created_at);
+    const at = formatTime(row.event_at);
     const who = row.direction === 'outbound' ? 'Turbo Station' : (row.sender_name || 'Parceiro');
     const text = redact(String(row.body || '').replace(/^\[[^\]]*\]:\s*/, '')).slice(0, 500);
     return `[${at}] ${who}: ${text}`;
@@ -128,15 +130,23 @@ function cleanHermesOutput(stdout) {
 
 /** Status prose is untrusted: only the authenticated tool's complete contract may leave the runtime. */
 function evidenceAnswer(result) {
-  const calls = (result.trace || []).filter(call => call.tool === 'station_status');
-  if (!(result.tools || []).includes('station_status') && !calls.length) return result.answer;
-  const contracts = calls.filter(call => call.ok === true).map(call => call.replyContract);
-  if (!contracts.length || contracts.some(contract => !contract || contract.version !== 1
-      || contract.tool !== 'station_status' || typeof contract.text !== 'string'
-      || !contract.text.trim() || contract.text.length > 3000)) throw new Error('evidence_contract_missing');
-  const texts = [...new Set(contracts.map(contract => contract.text))];
-  if (texts.length !== 1 || calls.some(call => call.ok !== true)) throw new Error('evidence_contract_conflict');
-  return texts[0];
+  const operational = new Set(['station_status', 'station_usage']);
+  const calls = (result.trace || []).filter(call => operational.has(call.tool));
+  if (!(result.tools || []).some(tool => operational.has(tool)) && !calls.length) return result.answer;
+  if (!calls.length || calls.some(call => call.ok !== true || !call.replyContract || call.replyContract.version !== 1
+      || call.replyContract.tool !== call.tool || typeof call.replyContract.text !== 'string'
+      || !call.replyContract.text.trim() || call.replyContract.text.length > 3000)) throw new Error('evidence_contract_missing');
+  const byTool = new Map();
+  for (const call of calls) {
+    const text = call.replyContract.text;
+    if (byTool.has(call.tool) && byTool.get(call.tool) !== text) throw new Error('evidence_contract_conflict');
+    byTool.set(call.tool, text);
+  }
+  const text = ['station_status', 'station_usage'].filter(tool => byTool.has(tool)).map(tool => byTool.get(tool)).join('\n\n');
+  const other = (result.tools || []).some(tool => !operational.has(tool) && !['partner_context', 'partner_overview'].includes(tool));
+  const answer = text + (other ? '\n\nOutras partes da pergunta não foram validadas nesta resposta; precisam de revisão humana.' : '');
+  if (answer.length > 3000) throw new Error('evidence_contract_oversized');
+  return answer;
 }
 
 /** Runs `hermes -p parceiro chat -Q` with the prompt on stdin (no shell). */
