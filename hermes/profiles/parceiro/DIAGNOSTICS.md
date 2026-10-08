@@ -19,8 +19,10 @@ compartilhado pelo plugin e pelo monitor. Permite pedir estação/bico, referên
 ao erro anterior, o indicador que está alternando ou transcrição de áudio.
 Só erros de seleção de estação podem ser acompanhados dessa pergunta; falhas de
 acesso/provedor/evidência continuam bloqueadas. Não aceita texto livre do modelo.
-Em consultas operacionais, referências explícitas como "negócio", "mesmo erro" ou "aquele erro" recebem
-pergunta fixa mesmo se o modelo omitir a ferramenta; se mencionam alternância,
+Em consultas de status, referências a "mesmo erro", "aquele erro" ou "negócio"
+acompanhado de erro/falha/alternância recebem pergunta fixa mesmo se o modelo
+omitir a ferramenta. Uso, conhecimento e "negócio" isolado não disparam essa
+proteção. Se mencionam alternância,
 pergunta qual indicador muda. Essa proteção conservadora não resolve toda
 ambiguidade de linguagem nem substitui a consulta ao contexto autorizado.
 
