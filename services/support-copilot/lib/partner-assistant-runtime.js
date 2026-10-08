@@ -131,8 +131,10 @@ function cleanHermesOutput(stdout) {
 }
 
 function untranscribedAudio(question) {
-  const text = String(question || '').replace(/^\[[^\]]*\]:\s*/, '').trim();
-  if (text !== '[🎤 Áudio]') return null;
+  const text = String(question || '').trim();
+  // Generated display names may themselves contain brackets or newlines.
+  // Match the complete marker, allowing only its optional sender prefix.
+  if (!/^(?:\[[\s\S]*\]:\s*)?\[🎤 Áudio\]$/.test(text)) return null;
   return { answer: CLARIFICATIONS.audio, tools: ['clarification'], trace: [{ tool: 'clarification', args: { kind: 'audio' }, ok: true, replyContract: { version: 1, tool: 'clarification', text: CLARIFICATIONS.audio } }] };
 }
 

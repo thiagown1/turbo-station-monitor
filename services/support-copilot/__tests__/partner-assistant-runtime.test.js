@@ -15,6 +15,7 @@ const {
   claimPartnerAssistantMessage,
   cleanHermesOutput,
   evidenceAnswer,
+  untranscribedAudio,
   deliverDuePartnerAssistantJobs,
   partnerAssistantPolicy,
   redact,
@@ -288,6 +289,14 @@ test('mixed unvalidated parts are explicit and oversized composition is blocked'
   ] }), /evidence_contract_oversized/);
 });
 
+test('audio marker recognizes generated sender prefixes with nested brackets', () => {
+  for (const body of ['[🎤 Áudio]', '[Parceiro]: [🎤 Áudio]', '[Loja [Centro]]: [🎤 Áudio]', '[Loja\n[Centro]]: [🎤 Áudio]']) {
+    assert.equal(untranscribedAudio(body)?.answer, 'Não consegui transcrever o áudio. Pode mandar a pergunta por texto?');
+  }
+  assert.equal(untranscribedAudio('[Loja [Centro]]: Ouça [🎤 Áudio] e explique.'), null);
+  assert.equal(untranscribedAudio('Explique o código [🎤 Áudio]'), null);
+});
+
 test('status sections compose distinct stations and deduplicate repeated evidence', () => {
   const a = { ...canonical, text: 'A: bico 2, OtherError.', sections: [{ stationId: 'TESTA', text: 'A: bico 2, OtherError.' }] };
   const b = { ...canonical, text: 'B: reativação aceita.', sections: [{ stationId: 'TESTB', text: 'B: reativação aceita.' }] };
@@ -338,7 +347,7 @@ test('ambiguous references preserve a fixed clarification after validated connec
 });
 
 test('untranscribed audio requests text before calling Hermes and does not infer facts from earlier messages', async () => {
-  const msg = input({ body: '[Parceiro]: [🎤 Áudio]' });
+  const msg = input({ body: '[Loja [Centro]]: [🎤 Áudio]' });
   claimPartnerAssistantMessage(msg, config());
   let proposed;
   const result = await runPartnerAssistantJob(msg.messageId, {
