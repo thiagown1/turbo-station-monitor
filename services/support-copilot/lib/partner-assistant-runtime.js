@@ -31,6 +31,8 @@ const CONTEXT_WINDOW_MS = 24 * 60 * 60_000;
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 60_000;
 const PROCESSING_LEASE_MS = 5 * 60_000;
+const MAX_REPLY_CHARS = 8000;
+const CLARIFICATIONS = require('../../../hermes/profiles/parceiro/plugins/turbo-parceiro/clarifications.json');
 
 function baseUrl() { return String(process.env.AGENT_EVENT_BASE_URL || '').replace(/\/$/, ''); }
 function secret() { return process.env.PARTNER_AGENT_SECRET || ''; }
@@ -128,24 +130,62 @@ function cleanHermesOutput(stdout) {
     .trim();
 }
 
+function untranscribedAudio(question) {
+  const text = String(question || '').replace(/^\[[^\]]*\]:\s*/, '').trim();
+  if (text !== '[🎤 Áudio]') return null;
+  return { answer: CLARIFICATIONS.audio, tools: ['clarification'], trace: [{ tool: 'clarification', args: { kind: 'audio' }, ok: true, replyContract: { version: 1, tool: 'clarification', text: CLARIFICATIONS.audio } }] };
+}
+
 /** Status prose is untrusted: only the authenticated tool's complete contract may leave the runtime. */
 function evidenceAnswer(result) {
   const operational = new Set(['station_status', 'station_usage']);
-  const calls = (result.trace || []).filter(call => operational.has(call.tool));
-  if (!(result.tools || []).some(tool => operational.has(tool)) && !calls.length) return result.answer;
-  if (!calls.length || calls.some(call => call.ok !== true || !call.replyContract || call.replyContract.version !== 1
+  const clarifications = (result.trace || []).filter(call => call.tool === 'clarification');
+  if (clarifications.some(call => call.ok !== true || call.replyContract?.version !== 1
+      || call.replyContract.tool !== 'clarification' || !Object.hasOwn(CLARIFICATIONS, call.args?.kind || '')
+      || call.replyContract.text !== CLARIFICATIONS[call.args.kind])) throw new Error('evidence_contract_missing');
+  if ((result.tools || []).includes('clarification') && !clarifications.length) throw new Error('evidence_contract_missing');
+  const questions = [...new Set(clarifications.map(call => call.replyContract.text))];
+  const allCalls = (result.trace || []).filter(call => operational.has(call.tool));
+  if ((result.tools || []).some(tool => operational.has(tool)) && !allCalls.length) throw new Error('evidence_contract_missing');
+  const selectionErrors = new Set(['station_required', 'station_ambiguous', 'station_not_found']);
+  const calls = allCalls.filter(call => !(questions.length && call.ok === false && selectionErrors.has(call.error)));
+  if (!(result.tools || []).some(tool => operational.has(tool)) && !allCalls.length) return questions.length ? questions.join('\n') : result.answer;
+  if ((!calls.length && !questions.length) || calls.some(call => call.ok !== true || !call.replyContract || call.replyContract.version !== 1
       || call.replyContract.tool !== call.tool || typeof call.replyContract.text !== 'string'
-      || !call.replyContract.text.trim() || call.replyContract.text.length > 3000)) throw new Error('evidence_contract_missing');
+      || !call.replyContract.text.trim() || call.replyContract.text.length > MAX_REPLY_CHARS)) throw new Error('evidence_contract_missing');
   const byTool = new Map();
+  const byStation = new Map();
+  let statusFormat;
   for (const call of calls) {
     const text = call.replyContract.text;
+    if (call.tool === 'station_status') {
+      const sections = call.replyContract.sections;
+      const format = sections === undefined ? 'legacy' : 'stations';
+      if (statusFormat && statusFormat !== format) throw new Error('evidence_contract_conflict');
+      statusFormat = format;
+      if (format === 'stations') {
+        if (!Array.isArray(sections) || !sections.length || sections.length > 5) throw new Error('evidence_contract_missing');
+        const ids = new Set();
+        for (const section of sections) {
+          if (!section || typeof section.stationId !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(section.stationId)
+              || typeof section.text !== 'string' || !section.text.trim() || section.text.length > MAX_REPLY_CHARS
+              || ids.has(section.stationId)) throw new Error('evidence_contract_missing');
+          ids.add(section.stationId);
+          if (byStation.has(section.stationId) && byStation.get(section.stationId) !== section.text) throw new Error('evidence_contract_conflict');
+          byStation.set(section.stationId, section.text);
+        }
+        if (byStation.size > 5) throw new Error('evidence_contract_oversized');
+        continue;
+      }
+    }
     if (byTool.has(call.tool) && byTool.get(call.tool) !== text) throw new Error('evidence_contract_conflict');
     byTool.set(call.tool, text);
   }
+  if (byStation.size) byTool.set('station_status', [...byStation.values()].join('\n\n'));
   const text = ['station_status', 'station_usage'].filter(tool => byTool.has(tool)).map(tool => byTool.get(tool)).join('\n\n');
-  const other = (result.tools || []).some(tool => !operational.has(tool) && tool !== 'partner_context');
-  const answer = text + (other ? '\n\nOutras partes da pergunta não foram validadas nesta resposta; precisam de revisão humana.' : '');
-  if (answer.length > 3000) throw new Error('evidence_contract_oversized');
+  const other = (result.tools || []).some(tool => !operational.has(tool) && !['partner_context', 'clarification'].includes(tool));
+  const answer = [text, ...questions, ...(other ? ['Outras partes da pergunta não foram validadas nesta resposta; precisam de revisão humana.'] : [])].filter(Boolean).join('\n\n');
+  if (answer.length > MAX_REPLY_CHARS) throw new Error('evidence_contract_oversized');
   return answer;
 }
 
@@ -223,7 +263,8 @@ async function runPartnerAssistantJob(messageId, deps = {}) {
   const brandSubject = { brandId: job.brand_id, subject: { type: 'whatsapp_group', conversationId: job.conversation_id } };
   let delivered = false;
   try {
-    const result = await (deps.askHermes || askHermes)(buildPrompt(job, payload), job.conversation_id);
+    const prompt = buildPrompt(job, payload); // Validate the question clock even for an unsupported attachment.
+    const result = untranscribedAudio(payload.question) || await (deps.askHermes || askHermes)(prompt, job.conversation_id);
     const { tools } = result;
     const answer = evidenceAnswer(result);
     if (!answer) throw new Error('empty_answer');
@@ -295,4 +336,5 @@ module.exports = {
   partnerAssistantPolicy,
   redact,
   runPartnerAssistantJob,
+  untranscribedAudio,
 };

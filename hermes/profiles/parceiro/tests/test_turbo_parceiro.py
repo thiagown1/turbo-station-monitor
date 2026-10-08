@@ -193,6 +193,21 @@ class WhatsappFormatTest(unittest.TestCase):
         self.assertIsNone(plugin.whatsapp_format(""))
 
 
+class ClarificationTest(unittest.TestCase):
+    def test_fixed_question_is_traced_without_provider_or_app_calls(self):
+        with patch.object(plugin, '_trace') as trace, patch.object(plugin, '_post') as post:
+            result = json.loads(plugin.esclarecer({'tipo': 'alternancia'}))
+            self.assertTrue(result['ok'])
+            self.assertEqual(result['data']['replyContract']['text'], plugin.CLARIFICATIONS['alternancia'])
+            self.assertEqual(trace.call_args.args[0]['args'], {'kind': 'alternancia'})
+            post.assert_not_called()
+
+    def test_arbitrary_model_text_cannot_become_a_clarification(self):
+        result = json.loads(plugin.esclarecer({'tipo': 'Foi falta de energia?'}))
+        self.assertFalse(result['ok'])
+        self.assertIsNone(result['data']['replyContract'])
+
+
 class RegistrationTest(unittest.TestCase):
     def test_registers_only_read_only_tools_in_its_toolset(self):
         registered = []
@@ -209,7 +224,7 @@ class RegistrationTest(unittest.TestCase):
         plugin.register(Ctx())
         self.assertEqual(hooks, ["transform_llm_output"])
         names = {tool["name"] for tool in registered}
-        self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_resumo_dia", "parceiro_conhecimento"})
+        self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_resumo_dia", "parceiro_conhecimento", "parceiro_esclarecer"})
         self.assertTrue(all(tool["toolset"] == "turbo_parceiro" for tool in registered))
         for tool in registered:
             json.dumps(tool["schema"])  # schemas must be serializable

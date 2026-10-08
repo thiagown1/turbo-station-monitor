@@ -39,7 +39,14 @@ Quando um conector entra em falha, o carregador manda um "código de erro" técn
 | `PowerSwitchFailure` | Falha na chave/relé de potência |
 | `ReaderFailure` | Falha no leitor (RFID/cartão) |
 | `WeakSignal` | Sinal de rede fraco no carregador |
-| `NoError` | Não é um erro — indica que está tudo normal |
+| `NoError` | Nenhum erro padrão informado naquela notificação; não comprova ausência de problema físico |
+
+Os códigos proprietários (`vendorErrorCode`) são exibidos como recebidos. Sem
+documentação do fabricante, seu significado e a causa física ficam não
+confirmados. `Available` com `OtherError` continua sendo uma notificação de
+erro. Várias notificações iguais não provam vários incidentes independentes.
+Comandos `ChangeAvailability` aceitos ou agendados são distintos do estado
+observado: não identificam quem os solicitou nem comprovam desarme elétrico.
 
 Casos específicos já vistos na frota: **conector mal encaixado** (cabo não
 encaixado até travar — reencaixe, não é falha grave); **botão de emergência

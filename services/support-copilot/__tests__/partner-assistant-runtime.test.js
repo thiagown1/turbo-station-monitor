@@ -283,9 +283,47 @@ test('mixed unvalidated parts are explicit and oversized composition is blocked'
   const answer = evidenceAnswer({ answer: 'Equipe acionada.', tools: ['station_status', 'knowledge'], trace });
   assert.match(answer, /precisam de revisão humana/); assert.ok(answer.startsWith(canonical.text)); assert.doesNotMatch(answer, /Equipe acionada/);
   assert.throws(() => evidenceAnswer({ tools: ['station_status', 'station_usage'], trace: [
-    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(2000) } },
-    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(2000) } },
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(4500) } },
+    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(4500) } },
   ] }), /evidence_contract_oversized/);
+});
+
+test('status sections compose distinct stations and deduplicate repeated evidence', () => {
+  const a = { ...canonical, text: 'A: bico 2, OtherError.', sections: [{ stationId: 'TESTA', text: 'A: bico 2, OtherError.' }] };
+  const b = { ...canonical, text: 'B: reativação aceita.', sections: [{ stationId: 'TESTB', text: 'B: reativação aceita.' }] };
+  const trace = [a, b, a].map(replyContract => ({ tool: 'station_status', ok: true, replyContract }));
+  assert.equal(evidenceAnswer({ tools: ['station_status'], answer: 'Foi falta de energia.', trace }), a.text + '\n\n' + b.text);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [...trace, { tool: 'station_status', ok: true, replyContract: { ...a, sections: [{ stationId: 'TESTA', text: 'A: outro resultado.' }] } }] }), /evidence_contract_conflict/);
+});
+
+test('malformed or mixed legacy and station sections fail closed', () => {
+  for (const sections of [[], [{ stationId: '', text: 'x' }], [{ stationId: 'TESTA', text: '' }], [{ stationId: 'TESTA', text: 'a' }, { stationId: 'TESTA', text: 'a' }]]) {
+    assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: { ...canonical, sections } }] }), /evidence_contract_missing/);
+  }
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [
+    { tool: 'station_status', ok: true, replyContract: canonical },
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, sections: [{ stationId: 'TESTA', text: 'a' }] } },
+  ] }), /evidence_contract_conflict/);
+});
+
+test('ambiguous references preserve a fixed clarification after validated connector facts', () => {
+  const question = 'Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?';
+  const clarification = { tool: 'clarification', args: { kind: 'alternancia' }, ok: true, replyContract: { version: 1, tool: 'clarification', text: question } };
+  assert.equal(evidenceAnswer({ tools: ['station_status', 'clarification'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }, clarification] }), canonical.text + '\n\n' + question);
+  assert.equal(evidenceAnswer({ tools: ['clarification'], trace: [clarification], answer: 'Diagnóstico inventado.' }), question);
+  assert.throws(() => evidenceAnswer({ tools: ['clarification'], trace: [{ ...clarification, replyContract: { ...clarification.replyContract, text: 'Foi falta de energia?' } }] }), /evidence_contract_missing/);
+});
+
+test('untranscribed audio requests text before calling Hermes and does not infer facts from earlier messages', async () => {
+  const msg = input({ body: '[Parceiro]: [🎤 Áudio]' });
+  claimPartnerAssistantMessage(msg, config());
+  let proposed;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => { assert.fail('unsupported audio must not call the model'); },
+    request: async (_, init) => { proposed = JSON.parse(init.body); return okResponse({ reviewId: 'audio' }); },
+  });
+  assert.equal(result.status, 'review');
+  assert.equal(proposed.reply.answer, 'Não consegui transcrever o áudio. Pode mandar a pergunta por texto?');
 });
 
 test('mixed requested overview is explicitly unvalidated rather than silently dropped', () => {
