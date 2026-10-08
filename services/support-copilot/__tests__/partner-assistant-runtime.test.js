@@ -306,6 +306,28 @@ test('malformed or mixed legacy and station sections fail closed', () => {
   ] }), /evidence_contract_conflict/);
 });
 
+test('unresolved references request clarification even when Hermes omits that tool', () => {
+  const result = { answer: 'O mesmo erro continua.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] };
+  const question = 'Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?';
+  assert.equal(evidenceAnswer(result, 'O Teste B está com o mesmo erro de sempre, do negócio ficar alternando lá?'), canonical.text + '\n\n' + question);
+  assert.equal(evidenceAnswer(result, 'O negócio da estação está falhando?'), canonical.text + '\n\nA qual estação, bico e erro anterior você está se referindo?');
+  assert.equal(evidenceAnswer(result, 'O bico 2 alterna entre Available e Faulted?'), canonical.text);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [] }, 'O mesmo erro continua?'), /evidence_contract_missing/);
+});
+
+test('job supplies the original question to the mandatory clarification guard', async () => {
+  const msg = input({ body: '[Parceiro]: O Teste B está com o mesmo erro do negócio alternando?' });
+  claimPartnerAssistantMessage(msg, config());
+  let proposed;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: 'Equipe avisada.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] }),
+    request: async (_url, init) => { proposed = JSON.parse(init.body); return okResponse({ ok: true, reviewId: 'clarified-review' }); },
+  });
+  assert.equal(result.status, 'review');
+  assert.match(proposed.reply.answer, /Quando você fala em alternar/);
+  assert.doesNotMatch(proposed.reply.answer, /Equipe avisada/);
+});
+
 test('ambiguous references preserve a fixed clarification after validated connector facts', () => {
   const question = 'Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?';
   const clarification = { tool: 'clarification', args: { kind: 'alternancia' }, ok: true, replyContract: { version: 1, tool: 'clarification', text: question } };

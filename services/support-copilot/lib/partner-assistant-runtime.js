@@ -137,7 +137,7 @@ function untranscribedAudio(question) {
 }
 
 /** Status prose is untrusted: only the authenticated tool's complete contract may leave the runtime. */
-function evidenceAnswer(result) {
+function evidenceAnswer(result, question = '') {
   const operational = new Set(['station_status', 'station_usage']);
   const clarifications = (result.trace || []).filter(call => call.tool === 'clarification');
   if (clarifications.some(call => call.ok !== true || call.replyContract?.version !== 1
@@ -145,6 +145,12 @@ function evidenceAnswer(result) {
       || call.replyContract.text !== CLARIFICATIONS[call.args.kind])) throw new Error('evidence_contract_missing');
   if ((result.tools || []).includes('clarification') && !clarifications.length) throw new Error('evidence_contract_missing');
   const questions = [...new Set(clarifications.map(call => call.replyContract.text))];
+  // These explicit unresolved references remain ambiguous even after a status
+  // lookup. Never depend on the model remembering to call the clarification tool.
+  const reference = String(question).slice(0, 4000).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
+  if (!questions.length && /\b(?:negocio|mesmo erro|aquele erro)\b/.test(reference)) {
+    questions.push(/\baltern(?:ando|ar|a)\b/.test(reference) ? CLARIFICATIONS.alternancia : CLARIFICATIONS.referencia);
+  }
   const allCalls = (result.trace || []).filter(call => operational.has(call.tool));
   if ((result.tools || []).some(tool => operational.has(tool)) && !allCalls.length) throw new Error('evidence_contract_missing');
   const selectionErrors = new Set(['station_required', 'station_ambiguous', 'station_not_found']);
@@ -266,7 +272,7 @@ async function runPartnerAssistantJob(messageId, deps = {}) {
     const prompt = buildPrompt(job, payload); // Validate the question clock even for an unsupported attachment.
     const result = untranscribedAudio(payload.question) || await (deps.askHermes || askHermes)(prompt, job.conversation_id);
     const { tools } = result;
-    const answer = evidenceAnswer(result);
+    const answer = evidenceAnswer(result, payload.question);
     if (!answer) throw new Error('empty_answer');
 
     if (job.auto_send) {
