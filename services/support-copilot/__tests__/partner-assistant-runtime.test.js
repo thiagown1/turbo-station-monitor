@@ -312,6 +312,7 @@ test('unresolved references request clarification even when Hermes omits that to
   assert.equal(evidenceAnswer(result, 'O Teste B está com o mesmo erro de sempre, do negócio ficar alternando lá?'), canonical.text + '\n\n' + question);
   assert.equal(evidenceAnswer(result, 'O negócio da estação está falhando?'), canonical.text + '\n\nA qual estação, bico e erro anterior você está se referindo?');
   assert.equal(evidenceAnswer(result, 'O bico 2 alterna entre Available e Faulted?'), canonical.text);
+  assert.equal(evidenceAnswer({ answer: 'Consulte o guia de parceria.', tools: ['knowledge'], trace: [{ tool: 'knowledge', ok: true }] }, 'Como funciona o negócio de recarga?'), 'Consulte o guia de parceria.');
   assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [] }, 'O mesmo erro continua?'), /evidence_contract_missing/);
 });
 

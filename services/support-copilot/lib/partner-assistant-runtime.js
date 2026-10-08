@@ -148,7 +148,9 @@ function evidenceAnswer(result, question = '') {
   // These explicit unresolved references remain ambiguous even after a status
   // lookup. Never depend on the model remembering to call the clarification tool.
   const reference = String(question).slice(0, 4000).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
-  if (!questions.length && /\b(?:negocio|mesmo erro|aquele erro)\b/.test(reference)) {
+  const consultedOperational = (result.tools || []).some(tool => operational.has(tool))
+    || (result.trace || []).some(call => operational.has(call.tool));
+  if (consultedOperational && !questions.length && /\b(?:negocio|mesmo erro|aquele erro)\b/.test(reference)) {
     questions.push(/\baltern(?:ando|ar|a)\b/.test(reference) ? CLARIFICATIONS.alternancia : CLARIFICATIONS.referencia);
   }
   const allCalls = (result.trace || []).filter(call => operational.has(call.tool));

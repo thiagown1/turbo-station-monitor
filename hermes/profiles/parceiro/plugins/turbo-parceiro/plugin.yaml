@@ -8,5 +8,6 @@ provides_tools:
   - parceiro_uso
   - parceiro_resumo_dia
   - parceiro_conhecimento
+  - parceiro_esclarecer
 provides_hooks:
   - transform_llm_output

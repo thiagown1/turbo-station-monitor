@@ -224,6 +224,10 @@ class RegistrationTest(unittest.TestCase):
         plugin.register(Ctx())
         self.assertEqual(hooks, ["transform_llm_output"])
         names = {tool["name"] for tool in registered}
+        manifest = PLUGIN.with_name('plugin.yaml').read_text(encoding='utf-8')
+        tool_block = manifest.split('provides_tools:\n', 1)[1].split('\nprovides_hooks:', 1)[0]
+        declared = {line.strip()[2:] for line in tool_block.splitlines() if line.strip().startswith('- ')}
+        self.assertEqual(names, declared, 'Plugin manifest must declare every registered tool')
         self.assertEqual(names, {"parceiro_contexto", "parceiro_estacoes", "parceiro_status_estacao", "parceiro_uso", "parceiro_resumo_dia", "parceiro_conhecimento", "parceiro_esclarecer"})
         self.assertTrue(all(tool["toolset"] == "turbo_parceiro" for tool in registered))
         for tool in registered:
