@@ -15,6 +15,7 @@ const {
   claimPartnerAssistantMessage,
   cleanHermesOutput,
   evidenceAnswer,
+  untranscribedAudio,
   deliverDuePartnerAssistantJobs,
   partnerAssistantPolicy,
   redact,
@@ -283,9 +284,81 @@ test('mixed unvalidated parts are explicit and oversized composition is blocked'
   const answer = evidenceAnswer({ answer: 'Equipe acionada.', tools: ['station_status', 'knowledge'], trace });
   assert.match(answer, /precisam de revisão humana/); assert.ok(answer.startsWith(canonical.text)); assert.doesNotMatch(answer, /Equipe acionada/);
   assert.throws(() => evidenceAnswer({ tools: ['station_status', 'station_usage'], trace: [
-    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(2000) } },
-    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(2000) } },
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, text: 's'.repeat(4500) } },
+    { tool: 'station_usage', ok: true, replyContract: { version: 1, tool: 'station_usage', text: 'u'.repeat(4500) } },
   ] }), /evidence_contract_oversized/);
+});
+
+test('audio marker recognizes generated sender prefixes with nested brackets', () => {
+  for (const body of ['[🎤 Áudio]', '[Parceiro]: [🎤 Áudio]', '[Loja [Centro]]: [🎤 Áudio]', '[Loja\n[Centro]]: [🎤 Áudio]']) {
+    assert.equal(untranscribedAudio(body)?.answer, 'Não consegui transcrever o áudio. Pode mandar a pergunta por texto?');
+  }
+  assert.equal(untranscribedAudio('[Loja [Centro]]: Ouça [🎤 Áudio] e explique.'), null);
+  assert.equal(untranscribedAudio('Explique o código [🎤 Áudio]'), null);
+});
+
+test('status sections compose distinct stations and deduplicate repeated evidence', () => {
+  const a = { ...canonical, text: 'A: bico 2, OtherError.', sections: [{ stationId: 'TESTA', text: 'A: bico 2, OtherError.' }] };
+  const b = { ...canonical, text: 'B: reativação aceita.', sections: [{ stationId: 'TESTB', text: 'B: reativação aceita.' }] };
+  const trace = [a, b, a].map(replyContract => ({ tool: 'station_status', ok: true, replyContract }));
+  assert.equal(evidenceAnswer({ tools: ['station_status'], answer: 'Foi falta de energia.', trace }), a.text + '\n\n' + b.text);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [...trace, { tool: 'station_status', ok: true, replyContract: { ...a, sections: [{ stationId: 'TESTA', text: 'A: outro resultado.' }] } }] }), /evidence_contract_conflict/);
+});
+
+test('malformed or mixed legacy and station sections fail closed', () => {
+  for (const sections of [[], [{ stationId: '', text: 'x' }], [{ stationId: 'TESTA', text: '' }], [{ stationId: 'TESTA', text: 'a' }, { stationId: 'TESTA', text: 'a' }]]) {
+    assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: { ...canonical, sections } }] }), /evidence_contract_missing/);
+  }
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [
+    { tool: 'station_status', ok: true, replyContract: canonical },
+    { tool: 'station_status', ok: true, replyContract: { ...canonical, sections: [{ stationId: 'TESTA', text: 'a' }] } },
+  ] }), /evidence_contract_conflict/);
+});
+
+test('unresolved references request clarification even when Hermes omits that tool', () => {
+  const result = { answer: 'O mesmo erro continua.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] };
+  const question = 'Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?';
+  assert.equal(evidenceAnswer(result, 'O Teste B está com o mesmo erro de sempre, do negócio ficar alternando lá?'), canonical.text + '\n\n' + question);
+  assert.equal(evidenceAnswer(result, 'O negócio da estação está falhando?'), canonical.text + '\n\nA qual estação, bico e erro anterior você está se referindo?');
+  assert.equal(evidenceAnswer(result, 'O bico 2 alterna entre Available e Faulted?'), canonical.text);
+  assert.equal(evidenceAnswer({ answer: 'Consulte o guia de parceria.', tools: ['knowledge'], trace: [{ tool: 'knowledge', ok: true }] }, 'Como funciona o negócio de recarga?'), 'Consulte o guia de parceria.');
+  const usage = { version: 1, tool: 'station_usage', text: 'Hoje: 32 recargas.' };
+  assert.equal(evidenceAnswer({ tools: ['station_usage'], trace: [{ tool: 'station_usage', ok: true, replyContract: usage }] }, 'Quantas recargas esse negócio fez hoje?'), usage.text);
+  assert.equal(evidenceAnswer(result, 'Esse negócio está online?'), canonical.text);
+  assert.throws(() => evidenceAnswer({ tools: ['station_status'], trace: [] }, 'O mesmo erro continua?'), /evidence_contract_missing/);
+});
+
+test('job supplies the original question to the mandatory clarification guard', async () => {
+  const msg = input({ body: '[Parceiro]: O Teste B está com o mesmo erro do negócio alternando?' });
+  claimPartnerAssistantMessage(msg, config());
+  let proposed;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => ({ answer: 'Equipe avisada.', tools: ['station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] }),
+    request: async (_url, init) => { proposed = JSON.parse(init.body); return okResponse({ ok: true, reviewId: 'clarified-review' }); },
+  });
+  assert.equal(result.status, 'review');
+  assert.match(proposed.reply.answer, /Quando você fala em alternar/);
+  assert.doesNotMatch(proposed.reply.answer, /Equipe avisada/);
+});
+
+test('ambiguous references preserve a fixed clarification after validated connector facts', () => {
+  const question = 'Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?';
+  const clarification = { tool: 'clarification', args: { kind: 'alternancia' }, ok: true, replyContract: { version: 1, tool: 'clarification', text: question } };
+  assert.equal(evidenceAnswer({ tools: ['station_status', 'clarification'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }, clarification] }), canonical.text + '\n\n' + question);
+  assert.equal(evidenceAnswer({ tools: ['clarification'], trace: [clarification], answer: 'Diagnóstico inventado.' }), question);
+  assert.throws(() => evidenceAnswer({ tools: ['clarification'], trace: [{ ...clarification, replyContract: { ...clarification.replyContract, text: 'Foi falta de energia?' } }] }), /evidence_contract_missing/);
+});
+
+test('untranscribed audio requests text before calling Hermes and does not infer facts from earlier messages', async () => {
+  const msg = input({ body: '[Loja [Centro]]: [🎤 Áudio]' });
+  claimPartnerAssistantMessage(msg, config());
+  let proposed;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => { assert.fail('unsupported audio must not call the model'); },
+    request: async (_, init) => { proposed = JSON.parse(init.body); return okResponse({ reviewId: 'audio' }); },
+  });
+  assert.equal(result.status, 'review');
+  assert.equal(proposed.reply.answer, 'Não consegui transcrever o áudio. Pode mandar a pergunta por texto?');
 });
 
 test('mixed requested overview is explicitly unvalidated rather than silently dropped', () => {

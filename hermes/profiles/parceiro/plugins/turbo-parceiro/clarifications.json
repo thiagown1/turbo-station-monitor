@@ -1,0 +1,6 @@
+{
+  "estacao": "Qual estação e qual bico você quer consultar?",
+  "referencia": "A qual estação, bico e erro anterior você está se referindo?",
+  "alternancia": "Quando você fala em alternar ou mudar, o que muda: o estado do bico, o código de erro ou outro indicador?",
+  "audio": "Não consegui transcrever o áudio. Pode mandar a pergunta por texto?"
+}

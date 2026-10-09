@@ -33,6 +33,7 @@ TIMEOUT = 90
 BRAND_ID = "turbo_station"
 CLI_PLATFORMS = {"", "cli"}
 USAGE_PERIODS = ["today", "yesterday", "last_7_days", "last_30_days", "this_month", "last_month"]
+CLARIFICATIONS = json.loads(Path(__file__).with_name("clarifications.json").read_text(encoding="utf-8"))
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,14 @@ def resumo_dia(args: dict | None = None, **_) -> str:
     return _dump(call_partner_tool("station_day_summary", {"station": station} if station else {}))
 
 
+def esclarecer(args: dict | None = None, **_) -> str:
+    kind = (args or {}).get("tipo")
+    text = CLARIFICATIONS.get(kind) if isinstance(kind, str) else None
+    contract = {"version": 1, "tool": "clarification", "text": text} if text else None
+    _trace({"tool": "clarification", "args": {"kind": kind}, "ok": bool(text), "replyContract": contract})
+    return _dump({"ok": bool(text), "data": {"replyContract": contract}, "error": None if text else "invalid_clarification"})
+
+
 # ---------------------------------------------------------------------------
 # Knowledge base (RAG): BM25 over Markdown sections
 # ---------------------------------------------------------------------------
@@ -277,7 +286,7 @@ ESTACOES_SCHEMA = {
 }
 STATUS_SCHEMA = {
     "name": "parceiro_status_estacao",
-    "description": "Situação atual das estações do parceiro: saúde, comunicação, conectores, recargas em andamento e falhas das últimas 24h. Com o nome/ID consulta uma; vazio consulta todas as do grupo de uma vez (até 5).",
+    "description": "Situação das estações: estado e códigos de cada bico, comunicação, recargas em andamento (kWh/kW), códigos e cronologia das últimas 24h, comandos de disponibilidade e tentativas de início quando autorizados. Códigos proprietários não têm diagnóstico confirmado. Com nome/ID consulta uma; vazio consulta todas do grupo (até 5).",
     "parameters": {"type": "object", "properties": {
         "estacao": {"type": "string", "description": "Nome (ou parte) ou ID da estação, como o parceiro escreveu. Vazio = todas."},
     }},
@@ -305,6 +314,12 @@ CONHECIMENTO_SCHEMA = {
     }, "required": ["pergunta"]},
 }
 
+ESCLARECER_SCHEMA = {
+    "name": "parceiro_esclarecer",
+    "description": "Pergunta curta e fixa quando faltam estação/bico, referência ao erro anterior, significado de 'alternando' ou transcrição de áudio. Depois de consultar os fatos identificáveis, use para pedir o detalhe que falta; não invente o que o parceiro quis dizer.",
+    "parameters": {"type": "object", "properties": {"tipo": {"type": "string", "enum": list(CLARIFICATIONS)}}, "required": ["tipo"], "additionalProperties": False},
+}
+
 _TOOLS = [
     (CONTEXTO_SCHEMA, contexto, "🗂"),
     (ESTACOES_SCHEMA, estacoes, "\U0001f50c"),
@@ -312,6 +327,7 @@ _TOOLS = [
     (USO_SCHEMA, uso, "\U0001f4ca"),
     (RESUMO_DIA_SCHEMA, resumo_dia, "\U0001f4c8"),
     (CONHECIMENTO_SCHEMA, conhecimento, "\U0001f4da"),
+    (ESCLARECER_SCHEMA, esclarecer, "❓"),
 ]
 
 
