@@ -60,7 +60,7 @@
  * Vercel dashboard config (human step)
  *   Team Settings → Webhooks → Create Webhook
  *     URL:      https://logs.turbostation.com.br/vercel-deploy-hook
- *     Events:   deployment.promoted, deployment.error  (optionally deployment.succeeded)
+ *     Events:   deployment.promoted, deployment.error  (deployment.succeeded is received but never relayed)
  *     Project:  Turbo Station (prj_dptfUFsPBJ9yg0xVC9Ga05I0eU5m) — scope to this project
  *   Copy the generated signing secret into VERCEL_WEBHOOK_SECRET in the skill .env,
  *   then: pm2 restart vercel-deploy-hook --update-env
@@ -441,6 +441,14 @@ async function startDeployWatch(e) {
 
 // ─── Relay both channels (after the 200, never blocks the response) ──
 async function relay(e) {
+  // A finished build is not a deploy. The Prepare workflow builds the release candidate with
+  // --skip-domain, so `deployment.succeeded` fires for builds that never serve traffic (and again
+  // for every re-prepare). Receive the event, never announce it: the team only hears about a
+  // deploy on `deployment.promoted` (or a failure on `deployment.error`).
+  if (e.type === 'deployment.succeeded') {
+    log(`deployment.succeeded sha=${e.sha7} target=${e.target} received, not relayed to WhatsApp`);
+    return;
+  }
   let text = formatMessage(e);
   // On a PRODUCTION promotion, append a diff-derived manual smoke checklist.
   // Never blocks the 200 (relay runs in setImmediate) and never throws into it.
