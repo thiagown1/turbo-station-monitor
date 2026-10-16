@@ -14,6 +14,7 @@
  * Asserts:
  *   1. promoted + no target   -> POSTs /api/deploy-watch/start with the real sha
  *   2. succeeded + production -> does NOT post (would double-open the window)
+ *      and is NEVER relayed to WhatsApp (a candidate build is not a deploy)
  *   3. promoted + preview     -> does NOT post
  *   4. promoted + junk sha    -> does NOT post (the 2026-07-21 phantom-watch guard)
  */
@@ -130,9 +131,13 @@ function check(name, cond, detail) {
 
     console.log('\n2) deployment.succeeded, target=production (nao deve reabrir)');
     received.length = 0;
+    const outBeforeSucceeded = out.join('').length;
     await post(hookPort, payload('deployment.succeeded', 'production', SHA));
     await sleep(1500);
     check('nao abriu watch', received.length === 0, `recebeu ${received.length}`);
+    const afterSucceeded = out.join('').slice(outBeforeSucceeded);
+    check('nao mandou WhatsApp (nem dry-run) do build concluido', !afterSucceeded.includes('WOULD POST') && !afterSucceeded.includes('Build concluído'), afterSucceeded.slice(-300));
+    check('registrou que recebeu e nao enviou', afterSucceeded.includes('deployment.succeeded') && afterSucceeded.includes('not relayed'), afterSucceeded.slice(-300));
 
     console.log('\n3) deployment.promoted, target=preview');
     received.length = 0;
