@@ -133,3 +133,8 @@ test('the window is overridable, which is how a one-off shrink is run', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('cleanup worker keeps the three-day production override', () => {
+  const worker = require('../ecosystem.config').apps.find(app => app.name === 'cleanup-vercel-db');
+  assert.equal(worker.env.VERCEL_RETENTION_DAYS, '3');
+});
