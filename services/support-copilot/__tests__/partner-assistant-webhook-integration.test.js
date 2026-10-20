@@ -44,14 +44,20 @@ const FAKE_HERMES_SOURCE = [
       // Without a structured mention the partner assistant stays silent.
       { id: 'quiet', conversationId: CONVERSATION_ID, question: 'o Fornassa caiu?', mention: false, sender: 'Leonardo' },
       { id: 'mentioned', conversationId: CONVERSATION_ID, question: 'o Fornassa caiu?', sender: 'Leonardo' },
-    ], { hermesBin: FAKE_HERMES });
+    ], { hermesBin: FAKE_HERMES, triageMode: 'shadow' });
 
     const quiet = await sim.run('quiet');
     assert.equal(quiet.claimed, false);
+    assert.equal(sim.captured.triages.length, 1);
+    assert.equal(sim.captured.triages[0].message.messageId, quiet.messageId);
+    assert.equal(sim.jobFor(quiet.messageId), undefined);
+    assert.equal((await sim.replay('quiet')).duplicate, true);
+    assert.equal(sim.captured.triages.length, 1);
 
     const mentioned = await sim.run('mentioned');
     assert.equal(mentioned.claimed, true);
     assert.equal(sim.captured.proposals.length, 1);
+    assert.equal(sim.captured.triages.length, 1, 'the structured mention must not be triaged');
     const [proposal] = sim.captured.proposals;
     assert.equal(proposal.action, 'propose_reply');
     assert.deepEqual(proposal.subject, { type: 'whatsapp_group', conversationId: CONVERSATION_ID });

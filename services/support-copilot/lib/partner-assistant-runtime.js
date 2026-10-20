@@ -46,6 +46,7 @@ function partnerAssistantPolicy(config, conversationId) {
   if (!policy.allowedConversationIds.includes(conversationId)) return null;
   return {
     autoSend: policy.autoSend === true,
+    triageMode: ['shadow', 'active'].includes(policy.triageMode) ? policy.triageMode : 'off',
     mentionJids: Array.isArray(policy.mentionJids) ? policy.mentionJids : [],
   };
 }
