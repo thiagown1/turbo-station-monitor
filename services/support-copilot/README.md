@@ -156,6 +156,10 @@ JIDs trigger it and whether replies go out directly (`autoSend`, off by default)
   its current version (`read_profiles`, so team edits are kept) and writes it with
   `upsert_profile` (versioned and audited by the app). A failed group keeps its
   watermark and is retried the next day; output is validated and PII-redacted.
+  Dashboard input contains only `askedBy`, a short numeric-redacted `question`
+  and `at`; answers are ignored even if an older API still includes them, to
+  preserve the group's capability boundary. Requires the Next question-only
+  memory contract (turbo_station #2248) before activation.
 
 ### Simulating a partner message without WhatsApp
 
