@@ -201,7 +201,7 @@ function webhookPayload(scenario, messageId) {
  * cached by the service for a minute, so it is derived from the whole list up front).
  *
  * @param {object[]} rawScenarios `{ id, conversationId, groupJid?, question, context?, mention?, allowed?, autoSend?, sender? }`
- * @param {{ hermesBin?: string, timeoutMs?: number, settleMs?: number, parentEnv?: object }} [options]
+ * @param {{ hermesBin?: string, timeoutMs?: number, settleMs?: number, parentEnv?: object, triageMode?: string, triageHandler?: function }} [options]
  */
 async function startSimulator(rawScenarios, options = {}) {
   const scenarios = normalizeScenarios(rawScenarios);
@@ -213,7 +213,8 @@ async function startSimulator(rawScenarios, options = {}) {
   const dbPath = path.join(workDir, 'support-copilot.sqlite');
   const mediaDir = path.join(workDir, 'media');
   const config = buildCentralConfig(scenarios);
-  const captured = { proposals: [], interactions: [], investigations: 0, gatewaySends: [], unexpected: [] };
+  config.partnerAssistant.triageMode = options.triageMode || 'off';
+  const captured = { proposals: [], interactions: [], triages: [], investigations: 0, gatewaySends: [], unexpected: [] };
   let sequence = 0;
   let child;
   let childOutput = '';
@@ -235,6 +236,13 @@ async function startSimulator(rawScenarios, options = {}) {
         captured.interactions.push(body);
         return reply(res, 200, { ok: true });
       }
+    }
+    if (req.method === 'POST' && req.url === '/api/agents/partner-triage') {
+      if (req.headers.authorization !== `Bearer ${PARTNER_SECRET}`) return reply(res, 401, { error: 'unauthorized' });
+      captured.triages.push(body);
+      if (options.triageHandler) return options.triageHandler(req, res, body);
+      return reply(res, 200, { ok: true, mode: config.partnerAssistant.triageMode,
+        decision: 'answer', act: true, intent: 'how_it_works', confidence: 0.9, reason: 'simulated' });
     }
     if (req.method === 'POST' && req.url === '/api/agents/station-investigations') {
       captured.investigations += 1;

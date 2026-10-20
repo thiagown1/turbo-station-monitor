@@ -651,6 +651,18 @@ try {
   console.warn(`${LOG_TAG} partner assistant migration:`, err.message);
 }
 
+// Shadow triage: durable at-most-once reservation, separate from reply jobs.
+try {
+  db.exec(`CREATE TABLE IF NOT EXISTS partner_assistant_triage (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    brand_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )`);
+} catch (err) {
+  console.warn(`${LOG_TAG} partner triage migration:`, err.message);
+}
+
 // Daily partner profile job: per-group watermark and one row per Brasília day.
 try {
   db.exec(`

@@ -149,6 +149,27 @@ JIDs trigger it and whether replies go out directly (`autoSend`, off by default)
 - A message the partner assistant owns is never handed to the station
   investigator, including provider replays. Failures retry up to 3 times through
   the agent-router worker sweep.
+- **Unmentioned-message triage (shadow only):** the ingest uses the existing
+  `GET /api/agents/config` response and the same partner-assistant policy
+  (global/agent switches and conversation allowlist). `partnerAssistant.triageMode`
+  missing, `off` or unknown skips the call. `shadow` schedules one background
+  `POST /api/agents/partner-triage`, authenticated with `PARTNER_AGENT_SECRET`,
+  with an 8-second timeout. Outbound messages, structured mentions, missing
+  provider message ids and messages already owned by the mention assistant
+  are excluded. Text is redacted and
+  limited to 2,000 characters; no recent context is sent in this version.
+  HTTP/network/JSON failures never propagate into ingest or trigger retries.
+  A separate SQLite `partner_assistant_triage` reservation, committed before HTTP,
+  dedupes message ids across replays/restarts without creating reply jobs/reviews.
+  Reservations contain ids/time only and are retained to preserve dedupe;
+  a crash after reservation may lose a shadow sample rather than pay again.
+  Local success logs contain only ids, decision, intent and confidence.
+  **`active` is also shadow in this release, even when the route returns `act:true`
+  or `autoSend` is enabled:** this path never calls Hermes, replies or forwards.
+  Existing downstream routing is unchanged. Actual active triage still needs a
+  separate implementation with reply/forward gates, validation against human
+  labels and an explicitly authorized release/activation. Rollback: set
+  `triageMode=off` (the shared config cache lasts up to 60 seconds).
 - **Daily profile** (`lib/partner-profile-job.js`, off unless
   `PARTNER_PROFILE_JOB_ENABLED=true`): once per Brasília day after 03:00, for
   every group with a partner link, reads only the messages since the last run,

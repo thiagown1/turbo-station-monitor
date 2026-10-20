@@ -44,6 +44,7 @@ const { emitEvent } = require('../lib/sse');
 const { extractWhatsappMessageContext } = require('../lib/whatsapp-message-context');
 const { prepareStationInvestigation, routeStationInvestigation } = require('../lib/station-investigator-runtime');
 const { claimPartnerAssistantMessage, partnerAssistantOwns, runPartnerAssistantJob } = require('../lib/partner-assistant-runtime');
+const { schedulePartnerTriage } = require('../lib/partner-assistant-triage');
 const {
   handleFinancialApprovalReply,
   sendFinancialApprovalAcknowledgement,
@@ -615,6 +616,12 @@ router.post('/', async (req, res) => {
         return res.status(503).json({ error: 'fresh_agent_config_required' });
       }
       contadorEvent.accountingGroup = accountingGroupFromConfig(sharedAgentConfig, conversationId);
+      if (sharedAgentConfig && !sharedAgentConfigError) {
+        // Observation only, independent of downstream routing; never await triage.
+        schedulePartnerTriage({
+          messageId: externalMessageId, conversationId, brandId, direction, body, whatsappContext,
+        }, sharedAgentConfig);
+      }
       if (quotedContadorReply) {
         // Resolve authenticated Contador continuations before the stateful
         // station preflight so they cannot reserve station quota or ownership.
