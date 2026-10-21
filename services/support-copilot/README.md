@@ -43,6 +43,14 @@ WhatsApp → whatsapp-gateway/Baileys (:3006) → webhook → support-copilot (:
 
 ## WhatsApp / Baileys integration
 
+Inbound group replays can enrich a previously stored bare `[unknown]` or
+`[messageType]` fallback after a session reset. The adapter repairs its body,
+raw text and structured mention/quote metadata in a SQLite transaction before
+duplicate recovery routing. Real stored content is immutable on replay;
+placeholder-only replays leave the row unchanged. Metadata-only replays can
+recover structured mentions while awaiting text. Existing assistant ownership,
+review and send gates still apply.
+
 ### Flow
 
 ```

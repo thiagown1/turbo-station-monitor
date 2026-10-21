@@ -596,6 +596,108 @@ function quotedContadorPayload(messageId, quotedMessageId, groupJid = GROUP_JID)
     crashGapProbe.close();
     assert.equal(crashGapJobCount, 1, 'duplicate acknowledgement must follow the durable recovery enqueue');
 
+    // Session-reset delivery: an empty event precedes the decrypted duplicate.
+    const postDuplicate = async (payload, expectedStatus = 200) => {
+      const response = await fetch(`http://127.0.0.1:${supportPort}/api/support/ingest/evolution`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-webhook-secret': WEBHOOK_SECRET },
+        body: JSON.stringify(payload),
+      });
+      assert.equal(response.status, expectedStatus);
+      return response.json();
+    };
+    const readStored = (id) => {
+      const probe = new Database(DB_PATH, { readonly: true });
+      try { return probe.prepare('SELECT * FROM messages WHERE external_message_id = ?').get(id); }
+      finally { probe.close(); }
+    };
+    for (const type of [undefined, 'extendedTextMessage']) {
+      const id = `${MESSAGE_ID}-placeholder-${type || 'unknown'}`;
+      const empty = webhookPayload(id, false);
+      empty.data.messageType = type;
+      empty.data.message = {};
+      await postDuplicate(empty, 201);
+      const placeholder = readStored(id);
+      assert.equal(placeholder.body, `[Luan]: [${type || 'unknown'}]`);
+      assert.equal((await postDuplicate(empty)).duplicate, true);
+      assert.deepEqual(readStored(id), placeholder, 'placeholder replay must not mutate the message');
+
+      const hydrated = webhookPayload(id);
+      hydrated.data.message.extendedTextMessage.contextInfo = {
+        mentionedJid: [BOT_JID], stanzaId: 'quoted-partner-message',
+        participant: 'quoted-partner@s.whatsapp.net', isForwarded: true, forwardingScore: 1,
+      };
+      const beforeCalls = investigationCount;
+      assert.equal((await postDuplicate(hydrated)).duplicate, true);
+      const repaired = readStored(id);
+      assert.equal(repaired.id, placeholder.id);
+      assert.equal(repaired.body, '[Luan]: @Turbo Station Suporte Habibs desarmou de novo?');
+      assert.equal(repaired.raw_body, hydrated.data.message.extendedTextMessage.text);
+      assert.deepEqual(JSON.parse(repaired.mentioned_jids_json), [BOT_JID]);
+      assert.equal(repaired.quoted_message_id, 'quoted-partner-message');
+      assert.equal(repaired.quoted_sender_id, 'quoted-partner@s.whatsapp.net');
+      assert.equal(repaired.is_forwarded, 1);
+      assert.equal(repaired.forwarding_score, 1);
+      assert.equal(repaired.created_at, placeholder.created_at);
+      await waitUntil(() => investigationCount === beforeCalls + 1);
+      assert.equal(investigationRequest.sourceMessageId, id,
+        'real preparation must pass low_context_confidence and reach central');
+      assert.equal(investigationRequest.context.effectiveQuestion, 'Habibs desarmou de novo?');
+      assert.notEqual(investigationRequest.context.contextConfidence, 'low');
+      await waitUntil(() => {
+        const probe = new Database(DB_PATH, { readonly: true });
+        try { return probe.prepare('SELECT status FROM station_investigation_jobs WHERE message_id = ?').get(id)?.status === 'review'; }
+        finally { probe.close(); }
+      });
+      await postDuplicate(hydrated);
+      const changed = webhookPayload(id, false);
+      changed.data.message.extendedTextMessage.text = 'different real body';
+      await postDuplicate(changed);
+      await postDuplicate(empty);
+      assert.deepEqual(readStored(id), repaired, 'real content and metadata must never be replaced by replays');
+      assert.equal(investigationCount, beforeCalls + 1, 'hydrated replay must not investigate twice');
+    }
+    // Normal duplicates without a durable owner also retain their original text.
+    for (const text of ['original real text', '[hello]', '[📷 Imagem]']) {
+      const realId = `${MESSAGE_ID}-real-body-${text}`;
+      const original = webhookPayload(realId, false);
+      original.data.message.extendedTextMessage.text = text;
+      await postDuplicate(original, 201);
+      const originalRow = readStored(realId);
+      const replacement = webhookPayload(realId, false);
+      replacement.data.message.extendedTextMessage.text = 'different real text';
+      await postDuplicate(replacement);
+      assert.deepEqual(readStored(realId), originalRow);
+    }
+
+    // Structured metadata can arrive before the text. Keep the placeholder
+    // until text arrives, retain quote fields absent from that later delivery.
+    const metadataId = `${MESSAGE_ID}-metadata-only`;
+    const metadata = webhookPayload(metadataId, false);
+    metadata.data.message = {};
+    await postDuplicate(metadata, 201);
+    const metadataPlaceholder = readStored(metadataId);
+    metadata.data.message = { extendedTextMessage: { contextInfo: {
+      mentionedJid: ['another-bot@s.whatsapp.net'], stanzaId: 'earlier-quote',
+      participant: 'earlier-sender@s.whatsapp.net',
+    } } };
+    await postDuplicate(metadata);
+    const metadataRow = readStored(metadataId);
+    assert.equal(metadataRow.body, metadataPlaceholder.body);
+    assert.equal(metadataRow.raw_body, metadataPlaceholder.raw_body);
+    assert.deepEqual(JSON.parse(metadataRow.mentioned_jids_json), ['another-bot@s.whatsapp.net']);
+    await postDuplicate(metadata);
+    assert.deepEqual(readStored(metadataId), metadataRow, 'mention-only enrichment must be idempotent');
+    metadata.data.message = { extendedTextMessage: { text: 'recovered text' } };
+    await postDuplicate(metadata);
+    const completeRow = readStored(metadataId);
+    assert.equal(completeRow.body, '[Luan]: recovered text');
+    assert.equal(completeRow.raw_body, 'recovered text');
+    assert.equal(completeRow.quoted_message_id, 'earlier-quote');
+    assert.equal(completeRow.quoted_sender_id, 'earlier-sender@s.whatsapp.net');
+    assert.deepEqual(JSON.parse(completeRow.mentioned_jids_json), ['another-bot@s.whatsapp.net']);
+    assert.equal(gatewaySendCount, 0, 'placeholder recovery must stay in shadow review without sending');
+
     const database = new Database(DB_PATH, { readonly: true });
     const job = database.prepare(`
       SELECT status, decision, confidence, station_ids_json, response_sent_at, response_external_message_id

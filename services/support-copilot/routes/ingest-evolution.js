@@ -179,6 +179,38 @@ function extractBody(message, messageType) {
   return `[${messageType || 'unknown'}]`;
 }
 
+// Only the bare extractBody fallback, never the descriptive media markers or
+// a body containing prose. WhatsApp types are conversation or *Message.
+function isBodyFallback(body) {
+  return typeof body === 'string' && /^\[(?:unknown|conversation|[A-Za-z][A-Za-z0-9]*Message)\]$/.test(body);
+}
+
+function repairPlaceholderDuplicate(messageId, body, groupBody, whatsappContext) {
+  const hasBody = body.trim().length > 0 && !isBodyFallback(body);
+  if (!hasBody && whatsappContext.mentionedJids.length === 0) return;
+
+  // Re-read and repair under the same SQLite write transaction: concurrent
+  // deliveries cannot replace text that another delivery already recovered.
+  db.transaction(() => {
+    const stored = db.prepare('SELECT * FROM messages WHERE id = ?').get(messageId);
+    if (!stored || stored.direction !== 'inbound' || stored.source !== 'evolution') return;
+    const rawBody = stored.raw_body;
+    if (!isBodyFallback(rawBody) || stored.body !== `[${stored.sender_name}]: ${rawBody}`) return;
+    const mentionedJids = [...new Set([
+      ...JSON.parse(stored.mentioned_jids_json || '[]'), ...whatsappContext.mentionedJids,
+    ])];
+    db.prepare(`UPDATE messages SET body = ?, raw_body = ?, mentioned_jids_json = ?,
+      quoted_message_id = COALESCE(?, quoted_message_id),
+      quoted_sender_id = COALESCE(?, quoted_sender_id),
+      provider_timestamp = COALESCE(?, provider_timestamp),
+      is_forwarded = MAX(is_forwarded, ?), forwarding_score = MAX(forwarding_score, ?)
+      WHERE id = ?`)
+      .run(hasBody ? groupBody : stored.body, hasBody ? body : rawBody, JSON.stringify(mentionedJids),
+        whatsappContext.quotedMessageId, whatsappContext.quotedSenderId, whatsappContext.providerTimestamp,
+        whatsappContext.isForwarded ? 1 : 0, whatsappContext.forwardingScore, messageId);
+  }).immediate();
+}
+
 /**
  * Extract media metadata if present.
  */
@@ -392,6 +424,7 @@ router.post('/', async (req, res) => {
       const dup = stmts.findMsgByExternalId.get(conversationId, brandId, externalMessageId);
       if (dup) {
         if (direction === 'inbound') {
+          repairPlaceholderDuplicate(dup.id, body, groupBody, whatsappContext);
           if (durableReplayOwner(dup.id, externalMessageId)) {
             return res.json({ id: dup.id, conversationId, duplicate: true });
           }
