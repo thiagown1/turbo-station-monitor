@@ -68,9 +68,14 @@ function parsedJson(value, fallback) {
   try { return JSON.parse(value); } catch { return fallback; }
 }
 
-function withoutMentions(text) {
+function stripMentionTokens(text) {
+  // Keep alert line boundaries and separate words around inline mentions.
   return String(text || '')
-    .replace(/@(?:Turbo\s*Station\s*Suporte|\d{5,})/gi, '')
+    .replace(/@(?:Turbo\s*Station\s*Suporte|\d{5,})/gi, ' ');
+}
+
+function withoutMentions(text) {
+  return stripMentionTokens(text)
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -117,7 +122,7 @@ function effectiveQuestion(messages, trigger) {
 }
 
 function stationIdsFrom(text) {
-  const values = String(text || '').match(/\b(?:[A-Z]{1,8}\d{6,16}|\d{10,16})\b/g) || [];
+  const values = stripMentionTokens(text).match(/\b(?:[A-Z]{1,8}\d{6,16}|\d{10,16})\b/g) || [];
   return [...new Set(values.map((value) => value.toUpperCase()))];
 }
 
@@ -170,7 +175,7 @@ function stateFirstStationName(raw) {
 function stationNamesFrom(text, options = {}) {
   const includeExplicit = options.includeExplicit !== false;
   const includeNatural = options.includeNatural !== false;
-  const value = String(text || '');
+  const value = stripMentionTokens(text);
   const candidates = [];
 
   const addCandidate = (raw) => {
@@ -295,7 +300,7 @@ function reconstructIncidentContext(messages, triggerMessageId, options = {}) {
   const questionMessage = effectiveQuestion(ordered, trigger);
   const question = withoutMentions(cleanBody(questionMessage));
   const relevant = ordered.filter((message) => parseProviderTime(message) <= parseProviderTime(trigger));
-  const allText = relevant.map(cleanBody).join('\n');
+  const allText = relevant.map((message) => stripMentionTokens(cleanBody(message))).join('\n');
   const stationIds = stationIdsFrom(allText);
   const stationNames = uniqueStationNames([
     ...stationNamesFrom(allText, { includeNatural: false }),
@@ -314,7 +319,7 @@ function reconstructIncidentContext(messages, triggerMessageId, options = {}) {
     speaker: message.id === trigger.id || message.sender_id === trigger.sender_id ? 'requester' : `participant_${index + 1}`,
     direction: message.direction,
     at: parseProviderTime(message).toISOString(),
-    body: cleanBody(message).slice(0, 1000),
+    body: stripMentionTokens(cleanBody(message)).trim().slice(0, 1000),
     quotedMessageId: message.quoted_message_id || null,
     forwarded: Boolean(message.is_forwarded),
   }));
