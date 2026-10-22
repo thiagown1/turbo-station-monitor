@@ -534,3 +534,60 @@ test('reuses unpunctuated prior questions for every supported station state word
     assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'Habibs' }], state);
   }
 });
+
+test('structured LID mentions never become station hints or context text', () => {
+  const messages = [message('lid-question', '2026-10-21T15:00:00Z', 'partner', '@66435376238593 Como ta o caju limão?', {
+    mentioned_jids_json: JSON.stringify(['66435376238593@lid']),
+  })];
+  const context = reconstructIncidentContext(messages, 'lid-question');
+  assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'caju limão' }]);
+  assert.equal(context.effectiveQuestion, 'Como ta o caju limão?');
+  assert.equal(context.messageRefs[0].body, 'Como ta o caju limão?');
+  assert.equal(context.contextFingerprint, reconstructIncidentContext(messages, 'lid-question').contextFingerprint);
+});
+
+test('preserves real alphanumeric and bare numeric station IDs alongside mentions', () => {
+  const context = reconstructIncidentContext([
+    message('ids', '2026-10-21T15:00:00Z', 'partner', '@66435376238593 Verifica AR2512180009 e 12345678901234?', {
+      mentioned_jids_json: JSON.stringify(['66435376238593@lid']),
+    }),
+  ], 'ids');
+  assert.deepEqual(context.stationHints.filter(hint => hint.kind === 'id'), [
+    { kind: 'id', value: 'AR2512180009' }, { kind: 'id', value: '12345678901234' },
+  ]);
+});
+
+test('isolated LID mention reuses an earlier question without introducing hints', () => {
+  const context = reconstructIncidentContext([
+    message('earlier', '2026-10-21T15:00:00Z', 'partner', 'Como ta o caju limão?'),
+    message('mention', '2026-10-21T15:01:00Z', 'partner', '@66435376238593', {
+      mentioned_jids_json: JSON.stringify(['66435376238593@lid']),
+    }),
+  ], 'mention');
+  assert.equal(context.questionMessageId, 'earlier');
+  assert.equal(context.effectiveQuestion, 'Como ta o caju limão?');
+  assert.deepEqual(context.stationHints, [{ kind: 'name', value: 'caju limão' }]);
+  assert.equal(context.messageRefs[1].body, '');
+});
+
+test('removes numeric and display-name mentions inside sentences and explicit labels', async (t) => {
+  for (const mention of ['@66435376238593', '@12345', '@Turbo Station Suporte']) {
+    await t.test(mention, () => {
+      const context = reconstructIncidentContext([
+        message('label', '2026-10-21T14:59:00Z', 'partner', `Estação: Caju ${mention} Limão\nID AR2512180009`),
+        message('question', '2026-10-21T15:00:00Z', 'partner', `Como ta o caju ${mention} limão?`),
+      ], 'question');
+      assert.deepEqual(context.stationHints, [
+        { kind: 'id', value: 'AR2512180009' }, { kind: 'name', value: 'Caju Limão' },
+      ]);
+      assert.equal(context.effectiveQuestion, 'Como ta o caju limão?');
+      assert.ok(context.messageRefs.every(ref => !ref.body.includes(mention)));
+    });
+  }
+});
+
+test('exported ID extractor ignores mentions while retaining the same bare digits', () => {
+  const { stationIdsFrom } = require('../lib/conversation-incident-context');
+  assert.deepEqual(stationIdsFrom('@66435376238593 @12345 @Turbo Station Suporte'), []);
+  assert.deepEqual(stationIdsFrom('@66435376238593 AR2512180009 66435376238593'), ['AR2512180009', '66435376238593']);
+});
