@@ -93,6 +93,14 @@ test('blocks a staff conversation', () => {
   assert.equal(r.reason, 'staff_conv');
 });
 
+test('blocks a conversation a person owns (takeover or handoff), before any other check', () => {
+  for (const status of ['assigned', 'escalated']) {
+    const r = evaluateAutoRespond(ok({ conv: { ...ok().conv, status } }));
+    assert.equal(r.allow, false, status);
+    assert.equal(r.reason, 'human_owned', status);
+  }
+});
+
 test('blocks a closed conversation', () => {
   const r = evaluateAutoRespond(ok({ conv: { ...ok().conv, status: 'closed' } }));
   assert.equal(r.allow, false);

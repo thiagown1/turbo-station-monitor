@@ -365,3 +365,68 @@ test('mixed requested overview is explicitly unvalidated rather than silently dr
   const answer = evidenceAnswer({ answer: 'Texto livre misturando lista e status.', tools: ['partner_overview', 'station_status'], trace: [{ tool: 'station_status', ok: true, replyContract: canonical }] });
   assert.ok(answer.startsWith(canonical.text)); assert.match(answer, /Outras partes da pergunta não foram validadas.*revisão humana/);
 });
+
+// ─── Human handoff: a person owns the conversation, the AI stays silent ──────
+
+function ownConversation(status) {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO conversations (id, brand_id, channel, status, created_at, updated_at)
+    VALUES ('conv_arena', 'turbo_station', 'whatsapp-group', ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET status = excluded.status`).run(status, now, now);
+}
+
+test('a human-owned conversation is claimed without creating a job', () => {
+  ownConversation('escalated');
+  const msg = input();
+  const claim = claimPartnerAssistantMessage(msg, config({ autoSend: true }));
+  assert.deepEqual(claim, { owned: true, fresh: false, reason: 'human_owned' });
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM partner_assistant_jobs WHERE message_id = ?').get(msg.messageId).n, 0);
+  ownConversation('open');
+});
+
+test('a takeover before the job runs skips it without asking Hermes', async () => {
+  ownConversation('open');
+  const msg = input();
+  claimPartnerAssistantMessage(msg, config({ autoSend: true }));
+  ownConversation('assigned');
+  let asked = false;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => { asked = true; return { answer: 'x', tools: [] }; },
+    sendText: async () => ({ key: { id: 'never' } }),
+  });
+  assert.deepEqual(result, { status: 'skipped', reason: 'human_owned' });
+  assert.equal(asked, false);
+  assert.equal(db.prepare('SELECT status, last_error FROM partner_assistant_jobs WHERE message_id = ?').get(msg.messageId).last_error, 'human_owned');
+  ownConversation('open');
+});
+
+test('a takeover while Hermes answers sends and proposes nothing', async () => {
+  ownConversation('open');
+  const msg = input();
+  claimPartnerAssistantMessage(msg, config({ autoSend: true }));
+  let sent = false;
+  let requested = false;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => { ownConversation('escalated'); return { answer: 'Resposta que não pode sair.', tools: [] }; },
+    sendText: async () => { sent = true; return { key: { id: 'never' } }; },
+    request: async () => { requested = true; return okResponse({ ok: true }); },
+  });
+  assert.deepEqual(result, { status: 'skipped', reason: 'human_owned' });
+  assert.equal(sent, false);
+  assert.equal(requested, false);
+  ownConversation('open');
+});
+
+test('shadow mode is also silenced: no review is proposed for a human-owned conversation', async () => {
+  ownConversation('open');
+  const msg = input();
+  claimPartnerAssistantMessage(msg, config());
+  let requested = false;
+  const result = await runPartnerAssistantJob(msg.messageId, {
+    askHermes: async () => { ownConversation('assigned'); return { answer: 'x', tools: [] }; },
+    request: async () => { requested = true; return okResponse({ ok: true }); },
+  });
+  assert.equal(result.reason, 'human_owned');
+  assert.equal(requested, false);
+  ownConversation('open');
+});

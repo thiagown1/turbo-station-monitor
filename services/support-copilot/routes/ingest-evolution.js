@@ -32,7 +32,7 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { isOfxDocument } = require('../lib/contador');
-const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
+const { evaluateAutoRespond, HUMAN_OWNED_STATUSES } = require('../lib/auto-respond-gate');
 const {
   enqueueContadorMessage,
   canRouteContadorEvent,
@@ -1176,6 +1176,8 @@ router.post('/', async (req, res) => {
             const { generateSuggestion } = require('../lib/copilot');
             const conv = stmts.getConversation.get(conversationId);
             if (!conv || conv.status === 'closed' || conv.is_staff) return;
+            // A person owns this conversation (takeover or handoff): the AI stays silent.
+            if (HUMAN_OWNED_STATUSES.includes(conv.status)) return;
 
             const allMsgs = db.prepare(
               'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'

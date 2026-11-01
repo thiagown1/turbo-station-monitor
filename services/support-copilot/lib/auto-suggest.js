@@ -20,6 +20,7 @@
 const { db, stmts, nowIso, randomId } = require('./db');
 const { LOG_TAG } = require('./constants');
 const { emitEvent } = require('./sse');
+const { HUMAN_OWNED_STATUSES } = require('./auto-respond-gate');
 
 /**
  * Create a copilot suggestion for a group conversation.
@@ -52,7 +53,7 @@ async function createGroupSuggestion(conversationId, brandId, { sourceMessageId 
 
   const conv = stmts.getConversation.get(conversationId);
   if (!conv || conv.channel !== 'whatsapp-group') return null;
-  if (conv.status === 'closed' || conv.is_staff) return null;
+  if (conv.status === 'closed' || conv.is_staff || HUMAN_OWNED_STATUSES.includes(conv.status)) return null;
 
   const settings = db.prepare(
     'SELECT auto_suggest_groups FROM copilot_settings WHERE brand_id = ?'

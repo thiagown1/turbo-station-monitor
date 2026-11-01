@@ -439,7 +439,7 @@
   ],
   "expectGateAllow": false,
   "expectEscalationType": "pedido_humano",
-  "goldenReply": "Boa tarde! Sem problema. Vou passar para um atendente da equipe te ligar. Pode me confirmar o melhor número e horário, por gentileza?"
+  "goldenReply": "Boa tarde! Sem problema. Passei seu pedido para a nossa equipe e uma pessoa continua a conversa por aqui."
  },
  {
   "id": "human_request-falar-com-responsavel-multiturn",
