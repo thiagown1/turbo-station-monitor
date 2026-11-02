@@ -17,6 +17,7 @@ const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
 const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
 const { writeJsonAtomic } = require('./atomic-json');
+const pricingLogAlerts = require('./pricing-log-alerts');
 
 // NOTE: Data is split across dedicated DBs
 const DB_DIR = path.join(__dirname, '..', 'db');
@@ -45,6 +46,10 @@ const WHATSAPP_BRAND = process.env.ALERT_WHATSAPP_BRAND || 'turbo_station';
 const URGENT_WHATSAPP_CONV = process.env.ALERT_URGENT_WHATSAPP_CONV !== undefined
     ? process.env.ALERT_URGENT_WHATSAPP_CONV
     : 'conv_i7ljlrvrmrl33ohs';
+// Pricing alerts (fallback admissions, market-pricing pipeline) are copied to
+// the URGENTE group too. ALERT_PRICING_URGENT_COPY=0 keeps them in the normal
+// group only.
+const PRICING_URGENT_COPY = process.env.ALERT_PRICING_URGENT_COPY !== '0';
 const SUPPORT_API_BASE = (process.env.SUPPORT_API_URL || 'https://logs.turbostation.com.br').replace(/\/+$/, '');
 const SUPPORT_API_SECRET = process.env.SUPPORT_API_SECRET || process.env.MONITOR_API_SECRET || '';
 
@@ -907,6 +912,51 @@ class AlertEngine {
     }
 
     /**
+     * Starts admitted with the fallback price (`[ADMISSION-TARIFF-FALLBACK]`).
+     * They answer HTTP 202, so detectVercel5xxErrors never sees them. Cooldown
+     * is per station (1 h, shared debounce): a station already alerted stays
+     * quiet, but a NEW station in the window fires a fresh alert at once.
+     */
+    detectAdmissionTariffFallback(now = Date.now()) {
+        const rows = pricingLogAlerts.queryTaggedVercelLogs(
+            this.vercelDb, pricingLogAlerts.ADMISSION_FALLBACK_TAG, now - QUERY_WINDOW, now,
+        );
+        if (rows.length === 0) return [];
+
+        const summary = pricingLogAlerts.summarizeAdmissionFallback(rows);
+        if (summary.total === 0) return [];
+
+        const newStationKeys = summary.stations
+            .map((s) => s.key)
+            .filter((key) => this.shouldSendAlert(pricingLogAlerts.ADMISSION_FALLBACK_ALERT_TYPE, key));
+        if (newStationKeys.length === 0) return [];
+
+        return [pricingLogAlerts.buildAdmissionFallbackAlert(summary, newStationKeys, {
+            now,
+            lookup: this.stationLookup || lookupStation,
+            windowMinutes: Math.round(QUERY_WINDOW / 60000),
+        })];
+    }
+
+    /**
+     * Market-pricing pipeline problems (`[MARKET-PRICING-ALERT]`): one alert
+     * per kind, with a 1 h cooldown per kind.
+     */
+    detectMarketPricingAlerts(now = Date.now()) {
+        const rows = pricingLogAlerts.queryTaggedVercelLogs(
+            this.vercelDb, pricingLogAlerts.MARKET_PRICING_TAG, now - QUERY_WINDOW, now,
+        );
+        if (rows.length === 0) return [];
+
+        return pricingLogAlerts.groupMarketPricingRows(rows)
+            .filter((group) => this.shouldSendAlert(pricingLogAlerts.MARKET_PRICING_ALERT_TYPE, group.kind))
+            .map((group) => pricingLogAlerts.buildMarketPricingAlert(group, {
+                now,
+                windowMinutes: Math.round(QUERY_WINDOW / 60000),
+            }));
+    }
+
+    /**
      * Correlate charger errors with backend errors (±30s window)
      */
     detectOcppVercelCorrelation() {
@@ -1750,6 +1800,8 @@ class AlertEngine {
             ...runDetector('detectVercel5xxErrors', () => this.detectVercel5xxErrors()),
             ...runDetector('detectVercelTimeouts', () => this.detectVercelTimeouts()),
             ...runDetector('detectHighLatency', () => this.detectHighLatency()),
+            ...runDetector('detectAdmissionTariffFallback', () => this.detectAdmissionTariffFallback()),
+            ...runDetector('detectMarketPricingAlerts', () => this.detectMarketPricingAlerts()),
             ...runDetector('detectChargerFaults', () => this.detectChargerFaults()),
             ...runDetector('detectOcppVercelCorrelation', () => this.detectOcppVercelCorrelation())
         ];
@@ -1804,6 +1856,15 @@ class AlertEngine {
                         await this.sendUrgentWhatsappAlert(this.formatUrgentCableTheftMessage(alert));
                     } catch (e) {
                         console.error('❌ Error sending urgent alert:', e && e.message);
+                    }
+                } else if (alert.urgentCopy && PRICING_URGENT_COPY) {
+                    // Pricing alerts: same message, best-effort copy to the
+                    // URGENTE group (the normal-group send above is the one
+                    // that is confirmed and retried).
+                    try {
+                        await this.sendUrgentWhatsappAlert(message);
+                    } catch (e) {
+                        console.error('❌ Error sending urgent alert copy:', e && e.message);
                     }
                 }
 
@@ -1911,3 +1972,4 @@ module.exports.getLatestOcppIngestTimestamp = getLatestOcppIngestTimestamp;
 module.exports.normalizeEndpoint = normalizeEndpoint;
 module.exports.groupByNormalizedEndpoint = groupByNormalizedEndpoint;
 module.exports.getVercel5xxAlertPolicy = getVercel5xxAlertPolicy;
+module.exports.QUERY_WINDOW = QUERY_WINDOW;
