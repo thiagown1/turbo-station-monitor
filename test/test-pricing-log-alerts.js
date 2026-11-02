@@ -124,6 +124,25 @@ test('new station while another is in cooldown → alerts at once, marks only th
     assert.match(alerts[0].description, /- Posto Centro \(AR2510070008\): 1x · motivo: market_catalog_expired \(1x\)\\n/);
 });
 
+test('new station stays visible when the station list is truncated', () => {
+    const db = createVercelDb();
+    const engine = createEngine(db);
+    for (let i = 1; i <= 15; i++) {
+        const id = `OLD${String(i).padStart(4, '0')}`;
+        insertLog(db, { body: fallbackLine(id) });
+        insertLog(db, { body: fallbackLine(id) });
+    }
+    assert.strictEqual(engine.detectAdmissionTariffFallback(NOW).length, 1);
+
+    ageDebounce(engine, 2 * 60 * 1000);
+    insertLog(db, { timestamp: NOW - 5_000, body: fallbackLine('NEW0001') });
+    const [alert] = engine.detectAdmissionTariffFallback(NOW);
+
+    assert.deepStrictEqual(alert.new_station_ids, ['NEW0001']);
+    assert.match(alert.description, /Estações afetadas:\\n- NEW0001: 1x · motivo: market_catalog_expired \(1x\) · nova/);
+    assert.match(alert.description, /- \+1 outra\(s\) estação\(ões\)/);
+});
+
 test('no tag in the window → nothing; tagged rows older than the window are ignored', () => {
     const db = createVercelDb();
     insertLog(db, { body: 'POST /api/charging/start status=202', status: 202 });

@@ -278,7 +278,13 @@ function buildAdmissionFallbackAlert(summary, newStationKeys, { now = Date.now()
     );
     lines.push('');
     lines.push('Estações afetadas:');
-    for (const s of summary.stations.slice(0, MAX_STATIONS_LISTED)) {
+    // New stations first: they are why this alert fires, and their cooldown
+    // is already consumed, so truncation must never hide them.
+    const ordered = [
+        ...summary.stations.filter((s) => fresh.has(s.key)),
+        ...summary.stations.filter((s) => !fresh.has(s.key)),
+    ];
+    for (const s of ordered.slice(0, MAX_STATIONS_LISTED)) {
         let label = s.stationId || 'sem stationId no log';
         if (s.stationId) {
             let name = null;

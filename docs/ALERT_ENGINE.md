@@ -69,7 +69,7 @@ pairs. Recognized fields:
 
 **Message.** The fallback alert lists every station in the window with its
 count and original reasons. Stations outside their cooldown are marked
-`nova`. The market-pricing alert shows the kind and the newest log text,
+`nova` and listed first, so the 15-station cap never hides them. The market-pricing alert shows the kind and the newest log text,
 capped at 300 characters. Both end with the action "verificar catálogo de
 preços / rota-api / cron market-pricing".
 
