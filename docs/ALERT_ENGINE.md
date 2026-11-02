@@ -29,6 +29,62 @@ The Alert Engine is a proactive monitoring system that queries the unified SQLit
    - Helps identify backend-caused charger failures
    - Severity: **critical**
 
+5. **Fallback-price admissions** (`admission_tariff_fallback`)
+   - Matches Vercel log lines tagged `[ADMISSION-TARIFF-FALLBACK]`
+   - Severity: **critical**, copied to the URGENTE group
+   - Cooldown: 1 hour **per station**; a new station alerts at once
+   - See [Pricing log alerts](#pricing-log-alerts-added-2026-11-02)
+
+6. **Market-pricing pipeline** (`market_pricing_alert`)
+   - Matches Vercel log lines tagged `[MARKET-PRICING-ALERT]`
+   - Severity: **critical**, copied to the URGENTE group
+   - Cooldown: 1 hour **per alert kind**
+
+## Pricing log alerts (added 2026-11-02)
+
+On 2026-11-02 the market price catalog expired. Charge starts returned 503 for
+about 6.5 hours. The Next app now admits those starts with a fallback price.
+A fallback start returns HTTP 202, so the 5xx alert does not fire. Two log
+tags close that gap. Code: `services/pricing-log-alerts.js` (parsing, PII
+redaction, messages) and the two `detect*` methods in `alert-engine.js`.
+
+| Tag | Logged by the Next app when | Alert type | Cooldown key |
+|-----|-----------------------------|------------|--------------|
+| `[ADMISSION-TARIFF-FALLBACK]` | a start is admitted with the fallback price | `admission_tariff_fallback` | station id |
+| `[MARKET-PRICING-ALERT]` | daily apply rejected all prices, catalog expires in < 6 h or is unreadable, watchdog fallback expired | `market_pricing_alert` | alert kind |
+
+**Query.** Each tick reads the rows whose `timestamp` is inside the last
+5 minutes and whose `body` contains the tag (`instr`, literal match). The
+timestamp range keeps SQLite on `idx_vercel_logs_timestamp`. Never add an
+unbounded `body LIKE '%...%'`: it scans the whole table and times out. A test
+asserts the query plan.
+
+**Line format.** The text after the tag can be a JSON object or `key=value`
+pairs. Recognized fields:
+
+- fallback: `stationId`, `reason` (or `originalReason`), `fallbackPrice`, `route`
+- market pricing: `kind` (or `code`/`type`) and `message` (or `summary`). Without
+  `kind`, the engine infers `daily_apply_rejected`, `catalog_expiring`,
+  `catalog_unreadable`, `watchdog_fallback_expired` or `other` from the text.
+
+**Message.** The fallback alert lists every station in the window with its
+count and original reasons. Stations outside their cooldown are marked
+`nova`. The market-pricing alert shows the kind and the newest log text,
+capped at 300 characters. Both end with the action "verificar catálogo de
+preços / rota-api / cron market-pricing".
+
+**Privacy.** The message uses only parsed fields. Station ids must match a
+strict id shape. Free text is redacted before it is capped: e-mails, JWT and
+Bearer tokens, `userId=`/`email=`/`phone=`/`token=`-style values, phone-like
+digit runs and opaque ids of 20+ characters are replaced.
+
+**URGENTE copy.** Both alerts also go to the "Turbo Station + URGENTE" group as
+a best-effort copy. Only the normal-group send is confirmed and retried. Set
+`ALERT_PRICING_URGENT_COPY=0` to keep them in the normal group only.
+`ALERT_URGENT_WHATSAPP_CONV=''` disables every urgent copy.
+
+**Tests:** `npm run test:pricing-alerts`.
+
 ## Debounce Logic
 
 - **Problem alerts:** 1 hour debounce window
