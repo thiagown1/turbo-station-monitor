@@ -72,7 +72,9 @@ function dashboardTranscript(turns) {
     const at = new Date(turn.at).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', timeZone: 'America/Sao_Paulo' });
     // The app already sends short notes without amounts; keep who asked.
     const who = turn.askedBy ? String(turn.askedBy).slice(0, 80) : 'parceiro';
-    return `[${at}] Dashboard: ${who} perguntou: ${redact(String(turn.question)).slice(0, 400)} | assistente respondeu: ${redact(String(turn.answer)).slice(0, 400)}`;
+    // Never consume answers, including legacy payloads: group capabilities
+    // may not permit the information returned by the dashboard assistant.
+    return `[${at}] Dashboard: ${who} perguntou: ${redact(String(turn.question)).slice(0, 400)}`;
   }).join('\n');
 }
 
