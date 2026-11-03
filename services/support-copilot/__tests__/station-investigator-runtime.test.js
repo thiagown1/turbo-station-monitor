@@ -1508,3 +1508,59 @@ test('does not send when autoSend is enabled but the central decision requires r
   const job = db.prepare('SELECT status, decision, response_sent_at FROM station_investigation_jobs WHERE message_id = ?').get('central-review');
   assert.deepEqual(job, { status: 'review', decision: 'review', response_sent_at: null });
 });
+
+// ─── Human handoff: a person owns the conversation, the AI stays silent ──────
+
+function ownConversation(status) {
+  const now = new Date().toISOString();
+  db.prepare(`INSERT INTO conversations (id, brand_id, channel, status, created_at, updated_at)
+    VALUES ('conv-pilot', 'turbo_station', 'whatsapp-group', ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET status = excluded.status`).run(status, now, now);
+}
+
+test('a human-owned conversation is claimed but never investigated, persisted or sent', async () => {
+  ownConversation('escalated');
+  let requested = false;
+  let sent = false;
+  const result = await routeStationInvestigation(input('human-owned-prepare'), {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('human-owned-prepare'),
+    request: async () => { requested = true; return jsonResponse({ decision: 'send', reply: 'x' }); },
+    sendText: async () => { sent = true; return { key: { id: 'never' } }; },
+  });
+  assert.deepEqual(result, { skipped: true, reason: 'human_owned' });
+  assert.equal(requested, false);
+  assert.equal(sent, false);
+  assert.equal(db.prepare('SELECT COUNT(*) n FROM station_investigation_jobs WHERE message_id = ?').get('human-owned-prepare').n, 0);
+  ownConversation('open');
+});
+
+test('a person who takes over while the analysis runs blocks the send', async () => {
+  ownConversation('open');
+  let sent = false;
+  const result = await routeStationInvestigation(input('human-owned-midflight'), {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('human-owned-midflight'),
+    request: async () => {
+      ownConversation('assigned'); // operator takes over during the central call
+      return jsonResponse({ decision: 'send', confidence: 'high', stationIds: ['AR1'], reply: 'Resposta que não pode sair.' });
+    },
+    sendText: async () => { sent = true; return { key: { id: 'never' } }; },
+  });
+  assert.deepEqual(result, { status: 'skipped', reason: 'human_owned' });
+  assert.equal(sent, false);
+  const job = db.prepare('SELECT status, last_error FROM station_investigation_jobs WHERE message_id = ?').get('human-owned-midflight');
+  assert.deepEqual(job, { status: 'failed', last_error: 'human_owned' });
+  ownConversation('open');
+});
+
+test('after the person resolves the handoff the same group is answered again', async () => {
+  ownConversation('open');
+  const result = await routeStationInvestigation(input('human-owned-resumed'), {
+    loadConfig: async () => config({ autoSend: true }),
+    buildContext: () => context('human-owned-resumed'),
+    request: async () => jsonResponse({ decision: 'send', confidence: 'high', stationIds: ['AR1'], reply: 'Voltei.' }),
+    sendText: async () => ({ key: { id: 'out-resumed' } }),
+  });
+  assert.equal(result.status, 'sent');
+});

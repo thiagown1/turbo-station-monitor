@@ -3,6 +3,7 @@ const { loadConfig } = require('./agent-router');
 const { buildConversationIncidentContext } = require('./conversation-incident-context');
 const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
+const { isConversationHumanOwned } = require('./human-handoff');
 
 const PROCESSING_LEASE_MS = 120_000;
 const STATION_JOB_MAX_ATTEMPTS = 5;
@@ -208,6 +209,12 @@ async function prepareStationInvestigation(input, deps = {}) {
     return { claimed: claimedByPriorJob, ready: false, result: { skipped: true, reason: 'structured_mention_required' } };
   }
 
+  // A person owns this conversation (takeover or handoff): stay silent, and keep
+  // the claim so no generic responder answers either.
+  if (isConversationHumanOwned(db, input.conversationId)) {
+    return { claimed: true, ready: false, result: { skipped: true, reason: 'human_owned' } };
+  }
+
   // Once an explicitly allowlisted bot mention is present in an allowlisted
   // group, this workflow owns the message. Any later failure must stay silent
   // and fail closed instead of falling through to a second, generic responder.
@@ -296,6 +303,12 @@ async function routeStationInvestigation(input, deps = {}) {
       db.prepare("UPDATE station_investigation_jobs SET status='review', decision=?, confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=? WHERE message_id=?")
         .run(result.decision || 'review', result.confidence || null, JSON.stringify(result.stationIds || []), JSON.stringify(result), nowIso(), input.messageId);
       return { status: 'review', result };
+    }
+    // A person may have taken over while the analysis ran: do not send.
+    if (isConversationHumanOwned(db, input.conversationId)) {
+      db.prepare("UPDATE station_investigation_jobs SET status='failed', last_error='human_owned', updated_at=? WHERE message_id=? AND status='processing'")
+        .run(nowIso(), input.messageId);
+      return { status: 'skipped', reason: 'human_owned' };
     }
     const sending = db.prepare(`UPDATE station_investigation_jobs
       SET status='sending', decision='send', confidence=?, station_ids_json=?, result_json=?, last_error=NULL, updated_at=?
@@ -407,7 +420,7 @@ async function deliverDueStationInvestigations(deps = {}) {
           forwardingScore: Number(source.forwarding_score || 0),
         },
       }, deps);
-      if (['context_failed', 'low_context_confidence', 'structured_mention_required'].includes(result?.reason)) {
+      if (['context_failed', 'low_context_confidence', 'structured_mention_required', 'human_owned'].includes(result?.reason)) {
         failDueJobIfUnchanged(job, result.reason);
       } else if (result?.skipped) {
         rescheduleDueJobIfUnchanged(job, result.reason || 'policy_blocked');

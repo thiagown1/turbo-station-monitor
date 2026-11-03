@@ -354,7 +354,9 @@ router.post('/:id/release', (req, res) => {
   const conv = stmts.getConversation.get(req.params.id);
   if (!conv) return res.status(404).json({ error: 'Not found' });
   const now = nowIso();
-  db.prepare(`UPDATE conversations SET assigned_agent_id = NULL, status = 'open', updated_at = ? WHERE id = ?`)
+  // Release hands the conversation back to the AI, so it also clears the handoff
+  // fields; otherwise a stale escalated_at/to would outlive the human owner.
+  db.prepare(`UPDATE conversations SET assigned_agent_id = NULL, escalated_at = NULL, escalated_to = NULL, status = 'open', updated_at = ? WHERE id = ?`)
     .run(now, conv.id);
   db.prepare(`INSERT INTO audit_log (id, brand_id, conversation_id, action, actor_user_id, metadata_json, created_at) VALUES (?,?,?,?,?,?,?)`)
     .run(randomId('audit'), conv.brand_id, conv.id, 'support.release', null, null, now);

@@ -23,6 +23,7 @@ const path = require('node:path');
 const { db, nowIso, randomId } = require('./db');
 const { findAllowedStructuredMention } = require('./whatsapp-message-context');
 const { sendText } = require('./evolution-client');
+const { isConversationHumanOwned } = require('./human-handoff');
 
 const LOG_TAG = '[partner-assistant]';
 const HERMES_TIMEOUT_MS = 180_000;
@@ -70,6 +71,11 @@ function claimPartnerAssistantMessage(input, config) {
   if (!policy) return { owned: false, reason: 'not_enabled' };
   if (!findAllowedStructuredMention(input.whatsappContext, policy.mentionJids)) {
     return { owned: false, reason: 'structured_mention_required' };
+  }
+  // A person owns this conversation (takeover or handoff): stay silent, keep the
+  // claim so no other responder answers, and create no job.
+  if (isConversationHumanOwned(db, input.conversationId)) {
+    return { owned: true, fresh: false, reason: 'human_owned' };
   }
   const now = nowIso();
   const payload = {
@@ -272,6 +278,10 @@ function settle(messageId, patch) {
 async function runPartnerAssistantJob(messageId, deps = {}) {
   const job = acquire(messageId);
   if (!job) return { status: 'skipped' };
+  if (isConversationHumanOwned(db, job.conversation_id)) {
+    settle(messageId, { status: 'failed', last_error: 'human_owned' });
+    return { status: 'skipped', reason: 'human_owned' };
+  }
   const payload = JSON.parse(job.payload_json);
   const brandSubject = { brandId: job.brand_id, subject: { type: 'whatsapp_group', conversationId: job.conversation_id } };
   let delivered = false;
@@ -281,6 +291,12 @@ async function runPartnerAssistantJob(messageId, deps = {}) {
     const { tools } = result;
     const answer = evidenceAnswer(result, payload.question);
     if (!answer) throw new Error('empty_answer');
+
+    // A person may have taken over while Hermes was answering: deliver nothing.
+    if (isConversationHumanOwned(db, job.conversation_id)) {
+      settle(messageId, { status: 'failed', last_error: 'human_owned' });
+      return { status: 'skipped', reason: 'human_owned' };
+    }
 
     if (job.auto_send) {
       const sent = await (deps.sendText || sendText)(job.instance, job.group_jid, answer);

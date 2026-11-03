@@ -32,7 +32,8 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { isOfxDocument } = require('../lib/contador');
-const { evaluateAutoRespond } = require('../lib/auto-respond-gate');
+const { evaluateAutoRespond, HUMAN_OWNED_STATUSES } = require('../lib/auto-respond-gate');
+const { isConversationHumanOwned } = require('../lib/human-handoff');
 const {
   enqueueContadorMessage,
   canRouteContadorEvent,
@@ -1176,6 +1177,8 @@ router.post('/', async (req, res) => {
             const { generateSuggestion } = require('../lib/copilot');
             const conv = stmts.getConversation.get(conversationId);
             if (!conv || conv.status === 'closed' || conv.is_staff) return;
+            // A person owns this conversation (takeover or handoff): the AI stays silent.
+            if (HUMAN_OWNED_STATUSES.includes(conv.status)) return;
 
             const allMsgs = db.prepare(
               'SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at ASC'
@@ -1192,6 +1195,11 @@ router.post('/', async (req, res) => {
             const result = await generateSuggestion(conv, allMsgs, acctData ? { userData: acctData } : undefined);
             // generateSuggestion returns { text, model, waiting?, noReply?, tags? }
             if (!result?.text || result.waiting || result.noReply) return;
+
+            // A person may have taken over or escalated while the model ran: `conv`
+            // above is stale. Re-read it and persist and send nothing if so.
+            const liveConv = stmts.getConversation.get(conversationId);
+            if (!liveConv || HUMAN_OWNED_STATUSES.includes(liveConv.status)) return;
 
             console.log(`${LOG_TAG} [auto-suggest] ${conversationId}: "${result.text.substring(0, 60)}..."`);
 
@@ -1216,7 +1224,7 @@ router.post('/', async (req, res) => {
             // Auto-respond gate (phase 4) — fail-closed: flag + allowlist/percent +
             // escalation triggers + business hours all decided in one pure function.
             const gate = evaluateAutoRespond({
-              conv,
+              conv: liveConv,
               lastInboundText: body,
               suggestion: { text: result.text, model: result.model, tags: result.tags },
               settings,
@@ -1236,6 +1244,11 @@ router.post('/', async (req, res) => {
                 // Humanize: show "typing…" then wait before sending (best-effort).
                 if (gate.typing) { await sendPresence(instanceName, customerPhone, 'composing', gate.delayMs || 0); }
                 if (gate.delayMs) { await new Promise(r => setTimeout(r, Math.min(gate.delayMs, 9000))); }
+                // The typing delay is long enough for a takeover: check again right before sending.
+                if (isConversationHumanOwned(db, conversationId)) {
+                  console.log(`${LOG_TAG} [auto-respond] held for ${conversationId}: human_owned`);
+                  return;
+                }
                 console.log(`${LOG_TAG} [auto-respond] sending (${gate.reason}) to ${conversationId} after ${gate.delayMs}ms`);
                 await sendText(instanceName, customerPhone, result.text);
 

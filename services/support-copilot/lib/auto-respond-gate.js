@@ -41,6 +41,9 @@ const ESCALATION_PATTERNS = [
   { type: 'furioso', re: /\b(absurd\w*|rid[íi]cul\w*|p[ée]ssim\w*|horr[íi]vel|vergonha|inadmiss[íi]vel|palha[çc]ada|descaso|merda|porra|caralh\w*|vsf|vtnc|fdp)\b/i },
 ];
 
+// Conversations a person owns (takeover or handoff): the AI must stay silent.
+const HUMAN_OWNED_STATUSES = Object.freeze(['assigned', 'escalated']);
+
 // Tags emitted by the suggestion that always force a human.
 const ESCALATION_TAGS = ['furioso', 'financeiro', 'lgpd', 'hack-tentativa', 'reclamacao'];
 
@@ -152,6 +155,7 @@ function evaluateAutoRespond({ conv = {}, lastInboundText = '', suggestion = {},
 
   // 3. Conversation eligible (real customer 1:1)
   if (conv.is_staff) return { allow: false, reason: 'staff_conv' };
+  if (HUMAN_OWNED_STATUSES.includes(conv.status)) return { allow: false, reason: 'human_owned' };
   if (conv.status === 'closed') return { allow: false, reason: 'closed_conv' };
   if (conv.channel !== 'whatsapp') return { allow: false, reason: 'not_whatsapp_1to1' };
   if (!conv.customer_phone) return { allow: false, reason: 'no_phone' };
@@ -195,4 +199,5 @@ module.exports = {
   stableHash,
   ESCALATION_PATTERNS,
   ESCALATION_TAGS,
+  HUMAN_OWNED_STATUSES,
 };
