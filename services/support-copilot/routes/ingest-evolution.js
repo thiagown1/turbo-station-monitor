@@ -32,7 +32,7 @@ const { db, stmts, nowIso, randomId, normalizePhone, mergeConversations } = requ
 const { LOG_TAG, MEDIA_DIR, EVOLUTION_INSTANCE_BRAND_MAP, EVOLUTION_API_URL } = require('../lib/constants');
 const { scheduleGroupSuggestion } = require('../lib/auto-suggest');
 const { isOfxDocument } = require('../lib/contador');
-const { evaluateAutoRespond, HUMAN_OWNED_STATUSES } = require('../lib/auto-respond-gate');
+const { evaluateAutoRespond, HUMAN_OWNED_STATUSES, AUTO_RESPOND_SETTING_COLUMNS } = require('../lib/auto-respond-gate');
 const { isConversationHumanOwned } = require('../lib/human-handoff');
 const {
   enqueueContadorMessage,
@@ -1155,8 +1155,9 @@ router.post('/', async (req, res) => {
   // ─── Auto-suggest / auto-respond (debounced — waits for user to stop typing) ─
   if (direction === 'inbound') {
     try {
+      // The gate decides on percent, allowlist and business hours too: select them all.
       const settings = db.prepare(
-        'SELECT auto_suggest, auto_respond FROM copilot_settings WHERE brand_id = ?'
+        `SELECT auto_suggest, ${AUTO_RESPOND_SETTING_COLUMNS.join(', ')} FROM copilot_settings WHERE brand_id = ?`
       ).get(brandId);
 
       if (settings?.auto_suggest) {

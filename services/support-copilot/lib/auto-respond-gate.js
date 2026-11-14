@@ -41,6 +41,15 @@ const ESCALATION_PATTERNS = [
   { type: 'furioso', re: /\b(absurd\w*|rid[íi]cul\w*|p[ée]ssim\w*|horr[íi]vel|vergonha|inadmiss[íi]vel|palha[çc]ada|descaso|merda|porra|caralh\w*|vsf|vtnc|fdp)\b/i },
 ];
 
+// Columns of copilot_settings the gate decides on. A caller that selects fewer
+// makes the gate see percent 0 / no allowlist / no hours, so it never sends.
+const AUTO_RESPOND_SETTING_COLUMNS = Object.freeze([
+  'auto_respond',
+  'auto_respond_allowlist',
+  'auto_respond_percent',
+  'auto_respond_business_hours',
+]);
+
 // Conversations a person owns (takeover or handoff): the AI must stay silent.
 const HUMAN_OWNED_STATUSES = Object.freeze(['assigned', 'escalated']);
 
@@ -200,4 +209,5 @@ module.exports = {
   ESCALATION_PATTERNS,
   ESCALATION_TAGS,
   HUMAN_OWNED_STATUSES,
+  AUTO_RESPOND_SETTING_COLUMNS,
 };

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 1:1 auto-suggest / auto-respond timer vs. human ownership.
+ * 1:1 auto-suggest / auto-respond timer: human ownership and rollout settings.
  *
  * The debounce timer in routes/ingest-evolution.js reads the conversation once,
  * then awaits the customer lookup, the model and a typing delay. A person who
@@ -37,16 +37,6 @@ async function runChild(scenario) {
   let db;
   const setStatus = (status) => db.prepare("UPDATE conversations SET status = ? WHERE channel = 'whatsapp'").run(status);
 
-  // The route reads only `auto_suggest, auto_respond` from copilot_settings, so
-  // the real gate always sees percent 0 and never sends from this route (a
-  // separate, fail-closed finding, not changed here). Wrap the REAL gate and
-  // inject the percent so the send path can be exercised. Ownership is still
-  // decided by the real gate.
-  const realGate = require('../lib/auto-respond-gate');
-  stub('../lib/auto-respond-gate', {
-    ...realGate,
-    evaluateAutoRespond: (args) => realGate.evaluateAutoRespond({ ...args, settings: { ...args.settings, auto_respond_percent: 100 } }),
-  });
   stub('../lib/user-data', { resolveCustomerData: async () => null });
   stub('../lib/copilot', {
     generateSuggestion: async () => {
@@ -67,8 +57,11 @@ async function runChild(scenario) {
   });
 
   ({ db } = require('../lib/db'));
-  db.prepare(`INSERT INTO copilot_settings (brand_id, auto_suggest, auto_respond, auto_respond_percent, updated_at)
-              VALUES ('brandx', 1, 1, 100, ?)`).run(new Date().toISOString());
+  // The rollout settings the REAL route must read from copilot_settings.
+  const cfg = { auto_respond: 1, auto_respond_percent: 100, auto_respond_allowlist: null, auto_respond_business_hours: null, ...JSON.parse(process.env.SETTINGS_JSON || '{}') };
+  db.prepare(`INSERT INTO copilot_settings (brand_id, auto_suggest, auto_respond, auto_respond_percent, auto_respond_allowlist, auto_respond_business_hours, updated_at)
+              VALUES ('brandx', 1, ?, ?, ?, ?, ?)`)
+    .run(cfg.auto_respond, cfg.auto_respond_percent, cfg.auto_respond_allowlist, cfg.auto_respond_business_hours, new Date().toISOString());
 
   const express = require('express');
   const supertest = require('supertest');
@@ -92,7 +85,8 @@ async function runChild(scenario) {
   if (res.status !== 201) throw new Error(`webhook answered ${res.status}: ${JSON.stringify(res.body)}`);
 
   // Wait for the timer chain to finish, then a margin to prove nothing sends later.
-  const finished = () => (scenario === 'control' ? calls.send >= 1 : calls.generate >= 1 && (scenario !== 'escalated_during_typing' || calls.presence >= 1));
+  const expectsSend = process.argv[4] === 'send';
+  const finished = () => (expectsSend ? calls.send >= 1 : calls.generate >= 1 && (scenario !== 'escalated_during_typing' || calls.presence >= 1));
   const deadline = Date.now() + 5000;
   while (!finished() && Date.now() < deadline) await new Promise((r) => realSetTimeout(r, 25));
   await new Promise((r) => realSetTimeout(r, 400));
@@ -121,11 +115,11 @@ function test(name, fn) {
   catch (err) { failed++; console.error(`  ✗ ${name}`); console.error(`    ${err.message}`); }
 }
 
-function run(scenario) {
+function run(scenario, { settings = {}, expectSend = false } = {}) {
   const dbPath = path.join(os.tmpdir(), `sc-1to1-${scenario}-${process.pid}-${Date.now()}.sqlite`);
   try {
-    const stdout = execFileSync(process.execPath, [__filename, 'child', scenario], {
-      env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath, EVOLUTION_INSTANCE_MAP: 'inst:brandx', SUPPORT_API_SECRET: '' },
+    const stdout = execFileSync(process.execPath, [__filename, 'child', scenario, expectSend ? 'send' : 'hold'], {
+      env: { ...process.env, SUPPORT_COPILOT_DB_PATH: dbPath, EVOLUTION_INSTANCE_MAP: 'inst:brandx', SUPPORT_API_SECRET: '', SETTINGS_JSON: JSON.stringify(settings) },
       encoding: 'utf8',
       timeout: 60000,
     });
@@ -140,7 +134,7 @@ function run(scenario) {
 console.log('\n🧪 routes/ingest-evolution.js — 1:1 timer vs human ownership\n');
 
 test('control: with nobody in charge the suggestion is saved and auto-sent once', () => {
-  const r = run('control');
+  const r = run('control', { expectSend: true });
   assert.equal(r.send, 1);
   assert.equal(r.suggestions, 1);
   assert.equal(r.outbound, 1);
@@ -162,6 +156,56 @@ test('an escalation during the typing delay stops the send right before sendText
   assert.equal(r.send, 0);
   assert.equal(r.outbound, 0);
   assert.equal(r.status, 'escalated');
+});
+
+// ─── Rollout settings: percent, allowlist, business hours, master flag ───────
+// The route used to read only auto_suggest and auto_respond, so the gate always
+// saw percent 0 and a 1:1 reply was never sent. These cases use the REAL gate.
+
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+function weekdayInSaoPaulo(offsetDays = 0) {
+  const name = new Intl.DateTimeFormat('en-US', { timeZone: 'America/Sao_Paulo', weekday: 'short' }).format(new Date(Date.now() + offsetDays * 86400000));
+  return DAYS.indexOf(name);
+}
+const allDayOn = (day) => JSON.stringify({ days: [day], start: '00:00', end: '24:00' });
+
+test('percent 0 with no allowlist holds the reply: the suggestion is saved, nothing is sent', () => {
+  const r = run('percent_zero', { settings: { auto_respond_percent: 0 } });
+  assert.equal(r.generate, 1);
+  assert.equal(r.send, 0);
+  assert.equal(r.suggestions, 1);
+});
+
+test('the allowlist is read: a listed phone is auto-sent even with percent 0', () => {
+  const r = run('allowlist_includes', { expectSend: true, settings: { auto_respond_percent: 0, auto_respond_allowlist: JSON.stringify(['5561999990000']) } });
+  assert.equal(r.send, 1);
+  assert.equal(r.outbound, 1);
+});
+
+test('the allowlist is read: a phone that is not listed is held', () => {
+  const r = run('allowlist_excludes', { settings: { auto_respond_percent: 100, auto_respond_allowlist: JSON.stringify(['5511988887777']) } });
+  assert.equal(r.generate, 1);
+  assert.equal(r.send, 0);
+  assert.equal(r.suggestions, 1);
+});
+
+test('business hours are read: inside the window the reply is sent', () => {
+  const r = run('inside_hours', { expectSend: true, settings: { auto_respond_business_hours: allDayOn(weekdayInSaoPaulo(0)) } });
+  assert.equal(r.send, 1);
+});
+
+test('business hours are read: outside the window the reply is held', () => {
+  const r = run('outside_hours', { settings: { auto_respond_business_hours: allDayOn(weekdayInSaoPaulo(3)) } });
+  assert.equal(r.generate, 1);
+  assert.equal(r.send, 0);
+  assert.equal(r.suggestions, 1);
+});
+
+test('the master flag off holds everything, even with percent 100', () => {
+  const r = run('flag_off', { settings: { auto_respond: 0, auto_respond_percent: 100 } });
+  assert.equal(r.generate, 1);
+  assert.equal(r.send, 0);
+  assert.equal(r.suggestions, 1);
 });
 
 console.log(`\n${passed} passed, ${failed} failed\n`);
