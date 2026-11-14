@@ -18,6 +18,7 @@ const {
   withinBusinessHours,
   humanizedDelayMs,
   rolloutBucket,
+  AUTO_RESPOND_SETTING_COLUMNS,
 } = require('../lib/auto-respond-gate');
 
 let passed = 0;
@@ -314,6 +315,16 @@ test('escalation takes precedence over allowlist+percent', () => {
 test('flag_off takes precedence over an escalation-worthy message', () => {
   const r = evaluateAutoRespond(ok({ lastInboundText: 'vou processar voces', settings: { auto_respond: 0 } }));
   assert.equal(r.reason, 'flag_off');
+});
+
+console.log('-- settings columns the gate reads');
+
+test('AUTO_RESPOND_SETTING_COLUMNS lists every settings field the gate reads', () => {
+  // A caller that selects fewer columns makes the gate see percent 0 and never
+  // send (the 1:1 route did exactly that). Keep the list and the gate in step.
+  const source = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'lib', 'auto-respond-gate.js'), 'utf8');
+  const read = [...new Set([...source.matchAll(/settings\.(auto_respond\w*)/g)].map((m) => m[1]))].sort();
+  assert.deepEqual([...AUTO_RESPOND_SETTING_COLUMNS].sort(), read);
 });
 
 console.log('-- regression: phrases caught by bot-eval harness');
