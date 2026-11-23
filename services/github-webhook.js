@@ -19,13 +19,9 @@ const fs = require('fs');
 const { exec, execFile, spawn } = require('child_process');
 const { resolveServicePort, BIND_HOST } = require('./lib/service-port');
 const { sendOperationalWhatsApp } = require('./lib/operational-whatsapp');
-const { isLegacyOpenClawHookEnabled } = require('./lib/legacy-openclaw-hook-policy');
 
 const PORT = resolveServicePort('GITHUB_WEBHOOK_PORT', 3002, '[github-webhook]');
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET || '';
-
-const OPENCLAW_GATEWAY_URL = process.env.OPENCLAW_GATEWAY_URL || 'http://127.0.0.1:18789';
-const OPENCLAW_HOOKS_TOKEN = process.env.OPENCLAW_HOOKS_TOKEN || '';
 
 const QUEUE_PATH = path.join(__dirname, '..', 'github-webhook-queue.jsonl');
 const CI_ATTEMPTS_PATH = path.join(__dirname, '..', 'ci-fix-attempts.json');
@@ -70,48 +66,6 @@ function getPullRequestUrl({ repository, prNumber, fallbackUrl }) {
   if (fallbackUrl) return fallbackUrl;
   if (!repository || !prNumber) return null;
   return `https://github.com/${repository}/pull/${prNumber}`;
-}
-
-function sendOpenClawAgentRequest({ message, agentId, name, channel, to, wakeMode = 'now', deliver = true }) {
-  const postData = JSON.stringify({
-    message,
-    agentId,
-    name,
-    channel,
-    to,
-    wakeMode,
-    deliver,
-  });
-
-  const url = new URL('/hooks/agent', OPENCLAW_GATEWAY_URL);
-
-  const req = http.request(
-    {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENCLAW_HOOKS_TOKEN}`,
-        'Content-Length': Buffer.byteLength(postData),
-      },
-    },
-    (res) => {
-      let body = '';
-      res.on('data', (chunk) => (body += chunk));
-      res.on('end', () => {
-        console.log(`[github-webhook] Agent hook sent (${res.statusCode}): ${body.substring(0, 160)}`);
-      });
-    }
-  );
-
-  req.on('error', (err) => {
-    console.error(`[github-webhook] Agent hook failed: ${err.message}`);
-  });
-
-  req.write(postData);
-  req.end();
 }
 
 function verifySignature({ rawBody, signatureHeader }) {
@@ -553,25 +507,6 @@ function handleWebhook(req, res) {
             `🔔 ${author} comentou (${webhookEvent.action}) na PR #${webhookEvent.pr_number}${title}\n${link || ''}\n"${preview}"\n⚡ Processando...`
           );
 
-          if (isShortTrader && isLegacyOpenClawHookEnabled()) {
-            // Trigger MoneyMan automatically for short_trader events.
-            sendOpenClawAgentRequest({
-              agentId: 'moneyman',
-              name: 'GitHub short_trader',
-              channel: 'telegram',
-              to: '-5128168391',
-              wakeMode: 'now',
-              deliver: true,
-              message:
-                `Você é o MoneyMan. Chegou um evento do GitHub do repo ${webhookEvent.repository}.\n\n` +
-                `Tipo: ${webhookEvent.event} (${webhookEvent.action})\n` +
-                `Autor: ${author}\n` +
-                `PR: #${webhookEvent.pr_number || ''} ${webhookEvent.pr_title || ''}\n` +
-                `Link: ${link || ''}\n\n` +
-                `Preview: "${preview}"\n\n` +
-                `Tarefa: avalie se precisa agir (responder comentário, abrir PR, corrigir CI, etc). Se precisar mexer em código, clone/atualize o repo short_trader e faça a ação. Responda com um status curto + próximo passo.`,
-            });
-          }
         } else {
           console.log(`[github-webhook] ACK suppressed (debounce or edited) for ${ackKey}`);
         }
@@ -593,23 +528,6 @@ function handleWebhook(req, res) {
           `🔴 CI falhou: "${webhookEvent.workflow_name}" (${webhookEvent.head_branch})\n${runUrl || ''}\n⚡ Analisando... (tentativa ${count}/${maxFixAttempts})`
         );
 
-        if (isShortTrader && isLegacyOpenClawHookEnabled()) {
-          sendOpenClawAgentRequest({
-            agentId: 'moneyman',
-            name: 'GitHub short_trader CI',
-            channel: 'telegram',
-            to: '-5128168391',
-            wakeMode: 'now',
-            deliver: true,
-            message:
-              `CI falhou no repo ${webhookEvent.repository}.\n` +
-              `Workflow: ${webhookEvent.workflow_name}\n` +
-              `Branch: ${webhookEvent.head_branch}\n` +
-              `Run: ${runUrl || ''}\n` +
-              `Tentativa: ${count}/${maxFixAttempts}\n\n` +
-              `Tarefa: diagnosticar o motivo do failure e propor (ou aplicar) correção no repo short_trader. Responda com status curto e próximo passo.`,
-          });
-        }
 
         if (!isShortTrader && count >= 2) {
           console.log(
