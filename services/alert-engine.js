@@ -15,6 +15,7 @@ const path = require('path');
 const fs = require('fs');
 const { lookupStation } = require('./station-lookup');
 const { notifyPartnerFault } = require('./partner-fault-notifier');
+const { findFaultStreakStart } = require('./partner-fault-route');
 const { parseStatusNotif, isEmergencyStopFault, isCableTheftSuspectFault } = require('./ocpp-utils');
 const { writeJsonAtomic } = require('./atomic-json');
 const pricingLogAlerts = require('./pricing-log-alerts');
@@ -549,6 +550,28 @@ class AlertEngine {
             return start;
         } catch (e) {
             console.error('⚠️ cable-theft streak-start lookup failed:', e.message);
+            return fallbackTs;
+        }
+    }
+
+    /**
+     * Start of the fault streak the connector is in right now (oldest Faulted
+     * StatusNotification after its last operational status). Falls back to the
+     * event timestamp on error.
+     */
+    findFaultStreakStart(chargerId, connectorId, fallbackTs) {
+        try {
+            const rows = this.ocppDb.prepare(`
+                SELECT timestamp, message FROM ocpp_events
+                WHERE charger_id = ? AND message LIKE '%status=%'
+                ORDER BY timestamp DESC LIMIT 2000
+            `).all(chargerId).map(r => {
+                const p = parseStatusNotif(r.message);
+                return { timestamp: r.timestamp, status: p.status, connectorId: p.connectorId };
+            });
+            return findFaultStreakStart(rows, connectorId, fallbackTs);
+        } catch (e) {
+            console.error('⚠️ fault streak-start lookup failed:', e.message);
             return fallbackTs;
         }
     }
@@ -1203,6 +1226,9 @@ class AlertEngine {
                 // Pre-parsed fault fields forwarded to partner-fault-notifier to
                 // avoid re-parsing the StatusNotification message a second time.
                 parsed_fault: parsed,
+                // When this connector's current fault streak began; the partner
+                // route turns it into faultDurationMin for the alert-policy gate.
+                fault_started_ts: this.findFaultStreakStart(ev.charger_id, parsed.connectorId, ev.timestamp),
                 // Backoff bookkeeping (non-cable-theft only; cable-theft uses the
                 // burst-then-silence incident gate, no backoff streak).
                 backoff_streak: backoff ? backoff.streak : undefined,

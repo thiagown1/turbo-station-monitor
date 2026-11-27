@@ -31,6 +31,7 @@ const fs = require('fs');
 const path = require('path');
 const { lookupStation } = require('./station-lookup');
 const { parseStatusNotif } = require('./ocpp-utils');
+const { buildRoutePayload } = require('./partner-fault-route');
 
 const PARTNER_CONFIG_FILE = path.join(__dirname, '..', 'config', 'partner-alert-stations.json');
 const IS_TEST_MODE = (process.env.PARTNER_ALERT_MODE || 'test') !== 'live';
@@ -42,6 +43,12 @@ const WHATSAPP_CONV = process.env.ALERT_WHATSAPP_CONV !== undefined
     ? process.env.ALERT_WHATSAPP_CONV
     : 'conv_jiuijxjtmnet23i9';
 const WHATSAPP_BRAND = process.env.ALERT_WHATSAPP_BRAND || 'turbo_station';
+
+// LIVE mode goes through the Next route, which owns the partner_fault_alerts
+// flag, the alert-policy duration gate and the WhatsappOutbox audit.
+const DASHBOARD_BASE = (process.env.DASHBOARD_URL || 'https://www.turbostation.com.br').replace(/\/+$/, '');
+const PARTNER_FAULT_ROUTE = process.env.PARTNER_FAULT_ROUTE_URL || `${DASHBOARD_BASE}/api/internal/partner-fault-alert`;
+const MONITOR_API_SECRET = process.env.MONITOR_API_SECRET || '';
 
 // Partner alerts are more disruptive than internal ones — 2h debounce per
 // charger+scenario so a flapping connector doesn't spam a partner group.
@@ -212,19 +219,29 @@ async function postToConversation(conversationId, brandId, text) {
     }
 }
 
-async function resolvePartnerConversationId(partnerId, brandId) {
-    if (!SUPPORT_API_SECRET) return null;
+/**
+ * POST the fault to the Next route. Resolves to `{status, reason}` from the
+ * route ('sent', 'skipped', ...) or null on transport/auth failure.
+ */
+async function postToPartnerFaultRoute(payload) {
+    if (!MONITOR_API_SECRET) {
+        console.warn('[partner-alert] MONITOR_API_SECRET not set — cannot call partner-fault-alert');
+        return null;
+    }
     try {
-        const url = `${SUPPORT_API_BASE}/api/support/groups/by-partner?partnerId=${encodeURIComponent(partnerId)}&brandId=${encodeURIComponent(brandId)}`;
-        const res = await fetch(url, {
-            headers: { 'x-api-secret': SUPPORT_API_SECRET },
+        const res = await fetch(PARTNER_FAULT_ROUTE, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'x-monitor-secret': MONITOR_API_SECRET },
+            body: JSON.stringify(payload),
         });
-        if (!res.ok) return null;
+        if (!res.ok) {
+            console.error(`[partner-alert] route failed: ${res.status} charger=${payload.chargerId}`);
+            return null;
+        }
         const data = await res.json().catch(() => null);
-        if (!data || !data.conversationId || data.enabled === false) return null;
-        return data.conversationId;
+        return data ? { status: data.status || null, reason: data.reason || null } : null;
     } catch (e) {
-        console.error('[partner-alert] resolve group failed:', e && e.message);
+        console.error('[partner-alert] route error:', e && e.message);
         return null;
     }
 }
@@ -295,19 +312,21 @@ async function notifyPartnerFault(fault) {
             console.log(`[partner-alert][TEST] sent for ${fault.charger_id} (${scenario}) to internal group`);
         }
     } else {
-        if (!partnerId) {
-            console.warn(`[partner-alert] partnerId missing for ${fault.charger_id} — cannot route in live mode`);
-            return;
-        }
-        const convId = await resolvePartnerConversationId(partnerId, brandId);
-        if (!convId) {
-            console.warn(`[partner-alert] no linked group for partnerId=${partnerId}`);
-            return;
-        }
-        const sent = await postToConversation(convId, brandId, partnerMsg);
-        if (sent) {
+        // The route resolves partner/group itself (station_ownership) and owns
+        // the partner_fault_alerts flag and the alert-policy duration gate.
+        const payload = buildRoutePayload({
+            fault, parsed, message: partnerMsg,
+            startTs: fault.fault_started_ts, nowTs: Date.now(),
+        });
+        const result = await postToPartnerFaultRoute(payload);
+        if (!result) return;
+        if (result.status === 'sent') {
             markSent(debounceKey);
-            console.log(`[partner-alert][LIVE] sent for ${fault.charger_id} (${scenario}) to ${partnerName}`);
+            console.log(`[partner-alert][LIVE] sent for ${fault.charger_id} (${scenario}) min=${payload.faultDurationMin}`);
+        } else {
+            // Skipped (flag off, policy gate, no group...) is NOT debounced, so a
+            // later alert of a persisting fault can still pass the duration gate.
+            console.log(`[partner-alert][LIVE] ${result.status} reason=${result.reason} for ${fault.charger_id} (${scenario}) min=${payload.faultDurationMin}`);
         }
     }
 }

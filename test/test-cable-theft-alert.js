@@ -60,7 +60,7 @@ check('does NOT flag ordinary faults (SECC CAN Offline / e-stop / CP state)', ()
     }
 });
 
-// detectChargerFaults() only touches this.ocppDb + shouldSendChargerFaultAlert
+// detectChargerFaults() only touches this.ocppDb + shouldSendChargerFaultAlert + findFaultStreakStart
 // (+ shouldAlertCableTheft for temperature faults), so exercise the real
 // prototype method against a fake engine (same pattern as
 // test-charger-fault-backoff.js — avoids opening the live sqlite DBs).
@@ -71,6 +71,7 @@ function detectWith(rows) {
         // Cable-theft faults now gate on the burst-then-silence incident check
         // instead of the escalating backoff; default to "fresh incident".
         shouldAlertCableTheft: () => true,
+        findFaultStreakStart: (_c, _n, fallbackTs) => fallbackTs,
     };
     return AlertEngine.prototype.detectChargerFaults.call(fake);
 }
